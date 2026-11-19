@@ -1,0 +1,775 @@
+package appui
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/egoist/mygo"
+	"github.com/egoist/mygo/ui"
+
+	"ccmonitor/internal/core"
+	"ccmonitor/internal/platform"
+	"ccmonitor/internal/service"
+)
+
+type SettingsTab int
+
+const (
+	TabUsage SettingsTab = iota
+	TabMenuBar
+	TabPanel
+	TabData
+	TabGeneral
+)
+
+type SettingsActions struct {
+	ChooseClaudeDir    func()
+	ChooseDir          func()
+	ToggleFloatingPill func(show bool)
+	SyncTray           func()
+	GetOpenAtLogin     func() bool
+	SetOpenAtLogin     func(bool) error
+}
+
+type SettingsModel struct {
+	Store   *service.Store
+	Actions SettingsActions
+
+	ActiveTab       SettingsTab
+	proxyDraft      string
+	proxySynced     bool
+	intervalStr     string
+	intSynced       bool
+	claudeDirDraft  string
+	lastClaudePref  string
+	claudeDirSynced bool
+	openAtLogin     bool
+	loginSynced     bool
+}
+
+func NewSettingsModel(store *service.Store, actions SettingsActions) *SettingsModel {
+	return &SettingsModel{
+		Store:     store,
+		Actions:   actions,
+		ActiveTab: TabUsage,
+	}
+}
+
+func (m *SettingsModel) View(c *ui.Context) {
+	ApplyDarkTheme(c)
+	c.Root().Background(ColorSurfaceSettings)
+
+	st := m.Store.ViewState()
+	zh := st.Prefs.IsChinese()
+
+	if !m.proxySynced {
+		m.proxyDraft = st.Prefs.ProxyURL
+		m.proxySynced = true
+	}
+	if !m.intSynced {
+		m.intervalStr = strconv.Itoa(st.Prefs.SyncIntervalSec)
+		m.intSynced = true
+	}
+	if !m.claudeDirSynced || st.Prefs.ClaudeConfigDir != m.lastClaudePref {
+		m.claudeDirDraft = st.Prefs.ClaudeConfigDir
+		m.lastClaudePref = st.Prefs.ClaudeConfigDir
+		m.claudeDirSynced = true
+	}
+	if !m.loginSynced {
+		if m.Actions.GetOpenAtLogin != nil {
+			m.openAtLogin = m.Actions.GetOpenAtLogin()
+		}
+		m.loginSynced = true
+	}
+
+	ui.Column(c).Fill().Background(ColorSurfaceSettings).Children(func() {
+		// Top 5-tab icon bar matching hero.png / settings-panel.png / settings-usage.png
+		m.renderTabBar(c, zh)
+		Hairline(c)
+
+		// Scrollable settings body
+		ui.Scroll(c).Grow(1).FillWidth().Children(func() {
+			ui.Column(c).FillWidth().Padding(20, 24, 28, 24).Gap(16).Children(func() {
+				switch m.ActiveTab {
+				case TabUsage:
+					m.renderUsageTab(c, st, zh)
+				case TabMenuBar:
+					m.renderMenuBarTab(c, st, zh)
+				case TabPanel:
+					m.renderPanelTab(c, st, zh)
+				case TabData:
+					m.renderDataTab(c, st, zh)
+				case TabGeneral:
+					m.renderGeneralTab(c, st, zh)
+				}
+			})
+		})
+	})
+}
+
+func (m *SettingsModel) renderTabBar(c *ui.Context, zh bool) {
+	tabs := []struct {
+		id   SettingsTab
+		icon *ui.SVG
+		name string
+	}{
+		{TabUsage, IconGauge, tr(zh, "用量", "Usage")},
+		{TabMenuBar, IconMenuBar, tr(zh, "菜单栏", "Menubar")},
+		{TabPanel, IconPanel, tr(zh, "面板", "Panel")},
+		{TabData, IconDB, tr(zh, "数据", "Data")},
+		{TabGeneral, IconSliders, tr(zh, "通用", "General")},
+	}
+
+	ui.Row(c).FillWidth().Padding(10, 16).Center().Gap(8).Background(ColorSurfaceHeader).Children(func() {
+		for _, tb := range tabs {
+			active := m.ActiveTab == tb.id
+			btn := ui.Column(c.Key(fmt.Sprintf("stab-%d", tb.id))).
+				Width(68).Padding(7, 8).Radius(10).Center().Gap(4).Cursor(ui.CursorPointer)
+			if active {
+				btn.Background(ui.RGBA(255, 255, 255, 0.11))
+			} else if btn.Hovered() {
+				btn.Background(ColorHover)
+			}
+			if btn.Clicked() {
+				m.ActiveTab = tb.id
+			}
+			col := ColorSecondary
+			if active {
+				col = ColorText
+			}
+			btn.Children(func() {
+				ui.Icon(c, tb.icon).FontSize(17).TextColor(col)
+				ui.Text(c, tb.name).FontSize(11).FontWeight(500).TextColor(col).SingleLine()
+			})
+		}
+	})
+}
+
+func settingsGroupTitle(c *ui.Context, title string) {
+	ui.Text(c, title).FontSize(11.5).FontWeight(500).TextColor(ColorTertiary).Margin(4, 0, -4, 0)
+}
+
+func settingsRow(c *ui.Context, title, desc string, control func()) {
+	ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(16).Children(func() {
+		ui.Column(c).Grow(1).Gap(3).Children(func() {
+			ui.Text(c, title).FontSize(13).FontWeight(500).TextColor(ColorText)
+			if desc != "" {
+				ui.Text(c, desc).FontSize(11.5).TextColor(ColorTertiary)
+			}
+		})
+		if control != nil {
+			control()
+		}
+	})
+}
+
+func (m *SettingsModel) renderUsageTab(c *ui.Context, st service.ViewState, zh bool) {
+	settingsGroupTitle(c, tr(zh, "官方用量", "Official usage"))
+
+	// Status subtitle
+	statusSub := tr(zh, "与 Claude Code /usage 一致", "Matches Claude Code /usage")
+	if st.OfficialUsage != nil {
+		rel := core.FormatRelative(st.OfficialUsage.FetchedAt, time.Now(), zh)
+		planTxt := st.DetectedPlan.Title()
+		if planTxt != "" {
+			planTxt = " · " + planTxt
+		}
+		statusSub = tr(zh, fmt.Sprintf("已连接%s · 上次同步 %s · 与 Claude Code /usage 一致", planTxt, rel),
+			fmt.Sprintf("Connected%s · Synced %s", planTxt, rel))
+	}
+	settingsRow(c, tr(zh, "Claude 官方用量", "Official Claude usage"), statusSub, func() {
+		TerracottaSwitch(c, "sw-off", st.Prefs.OfficialEnabled, func(on bool) {
+			m.Store.UpdatePrefs(func(p *core.Preferences) { p.OfficialEnabled = on })
+		})
+	})
+
+	Hairline(c)
+
+	settingsRow(c, tr(zh, "展开面板时立即查询", "Check when opening panel"),
+		tr(zh, "点开托盘图标时，上次同步后的消耗可能已经让数字变了，就立即查询；否则直接显示上次的结果，不发请求。",
+			"Refreshes when opening the panel if local usage likely moved the percentage."), func() {
+			TerracottaSwitch(c, "sw-open", st.Prefs.CheckOnOpen, func(on bool) {
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.CheckOnOpen = on })
+			})
+		})
+
+	Hairline(c)
+
+	settingsRow(c, tr(zh, "查询间隔", "Sync interval"),
+		tr(zh, "Claude Code 正在使用时，消耗够让官方百分比涨一格才查，两次至少隔这么久（10–3600 秒）。",
+			"Minimum seconds between automatic checks while active (10–3600s)."), func() {
+			ui.Row(c).AlignItems(ui.Center).Gap(6).Children(func() {
+				inp := ui.TextInput(c.Key("in-interval"), &m.intervalStr).Width(68).FontSize(12.5).TextColor(ColorText)
+				if inp.Submitted() || inp.Changed() {
+					if v, err := strconv.Atoi(strings.TrimSpace(m.intervalStr)); err == nil && v >= 10 && v <= 3600 {
+						m.Store.UpdatePrefs(func(p *core.Preferences) { p.SyncIntervalSec = v })
+					}
+				}
+				ui.Text(c, tr(zh, "秒", "s")).FontSize(11.5).TextColor(ColorTertiary)
+			})
+		})
+
+	Hairline(c)
+
+	settingsRow(c, tr(zh, "官方请求代理", "Official API proxy"),
+		tr(zh, "留空使用 Windows 系统代理。填写后用量和续期都从这里出去，例如 127.0.0.1:7890 或 socks5://127.0.0.1:7890",
+			"Leave blank for Windows system proxy. Example: 127.0.0.1:7890 or socks5://127.0.0.1:7890"), func() {
+			inp := ui.TextInput(c.Key("in-proxy"), &m.proxyDraft).
+				Width(195).Placeholder("127.0.0.1:7890").FontSize(12)
+			if inp.Submitted() || inp.Changed() {
+				val := strings.TrimSpace(m.proxyDraft)
+				if val != st.Prefs.ProxyURL {
+					m.Store.UpdatePrefs(func(p *core.Preferences) { p.ProxyURL = val })
+				}
+			}
+		})
+
+	Hairline(c)
+
+	settingsRow(c, tr(zh, "自动续期登录", "Auto-renew login"),
+		tr(zh, "默认开启。登录快过期时，使用与 Claude Code 相同的目录锁自动续期并写回凭据。",
+			"Renews OAuth token 5 minutes before expiry using Claude Code's lock protocol."), func() {
+			TerracottaSwitch(c, "sw-renew", st.Prefs.AutoRenewLogin, func(on bool) {
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.AutoRenewLogin = on })
+			})
+		})
+
+	Hairline(c)
+
+	// Credentials file status (reads <claudeDir>\.credentials.json only)
+	acctDesc := tr(zh, fmt.Sprintf("未在 %s 中找到 .credentials.json，可在「数据」页修改 .claude 目录或通过 Claude Code 终端登录。", st.ClaudeConfigDir),
+		fmt.Sprintf("No .credentials.json found in %s. Set the .claude directory under Data or sign in via Claude Code.", st.ClaudeConfigDir))
+	if st.AccountEmail != "" {
+		acctDesc = tr(zh, fmt.Sprintf("当前账号：%s（读取自 %s\\.credentials.json）", st.AccountEmail, st.ClaudeConfigDir),
+			fmt.Sprintf("Signed in: %s (from %s\\.credentials.json)", st.AccountEmail, st.ClaudeConfigDir))
+	} else if st.HasCredentialsFile {
+		acctDesc = tr(zh, fmt.Sprintf("已检测到凭据文件：%s\\.credentials.json", st.ClaudeConfigDir),
+			fmt.Sprintf("Credentials file detected: %s\\.credentials.json", st.ClaudeConfigDir))
+	}
+	settingsRow(c, tr(zh, "本地凭据文件", "Local credentials file"), acctDesc, func() {
+		b := ui.Row(c.Key("btn-set-cli")).Height(28).Padding(0, 12).Radius(7).Center().
+			Background(ColorPillBg).Cursor(ui.CursorPointer)
+		if b.Clicked() {
+			m.Store.LaunchClaudeCodeLogin()
+		}
+		b.Children(func() {
+			ui.Text(c, tr(zh, "终端登录", "CLI Login")).FontSize(11.5).FontWeight(500).TextColor(ColorText).SingleLine()
+		})
+	})
+
+	ui.Text(c, tr(zh,
+		"官方用量会用当前登录访问 Anthropic。自动查询只在出口可用、Claude Code 正在使用时进行；Token 没有变化时不发请求。遇到 429 自动退避，并始终为「立即刷新」保留配额。",
+		"Official usage queries api.anthropic.com directly. Automatic sync only runs when active and exit is safe, with token-bucket rate-limit protection.")).
+		FontSize(11).TextColor(ColorTertiary)
+
+	settingsGroupTitle(c, tr(zh, "计费周期", "Billing cycle"))
+
+	dayOpts := make([]string, 32)
+	dayOpts[0] = tr(zh, "不设置", "Not set")
+	for d := 1; d <= 31; d++ {
+		dayOpts[d] = tr(zh, fmt.Sprintf("每月 %d 日", d), fmt.Sprintf("Day %d", d))
+	}
+	curDay := dayOpts[0]
+	if st.Prefs.BillingAnchorDay >= 1 && st.Prefs.BillingAnchorDay <= 31 {
+		curDay = dayOpts[st.Prefs.BillingAnchorDay]
+	}
+	rangeDesc := tr(zh, "设置后在顶部套餐徽章旁显示本期还剩几天", "Shows days left beside the plan badge")
+	if st.Snapshot != nil && st.Prefs.BillingAnchorDay > 0 {
+		rangeDesc = tr(zh, "当前周期 ", "Current period ") + core.FormatPeriodRange(st.Snapshot.Billing.Start, st.Snapshot.Billing.End, zh)
+	}
+	settingsRow(c, tr(zh, "每月扣费日", "Billing day"), rangeDesc, func() {
+		sel := curDay
+		if ui.Select(c.Key("sel-anchor"), &sel, dayOpts).Width(120).Changed() {
+			for i, o := range dayOpts {
+				if o == sel {
+					m.Store.UpdatePrefs(func(p *core.Preferences) { p.BillingAnchorDay = i })
+					break
+				}
+			}
+		}
+	})
+}
+
+func (m *SettingsModel) renderMenuBarTab(c *ui.Context, st service.ViewState, zh bool) {
+	settingsGroupTitle(c, tr(zh, "菜单栏与悬浮条预览", "Menubar & Floating Bar Preview"))
+
+	// Live preview strip matching hero.png!
+	ui.Row(c).FillWidth().Height(42).Padding(0, 16).Radius(10).Background(ColorPillBg).Center().Gap(12).Children(func() {
+		ui.Box(c).Size(12, 3).Radius(1.5).Background(ColorQuaternary)
+		m.renderPreviewPillContent(c, st, zh)
+		ui.Box(c).Size(12, 3).Radius(1.5).Background(ColorQuaternary)
+		ui.Text(c, time.Now().Format("15:04")).FontSize(12).FontWeight(500).TextColor(ColorSecondary).FontFeatures("tnum")
+	})
+
+	settingsRow(c, tr(zh, "图标", "Icon"), "", func() {
+		idx := 0
+		if st.Prefs.IconStyle == core.IconStyleLogo {
+			idx = 1
+		}
+		SegmentedTabs(c, "seg-icon", []string{"Clawd", tr(zh, "Claude 标志", "Claude logo")}, idx, false, func(i int) {
+			m.Store.UpdatePrefs(func(p *core.Preferences) {
+				if i == 0 {
+					p.IconStyle = core.IconStyleClawd
+				} else {
+					p.IconStyle = core.IconStyleLogo
+				}
+			})
+			if m.Actions.SyncTray != nil {
+				m.Actions.SyncTray()
+			}
+		})
+	})
+
+	Hairline(c)
+
+	settingsRow(c, tr(zh, "桌面 Mini 悬浮条（Windows 专属）", "Floating Mini Bar (Windows)"),
+		tr(zh, "还原 macOS 菜单栏常驻多列数值体验，可拖拽到屏幕顶部或任务栏上方，点击展开主面板。",
+			"Always-on-top compact strip replicating macOS menu bar multi-column metrics."), func() {
+			TerracottaSwitch(c, "sw-pill", st.Prefs.ShowFloatingPill, func(on bool) {
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.ShowFloatingPill = on })
+				if m.Actions.ToggleFloatingPill != nil {
+					m.Actions.ToggleFloatingPill(on)
+				}
+			})
+		})
+
+	Hairline(c)
+
+	settingsRow(c, tr(zh, "Clawd 动画", "Clawd animations"),
+		tr(zh, "眨眼、张望、蹦跳，动作取自 Claude Code。", "Blinks and looks around using official Claude Code poses."), func() {
+			TerracottaSwitch(c, "sw-anim", st.Prefs.ClawdAnimation, func(on bool) {
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.ClawdAnimation = on })
+			})
+		})
+
+	Hairline(c)
+
+	// Multi-select metric strip matching hero.png "显示数值"
+	ui.Column(c).FillWidth().Gap(8).Children(func() {
+		ui.Text(c, tr(zh, "显示数值", "Visible metrics")).FontSize(13).FontWeight(500).TextColor(ColorText)
+		ui.Text(c, tr(zh, "亮起的会显示在悬浮条和预览栏上，点一下切换，可以多选。", "Click items to toggle them in the floating bar.")).
+			FontSize(11.5).TextColor(ColorTertiary)
+
+		type metricChip struct {
+			key   string
+			label string
+			val   string
+			col   ui.Color
+			on    bool
+			set   func(*core.Preferences, bool)
+		}
+		items := []metricChip{
+			{"m5h", tr(zh, "5小时", "5h"), "8%", ColorLive, st.Prefs.PillShowFiveHour, func(p *core.Preferences, v bool) { p.PillShowFiveHour = v }},
+			{"m7d", tr(zh, "本周", "Week"), "10%", ColorLive, st.Prefs.PillShowWeek, func(p *core.Preferences, v bool) { p.PillShowWeek = v }},
+			{"msc", "Fable", "0%", ColorSecondary, st.Prefs.PillShowScoped, func(p *core.Preferences, v bool) { p.PillShowScoped = v }},
+			{"mtd", tr(zh, "今日", "Today"), "$280", ColorText, st.Prefs.PillShowTodayCost, func(p *core.Preferences, v bool) { p.PillShowTodayCost = v }},
+			{"mwk", tr(zh, "本周费", "Wk $"), "$309", ColorText, st.Prefs.PillShowWeekCost, func(p *core.Preferences, v bool) { p.PillShowWeekCost = v }},
+			{"mmo", tr(zh, "本月费", "Mo $"), "$10.7k", ColorText, st.Prefs.PillShowMonthCost, func(p *core.Preferences, v bool) { p.PillShowMonthCost = v }},
+			{"msp", tr(zh, "速度", "Speed"), "71", ColorText, st.Prefs.PillShowSpeed, func(p *core.Preferences, v bool) { p.PillShowSpeed = v }},
+		}
+		ui.Row(c).Padding(4).Gap(4).Radius(9).Background(ColorPillBg).Children(func() {
+			for _, it := range items {
+				item := it
+				box := ui.Column(c.Key(item.key)).Padding(4, 9).Radius(7).Center().Gap(1).Cursor(ui.CursorPointer)
+				if item.on {
+					box.Background(ColorPillSel)
+				} else if box.Hovered() {
+					box.Background(ColorHover)
+				}
+				if box.Clicked() {
+					m.Store.UpdatePrefs(func(p *core.Preferences) { item.set(p, !item.on) })
+				}
+				op := float32(0.35)
+				if item.on {
+					op = 1
+				}
+				box.Opacity(op).Children(func() {
+					ui.Text(c, item.label).FontSize(9.5).TextColor(ColorSecondary).SingleLine()
+					ui.Text(c, item.val).FontSize(11.5).FontWeight(600).TextColor(item.col).FontFeatures("tnum").SingleLine()
+				})
+			}
+		})
+	})
+
+	Hairline(c)
+
+	settingsRow(c, tr(zh, "出口安全", "Exit guard"),
+		tr(zh, "Clawd 举着出口盾牌。官方请求只走 IPv4。IPv6 直连中国大陆、香港或澳门时发出警告。",
+			"Blocks official calls in CN/HK/MO and warns on direct IPv6 leaks."), func() {
+			TerracottaSwitch(c, "sw-exit", st.Prefs.ExitGuard, func(on bool) {
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.ExitGuard = on })
+				if m.Actions.SyncTray != nil {
+					m.Actions.SyncTray()
+				}
+			})
+		})
+
+	settingsGroupTitle(c, tr(zh, "提醒", "Alerts"))
+
+	settingsRow(c, tr(zh, "用量预警通知", "Usage warning alerts"),
+		tr(zh, "超过预警线、以及达到 95% 时各发一次 Windows 系统通知", "Sends a Windows Toast alert at threshold and 95%."), func() {
+			TerracottaSwitch(c, "sw-alert", st.Prefs.AlertEnabled, func(on bool) {
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.AlertEnabled = on })
+			})
+		})
+
+	thresh := float64(st.Prefs.AlertThresholdPct)
+	settingsRow(c, tr(zh, "预警线", "Alert threshold"), "", func() {
+		ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
+			if ui.Slider(c.Key("sl-thresh"), &thresh, 50, 95).Width(130).Changed() {
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.AlertThresholdPct = int(thresh) })
+			}
+			ui.Text(c, fmt.Sprintf("%d%%", st.Prefs.AlertThresholdPct)).Width(36).TextAlign(ui.End).
+				FontSize(12).FontWeight(500).TextColor(ColorSecondary).FontFeatures("tnum")
+		})
+	})
+}
+
+func (m *SettingsModel) renderPreviewPillContent(c *ui.Context, st service.ViewState, zh bool) {
+	col := ColorLive
+	if st.OfficialUsage != nil && st.OfficialUsage.FiveHour != nil {
+		col = LevelColor(st.OfficialUsage.FiveHour.Fraction())
+	}
+	if st.Prefs.IconStyle == core.IconStyleLogo {
+		ClaudeLogo(c, 15, col)
+	} else {
+		shield := st.Shield
+		if shield == platform.ShieldNone && st.Prefs.ExitGuard {
+			shield = platform.ShieldSafe
+		}
+		ClawdMascot(c, 18, col, "idle", shield)
+	}
+	addMetric := func(top, bot string, vc ui.Color) {
+		ui.Column(c).Center().Gap(0).Children(func() {
+			ui.Text(c, top).FontSize(8.5).TextColor(ColorTertiary).SingleLine()
+			ui.Text(c, bot).FontSize(11).FontWeight(600).TextColor(vc).FontFeatures("tnum").SingleLine()
+		})
+	}
+	now := time.Now()
+	money := core.NewMoneyFormat(st.Prefs.Currency)
+	if st.Prefs.PillShowFiveHour {
+		v, vc := "–", ColorSecondary
+		if st.OfficialUsage != nil && st.OfficialUsage.FiveHour != nil {
+			eff := st.OfficialUsage.EffectiveAt(now)
+			v = fmt.Sprintf("%d%%", eff.FiveHour.Percent())
+			vc = LevelColor(eff.FiveHour.Fraction())
+		}
+		addMetric(tr(zh, "5小时", "5h"), v, vc)
+	}
+	if st.Prefs.PillShowWeek {
+		v, vc := "–", ColorSecondary
+		if st.OfficialUsage != nil && st.OfficialUsage.SevenDay != nil {
+			eff := st.OfficialUsage.EffectiveAt(now)
+			v = fmt.Sprintf("%d%%", eff.SevenDay.Percent())
+			vc = LevelColor(eff.SevenDay.Fraction())
+		}
+		addMetric(tr(zh, "本周", "Week"), v, vc)
+	}
+	if st.Prefs.PillShowTodayCost {
+		cost := 0.0
+		if st.Snapshot != nil && st.Snapshot.Today() != nil {
+			cost = st.Snapshot.Today().Cost
+		}
+		addMetric(tr(zh, "今日", "Today"), money.Whole(cost), ColorText)
+	}
+}
+
+func (m *SettingsModel) renderPanelTab(c *ui.Context, st service.ViewState, zh bool) {
+	settingsGroupTitle(c, tr(zh, "内容", "Content"))
+
+	exitIdx := 0
+	if st.Prefs.ExitDisplay == core.ShowOnWarn {
+		exitIdx = 1
+	}
+	settingsRow(c, tr(zh, "出口", "Exit"), tr(zh, "出口所在的国家或地区和 IP，指针停上去显示完整地址", "Country/region and masked IP; hover reveals full IP."), func() {
+		SegmentedTabs(c, "seg-exit", []string{tr(zh, "始终", "Always"), tr(zh, "异常时", "On issue")}, exitIdx, false, func(i int) {
+			m.Store.UpdatePrefs(func(p *core.Preferences) {
+				if i == 0 {
+					p.ExitDisplay = core.ShowAlways
+				} else {
+					p.ExitDisplay = core.ShowOnWarn
+				}
+			})
+		})
+	})
+
+	Hairline(c)
+
+	settingsRow(c, tr(zh, "进程", "Processes"), tr(zh, "正在运行的 Claude 会话，展开后可以强制退出", "Running Claude sessions with hover force-quit."), func() {
+		TerracottaSwitch(c, "sw-procs", st.Prefs.ShowProcesses, func(on bool) {
+			m.Store.UpdatePrefs(func(p *core.Preferences) { p.ShowProcesses = on })
+		})
+	})
+
+	Hairline(c)
+
+	modeLabels := []string{tr(zh, "详细", "Detailed"), tr(zh, "简洁", "Compact"), tr(zh, "不显示", "Hidden")}
+	modeIdx := func(d core.DisplayMode) int {
+		switch d {
+		case core.DisplayCompact:
+			return 1
+		case core.DisplayHidden:
+			return 2
+		default:
+			return 0
+		}
+	}
+	idxMode := func(i int) core.DisplayMode {
+		switch i {
+		case 1:
+			return core.DisplayCompact
+		case 2:
+			return core.DisplayHidden
+		default:
+			return core.DisplayDetailed
+		}
+	}
+
+	settingsRow(c, tr(zh, "用量限额", "Limits"), tr(zh, "每项一条进度条和安全线，下面写重置时间", "Progress bar, safe line, and reset time per limit."), func() {
+		SegmentedTabs(c, "seg-lim", modeLabels, modeIdx(st.Prefs.LimitsDisplay), false, func(i int) {
+			m.Store.UpdatePrefs(func(p *core.Preferences) { p.LimitsDisplay = idxMode(i) })
+		})
+	})
+
+	Hairline(c)
+
+	settingsRow(c, tr(zh, "输出速度", "Output speed"), tr(zh, "近 5 分钟的速度和最近 1 小时的折线", "5-minute speed and 1-hour trend/scatter chart."), func() {
+		SegmentedTabs(c, "seg-spd", modeLabels, modeIdx(st.Prefs.SpeedDisplay), false, func(i int) {
+			m.Store.UpdatePrefs(func(p *core.Preferences) { p.SpeedDisplay = idxMode(i) })
+		})
+	})
+
+	Hairline(c)
+
+	settingsRow(c, tr(zh, "本期消耗", "Spend"), tr(zh, "金额、预计、Token 构成、缓存命中率和各模型花费", "Spend, estimate, token breakdown, cache hit rate, models."), func() {
+		SegmentedTabs(c, "seg-spend", modeLabels, modeIdx(st.Prefs.SpendDisplay), false, func(i int) {
+			m.Store.UpdatePrefs(func(p *core.Preferences) { p.SpendDisplay = idxMode(i) })
+		})
+	})
+
+	ui.Text(c, tr(zh, "在面板里点区块的标题可以收起或展开，收起后标题右侧显示摘要。", "Click any section header in the panel to collapse or expand it.")).
+		FontSize(11).TextColor(ColorTertiary)
+
+	settingsGroupTitle(c, tr(zh, "重置时间", "Reset time"))
+
+	fmtIdx := 0
+	if st.Prefs.FullDateReset {
+		fmtIdx = 1
+	}
+	settingsRow(c, tr(zh, "时间格式", "Format"), tr(zh, "面板里各额度的重置时间，按系统当前时区", "Displayed in local timezone."), func() {
+		SegmentedTabs(c, "seg-resetfmt", []string{tr(zh, "周六 22:00", "Sat 22:00"), tr(zh, "2026年10月31日 22:00", "Oct 31, 2026 22:00")}, fmtIdx, false, func(i int) {
+			m.Store.UpdatePrefs(func(p *core.Preferences) { p.FullDateReset = i == 1 })
+		})
+	})
+
+	Hairline(c)
+
+	settingsRow(c, tr(zh, "显示倒计时", "Show countdown"), tr(zh, "在重置时间右侧显示还剩多久，精确到秒，每秒刷新", "Shows live HH:MM:SS countdown beside reset time."), func() {
+		TerracottaSwitch(c, "sw-cnt", st.Prefs.ShowResetCountdown, func(on bool) {
+			m.Store.UpdatePrefs(func(p *core.Preferences) { p.ShowResetCountdown = on })
+		})
+	})
+
+	settingsGroupTitle(c, tr(zh, "货币", "Currency"))
+
+	curOpts := make([]string, len(core.AllCurrencies))
+	for i, cu := range core.AllCurrencies {
+		curOpts[i] = string(cu)
+	}
+	curSel := string(st.Prefs.Currency)
+	settingsRow(c, tr(zh, "显示货币", "Display currency"), tr(zh, "也可以在主面板直接点击金额循环切换", "Or click the spend amount directly in the panel."), func() {
+		if ui.Select(c.Key("sel-cur"), &curSel, curOpts).Width(100).Changed() {
+			m.Store.UpdatePrefs(func(p *core.Preferences) { p.Currency = core.CurrencyUnit(curSel) })
+		}
+	})
+}
+
+func (m *SettingsModel) renderDataTab(c *ui.Context, st service.ViewState, zh bool) {
+	settingsGroupTitle(c, tr(zh, ".claude 目录", ".claude directory"))
+
+	ui.Column(c).FillWidth().Gap(8).Children(func() {
+		ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
+			ui.Column(c).Grow(1).Gap(3).Children(func() {
+				ui.Text(c, tr(zh, "自定义 .claude 目录位置", "Custom .claude directory")).FontSize(13).FontWeight(500).TextColor(ColorText)
+				ui.Text(c, tr(zh, "留空使用默认位置。修改后将自动从该目录读取登录凭据（.credentials.json）、缓存配置与会话日志（projects），支持本地或 WSL 路径。",
+					"Leave empty for default. Used to locate .credentials.json, .claude.json cache, and projects logs (supports local or WSL paths).")).
+					FontSize(11.5).TextColor(ColorTertiary)
+			})
+		})
+
+		ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
+			placeholder := platform.DefaultClaudeConfigDir()
+			inp := ui.TextInput(c.Key("in-claude-dir"), &m.claudeDirDraft).
+				Grow(1).Placeholder(placeholder).FontSize(12)
+			if inp.Submitted() {
+				val := strings.TrimSpace(m.claudeDirDraft)
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.ClaudeConfigDir = val })
+			}
+
+			applyBtn := ui.Row(c.Key("btn-apply-claude-dir")).Height(28).Padding(0, 12).Radius(7).Center().
+				Background(ColorAccent.Alpha(0.22)).Cursor(ui.CursorPointer)
+			if applyBtn.Clicked() {
+				val := strings.TrimSpace(m.claudeDirDraft)
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.ClaudeConfigDir = val })
+			}
+			applyBtn.Children(func() {
+				ui.Text(c, tr(zh, "应用", "Apply")).FontSize(12).FontWeight(500).TextColor(ColorAccent).SingleLine()
+			})
+
+			if m.Actions.ChooseClaudeDir != nil {
+				pickBtn := ui.Row(c.Key("btn-pick-claude-dir")).Height(28).Padding(0, 12).Radius(7).Center().
+					Background(ColorPillSel).Cursor(ui.CursorPointer)
+				if pickBtn.Clicked() {
+					m.Actions.ChooseClaudeDir()
+				}
+				pickBtn.Children(func() {
+					ui.Text(c, tr(zh, "选择目录…", "Browse…")).FontSize(12).TextColor(ColorText).SingleLine()
+				})
+			}
+
+			if strings.TrimSpace(st.Prefs.ClaudeConfigDir) != "" {
+				resetBtn := ui.Row(c.Key("btn-reset-claude-dir")).Height(28).Padding(0, 10).Radius(7).Center().
+					Background(ColorPillBg).Cursor(ui.CursorPointer)
+				if resetBtn.Clicked() {
+					m.claudeDirDraft = ""
+					m.Store.UpdatePrefs(func(p *core.Preferences) { p.ClaudeConfigDir = "" })
+				}
+				resetBtn.Children(func() {
+					ui.Text(c, tr(zh, "默认", "Reset")).FontSize(11.5).TextColor(ColorSecondary).SingleLine()
+				})
+			}
+		})
+
+		// Live detection status of current effective .claude directory
+		ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, tr(zh, "当前生效：", "Active: ")+st.ClaudeConfigDir).
+				FontSize(11).TextColor(ColorTertiary).SingleLine().Grow(1)
+			if st.HasCredentialsFile {
+				Chip(c, tr(zh, "已找到凭据", "Credentials OK"), ColorLive)
+			} else {
+				Chip(c, tr(zh, "无凭据文件", "No credentials"), ColorTertiary)
+			}
+			if st.HasProjectsDir {
+				Chip(c, tr(zh, "已找到日志", "Logs OK"), ColorLive)
+			} else {
+				Chip(c, tr(zh, "无 projects", "No projects"), ColorTertiary)
+			}
+		})
+	})
+
+	Hairline(c)
+
+	settingsGroupTitle(c, tr(zh, "额外会话日志目录", "Additional session log folder"))
+
+	roots := strings.Join(st.DataRoots, "\n")
+	settingsRow(c, tr(zh, "当前扫描的日志目录", "Scanned log folders"), roots, func() {
+		ui.Row(c).Gap(6).Children(func() {
+			if m.Actions.ChooseDir != nil {
+				b := ui.Row(c.Key("btn-dir")).Height(28).Padding(0, 12).Radius(7).Center().Background(ColorPillSel).Cursor(ui.CursorPointer)
+				if b.Clicked() {
+					m.Actions.ChooseDir()
+				}
+				b.Children(func() {
+					ui.Text(c, tr(zh, "选择目录…", "Choose…")).FontSize(12).TextColor(ColorText).SingleLine()
+				})
+			}
+			if strings.TrimSpace(st.Prefs.CustomDataDir) != "" {
+				clr := ui.Row(c.Key("btn-clr-dir")).Height(28).Padding(0, 10).Radius(7).Center().Background(ColorPillBg).Cursor(ui.CursorPointer)
+				if clr.Clicked() {
+					m.Store.UpdatePrefs(func(p *core.Preferences) { p.CustomDataDir = "" })
+				}
+				clr.Children(func() {
+					ui.Text(c, tr(zh, "清除", "Clear")).FontSize(11.5).TextColor(ColorSecondary).SingleLine()
+				})
+			}
+		})
+	})
+
+	Hairline(c)
+
+	recCount := 0
+	if st.Snapshot != nil {
+		recCount = st.Snapshot.TotalRecords
+	}
+	idxDesc := tr(zh, fmt.Sprintf("已索引 %s 条记录 · 缓存 %s", core.FormatGrouped(int64(recCount)), platform.FormatBytes(uint64(st.IndexSize))),
+		fmt.Sprintf("%s records indexed · Cache %s", core.FormatGrouped(int64(recCount)), platform.FormatBytes(uint64(st.IndexSize))))
+	settingsRow(c, tr(zh, "本地索引缓存", "Local index cache"), idxDesc, func() {
+		b := ui.Row(c.Key("btn-reidx")).Height(28).Padding(0, 12).Radius(7).Center().Background(ColorPillSel).Cursor(ui.CursorPointer)
+		if b.Clicked() {
+			m.Store.RebuildIndex()
+		}
+		b.Children(func() {
+			ui.Text(c, tr(zh, "重新索引", "Rebuild index")).FontSize(12).TextColor(ColorText).SingleLine()
+		})
+	})
+
+	Hairline(c)
+
+	settingsRow(c, tr(zh, "缓存目录", "App data directory"), platform.AppDataDir(), func() {
+		b := ui.Row(c.Key("btn-open-data")).Height(28).Padding(0, 12).Radius(7).Center().Background(ColorPillBg).Cursor(ui.CursorPointer)
+		if b.Clicked() {
+			_ = mygo.Shell.OpenPath(platform.AppDataDir())
+		}
+		b.Children(func() {
+			ui.Text(c, tr(zh, "打开文件夹", "Open folder")).FontSize(12).TextColor(ColorSecondary).SingleLine()
+		})
+	})
+}
+
+func (m *SettingsModel) renderGeneralTab(c *ui.Context, st service.ViewState, zh bool) {
+	settingsGroupTitle(c, tr(zh, "通用", "General"))
+
+	langIdx := 0
+	if st.Prefs.Language == core.LangEN {
+		langIdx = 1
+	}
+	settingsRow(c, tr(zh, "语言", "Language"), tr(zh, "切换界面显示语言", "Switch interface language"), func() {
+		SegmentedTabs(c, "seg-lang", []string{"简体中文", "English"}, langIdx, false, func(i int) {
+			m.Store.UpdatePrefs(func(p *core.Preferences) {
+				if i == 0 {
+					p.Language = core.LangZH
+				} else {
+					p.Language = core.LangEN
+				}
+			})
+		})
+	})
+
+	Hairline(c)
+
+	settingsRow(c, tr(zh, "登录时自动启动", "Launch at login"),
+		tr(zh, "开机登录 Windows 时自动在系统托盘启动", "Automatically start in the system tray at Windows sign-in."), func() {
+			TerracottaSwitch(c, "sw-login", m.openAtLogin, func(on bool) {
+				if m.Actions.SetOpenAtLogin != nil {
+					if err := m.Actions.SetOpenAtLogin(on); err == nil {
+						m.openAtLogin = on
+					}
+				} else {
+					m.openAtLogin = on
+				}
+			})
+		})
+
+	Hairline(c)
+
+	settingsRow(c, tr(zh, "到期提醒", "Expiry reminders"),
+		tr(zh, "订阅临近到期或扣款失败时发送提醒", "Notify before billing period ends or on payment issues."), func() {
+			TerracottaSwitch(c, "sw-exp", st.Prefs.ExpiryNotifications, func(on bool) {
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.ExpiryNotifications = on })
+			})
+		})
+
+	Hairline(c)
+
+	ui.Column(c).FillWidth().Padding(8, 0).Gap(4).Children(func() {
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			ClaudeLogo(c, 16, ColorAccent)
+			ui.Text(c, "Claude Usage Monitor for Windows").FontSize(13).FontWeight(600).TextColor(ColorText)
+		})
+		ui.Text(c, tr(zh, "基于 egoist/mygo Native UI (Direct3D 11) 1:1 复刻自 kittors/claude-usage-monitor。",
+			"Windows native replica of kittors/claude-usage-monitor powered by egoist/mygo Direct3D 11 UI.")).
+			FontSize(11).TextColor(ColorTertiary)
+	})
+}
