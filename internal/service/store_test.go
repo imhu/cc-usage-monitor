@@ -118,3 +118,59 @@ func TestUnauthorizedNeverCallsClaudeAPI(t *testing.T) {
 		t.Fatalf("expected zero retries for dead credential, got lastReqAt=%v", s.lastReqAt)
 	}
 }
+
+func TestDayRolloverResetsTodayUsageWithoutNewLogs(t *testing.T) {
+	tmp := t.TempDir()
+	projDir := filepath.Join(tmp, "projects")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write one session record timestamped yesterday (local time).
+	yesterday := time.Now().AddDate(0, 0, -1)
+	line := `{"type":"assistant","timestamp":"` + yesterday.UTC().Format(time.RFC3339) + `","requestId":"r-yday","sessionId":"s1","message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":100000,"output_tokens":50000}}}` + "\n"
+	if err := os.WriteFile(filepath.Join(projDir, "session.jsonl"), []byte(line), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	notified := 0
+	s := &Store{
+		onChange:  func() { notified++ },
+		dataDir:   tmp,
+		prefsPath: filepath.Join(tmp, "prefs.json"),
+		indexPath: filepath.Join(tmp, "index.gob"),
+		statePath: filepath.Join(tmp, "state.json"),
+		prefs:     core.DefaultPreferences(),
+		index:     core.NewUsageIndex(),
+		pstate:    persistedState{Budget: core.NewRequestBudget(time.Now())},
+	}
+
+	// Initial scan ingests yesterday's record.
+	s.scanIndex([]string{projDir})
+	// Simulate that the cached snapshot was last computed yesterday (before midnight).
+	s.mu.Lock()
+	s.recomputeSnapshotLocked(yesterday)
+	if s.snapshot == nil || s.snapshot.Day.Cost <= 0 || s.snapshot.Day.Requests != 1 {
+		s.mu.Unlock()
+		t.Fatalf("expected non-zero yesterday Day snapshot, got %+v", s.snapshot)
+	}
+	s.mu.Unlock()
+	notified = 0
+
+	// Now run scanIndex today with NO new log bytes written -> must detect midnight rollover and reset today to 0.
+	s.scanIndex([]string{projDir})
+
+	st := s.ViewState()
+	if st.Snapshot == nil {
+		t.Fatal("expected non-nil snapshot after rollover")
+	}
+	if st.Snapshot.Day.Cost != 0 || st.Snapshot.Day.Requests != 0 {
+		t.Fatalf("expected today's cost/requests reset to 0 after midnight rollover, got cost=%v reqs=%d", st.Snapshot.Day.Cost, st.Snapshot.Day.Requests)
+	}
+	if today := st.Snapshot.Today(); today == nil || today.Cost != 0 {
+		t.Fatalf("expected Daily Today() cost to be 0 after midnight rollover, got %+v", today)
+	}
+	if notified == 0 {
+		t.Fatal("expected UI notify() to fire on midnight rollover")
+	}
+}

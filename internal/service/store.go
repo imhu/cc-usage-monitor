@@ -390,16 +390,51 @@ func (s *Store) scanIndex(roots []string) {
 	} else {
 		s.phase = PhaseEmpty
 	}
-	if changed || s.snapshot == nil {
-		s.recomputeSnapshotLocked(time.Now())
-		if idx.Dirty {
+	now := time.Now()
+	rolled := s.snapshotRolledOverLocked(now)
+	if changed || s.snapshot == nil || rolled {
+		s.recomputeSnapshotLocked(now)
+		if changed && idx.Dirty {
 			_ = idx.Save(s.indexPath)
 		}
 	}
 	s.mu.Unlock()
-	if changed {
+	if changed || rolled {
 		s.notify()
 	}
+}
+
+// snapshotRolledOverLocked reports whether the cached snapshot has crossed a day,
+// weekly, billing-cycle, or official limit reset boundary since it was generated.
+func (s *Store) snapshotRolledOverLocked(now time.Time) bool {
+	if s.snapshot == nil {
+		return false
+	}
+	if !now.Before(s.snapshot.Day.End) || now.Before(s.snapshot.Day.Start) {
+		return true
+	}
+	if !now.Before(s.snapshot.Billing.End) || now.Before(s.snapshot.Billing.Start) {
+		return true
+	}
+	if s.snapshot.Week != nil && (!now.Before(s.snapshot.Week.End) || now.Before(s.snapshot.Week.Start)) {
+		return true
+	}
+	if s.officialUsage != nil {
+		gen := s.snapshot.GeneratedAt
+		crossed := func(lim *core.OfficialLimit) bool {
+			return lim != nil && lim.ResetsAt != nil && lim.ResetsAt.After(gen) && !lim.ResetsAt.After(now)
+		}
+		if crossed(s.officialUsage.FiveHour) || crossed(s.officialUsage.SevenDay) ||
+			crossed(s.officialUsage.SevenDaySonnet) || crossed(s.officialUsage.SevenDayOpus) {
+			return true
+		}
+		for i := range s.officialUsage.Scoped {
+			if crossed(&s.officialUsage.Scoped[i].Limit) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *Store) RebuildIndex() {
