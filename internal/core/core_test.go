@@ -99,12 +99,32 @@ func TestRequestBudgetAndCooldown(t *testing.T) {
 	if !b.CanManual(now) {
 		t.Fatal("manual refresh should still be allowed")
 	}
+	// Consume last manual token right before hitting 429: manual reserve must still be preserved after cooldown.
+	b.Consume(now)
 	b.RecordRateLimit(now, 0)
 	if !b.InCooldown(now.Add(10 * time.Minute)) {
 		t.Fatal("should be in 15m cooldown after 429")
 	}
+	if rw := b.RetryWait(now); rw != BudgetFirstCooldown {
+		t.Fatalf("expected initial RetryWait=%v (cooldown), got %v", BudgetFirstCooldown, rw)
+	}
 	if b.Slowdown != 2 {
 		t.Fatalf("expected slowdown 2, got %v", b.Slowdown)
+	}
+	// Right after 15m cooldown ends, manual refresh must be allowed and RetryWait must clear to 0,
+	// while auto sync still waits for slowed refill (<= 40m).
+	after15 := now.Add(15 * time.Minute)
+	if b.InCooldown(after15) || b.RetryWait(after15) != 0 {
+		t.Fatalf("expected cooldown & RetryWait cleared at +15m, got %v", b.RetryWait(after15))
+	}
+	if !b.CanManual(after15) {
+		t.Fatal("manual refresh should be allowed right after cooldown ends")
+	}
+	if b.CanAuto(after15) {
+		t.Fatal("auto sync should still wait for slowed refill after 429")
+	}
+	if w := b.Wait(false, now); w > 40*time.Minute {
+		t.Fatalf("expected auto wait <= 40m after first 429, got %v", w)
 	}
 }
 

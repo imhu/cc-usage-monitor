@@ -6,12 +6,12 @@ import (
 )
 
 const (
-	BudgetCapacity        = 5.0
-	BudgetRefillInterval  = 20 * time.Minute
-	BudgetManualReserve   = 1.0
-	BudgetFirstCooldown   = 15 * time.Minute
-	BudgetLongestCooldown = 60 * time.Minute
-	BudgetMaxSlowdown     = 4.0
+	BudgetCapacity         = 5.0
+	BudgetRefillInterval   = 20 * time.Minute
+	BudgetManualReserve    = 1.0
+	BudgetFirstCooldown    = 15 * time.Minute
+	BudgetLongestCooldown  = 60 * time.Minute
+	BudgetMaxSlowdown      = 3.0 // max 60m per token (never exceeds 60m wait)
 	BudgetRecoveryHalfLife = 6 * time.Hour
 )
 
@@ -59,7 +59,7 @@ func (b RequestBudget) Available(now time.Time) float64 {
 	if elapsed <= 0 {
 		return max(0, min(BudgetCapacity, b.Tokens))
 	}
-	interval := b.RefillIntervalAt(b.UpdatedAt).Seconds()
+	interval := b.RefillIntervalAt(now).Seconds()
 	if interval <= 0 {
 		interval = BudgetRefillInterval.Seconds()
 	}
@@ -82,8 +82,7 @@ func (b RequestBudget) InCooldown(now time.Time) bool {
 	return b.Cooldown(now) > 0
 }
 
-// Wait matches RequestBudget.wait(manual:at:) in claude-usage-monitor:
-// returns the longer of remaining 429 cooldown and token-refill wait.
+// Wait returns the longer of remaining 429 cooldown and token-refill wait.
 func (b RequestBudget) Wait(manual bool, now time.Time) time.Duration {
 	need := 1.0
 	if !manual {
@@ -92,13 +91,17 @@ func (b RequestBudget) Wait(manual bool, now time.Time) time.Duration {
 	missing := need - b.Available(now)
 	var refill time.Duration
 	if missing > 1e-9 {
-		refill = time.Duration(missing * float64(b.RefillIntervalAt(b.UpdatedAt)))
+		refill = time.Duration(missing * float64(b.RefillIntervalAt(now)))
 	}
 	return max(b.Cooldown(now), refill)
 }
 
+// RetryWait returns the remaining 429 cooldown wait until manual retry is allowed again.
 func (b RequestBudget) RetryWait(now time.Time) time.Duration {
-	return b.Wait(false, now)
+	if !b.InCooldown(now) {
+		return 0
+	}
+	return b.Wait(true, now)
 }
 
 func (b RequestBudget) CanAuto(now time.Time) bool {
@@ -120,8 +123,6 @@ func (b *RequestBudget) RecordSuccess(now time.Time) {
 }
 
 func (b *RequestBudget) RecordRateLimit(now time.Time, retryAfter time.Duration) {
-	avail := b.Available(now)
-	left := min(avail, BudgetManualReserve)
 	b.Streak++
 	cooldown := BudgetFirstCooldown * time.Duration(1<<min(b.Streak-1, 4))
 	if cooldown > BudgetLongestCooldown {
@@ -136,6 +137,8 @@ func (b *RequestBudget) RecordRateLimit(now time.Time, retryAfter time.Duration)
 		b.Slowdown = min(BudgetMaxSlowdown, b.EffectiveSlowdown(now)*2)
 		b.SlowedAt = now
 	}
-	b.Tokens = left
+	// Always keep 1 manual-refresh reserve token so manual refresh is ready as soon as cooldown ends,
+	// while auto-sync still waits for 1 slowed refill interval (<= 60m).
+	b.Tokens = BudgetManualReserve
 	b.UpdatedAt = now
 }

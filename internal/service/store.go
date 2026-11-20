@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -137,6 +136,8 @@ type Store struct {
 	loginExpiresAt   *time.Time
 	deadLoginID      string
 	activeLoginID    string
+	lastCredMtime    time.Time
+	lastCredSize     int64
 
 	exitPlace    *core.PublicNetwork
 	exitIPv6     *core.PublicNetwork
@@ -265,6 +266,8 @@ func (s *Store) resetOfficialAccountLocked() {
 	s.loginExpiresAt = nil
 	s.deadLoginID = ""
 	s.activeLoginID = ""
+	s.lastCredMtime = time.Time{}
+	s.lastCredSize = 0
 	s.lastSyncLifetimeCost = 0
 	s.lastSyncWindowCost = 0
 	s.lastSyncFiveHourPct = 0
@@ -392,6 +395,15 @@ func (s *Store) scanIndex(roots []string) {
 	}
 	now := time.Now()
 	rolled := s.snapshotRolledOverLocked(now)
+	cooldownCleared := false
+	if s.isRateLimited && !s.pstate.Budget.InCooldown(now) {
+		s.isRateLimited = false
+		if s.officialState == OfficialFailed && s.officialUsage != nil {
+			s.officialState = OfficialConnected
+			s.officialFailMsg = ""
+		}
+		cooldownCleared = true
+	}
 	if changed || s.snapshot == nil || rolled {
 		s.recomputeSnapshotLocked(now)
 		if changed && idx.Dirty {
@@ -399,7 +411,7 @@ func (s *Store) scanIndex(roots []string) {
 		}
 	}
 	s.mu.Unlock()
-	if changed || rolled {
+	if changed || rolled || cooldownCleared {
 		s.notify()
 	}
 }
@@ -485,8 +497,16 @@ func (s *Store) startFileWatchers() {
 		}
 	}
 	// Watch configured .claude directory so CLI login (.credentials.json creation/update)
-	// automatically wakes up syncing once authorized.
+	// automatically wakes up syncing once authorized. Snapshot current .credentials.json
+	// stat first so unrelated files (history.jsonl, settings.json, etc.) never trigger syncs.
 	resolvedClaudeDir := platform.ClaudeConfigDir(claudeDir)
+	credFile := platform.ClaudeCredentialsFile(claudeDir)
+	if info, err := os.Stat(credFile); err == nil {
+		s.mu.Lock()
+		s.lastCredMtime = info.ModTime()
+		s.lastCredSize = info.Size()
+		s.mu.Unlock()
+	}
 	if _, err := os.Stat(resolvedClaudeDir); err == nil {
 		go s.watchDir(wctx, resolvedClaudeDir, false, func() {
 			s.onCredentialsFileEvent()
@@ -495,6 +515,34 @@ func (s *Store) startFileWatchers() {
 }
 
 func (s *Store) onCredentialsFileEvent() {
+	s.mu.RLock()
+	claudeDir := s.prefs.ClaudeConfigDir
+	prevMtime := s.lastCredMtime
+	prevSize := s.lastCredSize
+	s.mu.RUnlock()
+
+	credFile := platform.ClaudeCredentialsFile(claudeDir)
+	info, err := os.Stat(credFile)
+	if err != nil {
+		s.mu.Lock()
+		hadFile := !s.lastCredMtime.IsZero()
+		s.lastCredMtime = time.Time{}
+		s.lastCredSize = 0
+		s.mu.Unlock()
+		if hadFile {
+			s.syncLocalAuthState()
+		}
+		return
+	}
+	// Ignore all unrelated writes in ~/.claude (e.g. history.jsonl, debug, todos).
+	if info.ModTime().Equal(prevMtime) && info.Size() == prevSize {
+		return
+	}
+	s.mu.Lock()
+	s.lastCredMtime = info.ModTime()
+	s.lastCredSize = info.Size()
+	s.mu.Unlock()
+
 	creds, _, _ := s.loadCredentials()
 	if creds == nil || creds.AccessToken == "" {
 		s.syncLocalAuthState()
@@ -503,11 +551,15 @@ func (s *Store) onCredentialsFileEvent() {
 	id := creds.LoginID()
 	s.mu.RLock()
 	enabled := s.prefs.OfficialEnabled
-	sameActive := s.activeLoginID != "" && s.activeLoginID == id && s.officialState == OfficialConnected
+	state := s.officialState
+	prevActive := s.activeLoginID
 	sameDead := s.deadLoginID != "" && s.deadLoginID == id
 	needExit := s.exitPlace == nil
 	s.mu.RUnlock()
-	if sameActive || sameDead {
+
+	awaitingLogin := state == OfficialNoCredentials || state == OfficialSignedOut || state == OfficialExpired
+	loginSwitched := prevActive != "" && prevActive != id
+	if sameDead || (!awaitingLogin && !loginSwitched) {
 		return
 	}
 	if needExit {
@@ -707,6 +759,10 @@ func (s *Store) TryReadClaudeCodeCache() {
 	s.mu.RLock()
 	claudeDir := s.prefs.ClaudeConfigDir
 	s.mu.RUnlock()
+
+	var bestAccount *core.ClaudeCodeAccount
+	var newestUsage *core.ClaudeCodeUsageCache
+
 	for _, file := range platform.ClaudeGlobalConfigFiles(claudeDir) {
 		data, err := os.ReadFile(file)
 		if err != nil {
@@ -716,47 +772,60 @@ func (s *Store) TryReadClaudeCodeCache() {
 		if cfg == nil {
 			continue
 		}
-		changed := false
-		s.mu.Lock()
-		if cfg.Account != nil && s.profile == nil {
-			s.profile = &core.AccountProfile{
-				AccountUUID:      cfg.Account.UUID,
-				Email:            cfg.Account.Email,
-				OrganizationType: cfg.Account.OrganizationType,
-				RateLimitTier:    cfg.Account.RateLimitTier,
-			}
-			changed = true
+		if cfg.Account != nil && bestAccount == nil {
+			bestAccount = cfg.Account
 		}
 		if cfg.Usage != nil {
-			var shownAt *time.Time
-			if s.officialUsage != nil {
-				t := s.officialUsage.FetchedAt
-				shownAt = &t
-			}
-			acctUUID := ""
-			if s.profile != nil {
-				acctUUID = s.profile.AccountUUID
-			}
-			now := time.Now()
-			if cfg.Usage.Replaces(shownAt, acctUUID, now) {
-				u := cfg.Usage.Usage
-				s.officialUsage = &u
-				s.usageFromClaudeCode = true
-				if s.officialState == OfficialConnecting || s.officialState == OfficialFailed {
-					s.officialState = OfficialConnected
-					s.officialFailMsg = ""
-				}
-				s.applyOfficialToStateLocked(&u)
-				s.recomputeSnapshotLocked(now)
-				s.savePersistedStateLocked()
-				changed = true
+			if newestUsage == nil || cfg.Usage.Usage.FetchedAt.After(newestUsage.Usage.FetchedAt) {
+				u := *cfg.Usage
+				newestUsage = &u
 			}
 		}
-		s.mu.Unlock()
-		if changed {
-			s.notify()
-		}
+	}
+
+	if bestAccount == nil && newestUsage == nil {
 		return
+	}
+
+	changed := false
+	s.mu.Lock()
+	if bestAccount != nil && s.profile == nil {
+		s.profile = &core.AccountProfile{
+			AccountUUID:      bestAccount.UUID,
+			Email:            bestAccount.Email,
+			OrganizationType: bestAccount.OrganizationType,
+			RateLimitTier:    bestAccount.RateLimitTier,
+		}
+		changed = true
+	}
+	if newestUsage != nil {
+		var shownAt *time.Time
+		if s.officialUsage != nil {
+			t := s.officialUsage.FetchedAt
+			shownAt = &t
+		}
+		acctUUID := ""
+		if s.profile != nil {
+			acctUUID = s.profile.AccountUUID
+		}
+		now := time.Now()
+		if newestUsage.Replaces(shownAt, acctUUID, now) {
+			u := newestUsage.Usage
+			s.officialUsage = &u
+			s.usageFromClaudeCode = true
+			if s.officialState == OfficialConnecting || s.officialState == OfficialFailed {
+				s.officialState = OfficialConnected
+				s.officialFailMsg = ""
+			}
+			s.applyOfficialToStateLocked(&u)
+			s.recomputeSnapshotLocked(now)
+			s.savePersistedStateLocked()
+			changed = true
+		}
+	}
+	s.mu.Unlock()
+	if changed {
+		s.notify()
 	}
 }
 
@@ -1013,7 +1082,11 @@ func (s *Store) SyncOfficial(manual bool, fetchProfile bool) {
 		s.pstate.Budget.RecordRateLimit(doneNow, retryAfter)
 		s.isRateLimited = true
 		s.officialState = OfficialFailed
-		s.officialFailMsg = "429"
+		if err != nil {
+			s.officialFailMsg = err.Error()
+		} else {
+			s.officialFailMsg = "429"
+		}
 		s.savePersistedStateLocked()
 		return
 	}
@@ -1083,10 +1156,14 @@ func (s *Store) fetchUsageAPI(client *http.Client, accessToken string) (*core.Of
 	if err != nil {
 		return nil, 0, 0, err
 	}
+	// Match claude-usage-monitor's OfficialUsageService.swift exactly:
+	// Content-Type + Accept + anthropic-beta, no custom/default User-Agent, HTTP/1.1 Connection: close.
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("anthropic-beta", core.OAuthBetaHeader)
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", core.OAuthUserAgent)
+	req.Header.Set("User-Agent", "")
+	req.Close = true
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1098,15 +1175,16 @@ func (s *Store) fetchUsageAPI(client *http.Client, accessToken string) (*core.Of
 		return nil, resp.StatusCode, 0, err
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		var retry time.Duration
-		if ra := resp.Header.Get("Retry-After"); ra != "" {
-			if sec, perr := strconv.Atoi(ra); perr == nil && sec > 0 {
-				retry = time.Duration(sec) * time.Second
-			}
+		retry := core.ParseRetryAfter(resp.Header, time.Now())
+		if summary := core.SummarizeAPIError(body); summary != "" {
+			return nil, resp.StatusCode, retry, fmt.Errorf("HTTP 429 (%s)", summary)
 		}
 		return nil, resp.StatusCode, retry, fmt.Errorf("HTTP 429")
 	}
 	if resp.StatusCode != http.StatusOK {
+		if summary := core.SummarizeAPIError(body); summary != "" {
+			return nil, resp.StatusCode, 0, fmt.Errorf("HTTP %d (%s)", resp.StatusCode, summary)
+		}
 		return nil, resp.StatusCode, 0, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	u, err := core.DecodeOfficialUsage(body, time.Now())
@@ -1121,9 +1199,9 @@ func (s *Store) fetchProfile(client *http.Client, accessToken string, reqClaudeD
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("anthropic-beta", core.OAuthBetaHeader)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", core.OAuthUserAgent)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "")
+	req.Close = true
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1458,9 +1536,9 @@ func (s *Store) ViewState() ViewState {
 	_, credErr := os.Stat(platform.ClaudeCredentialsFile(s.prefs.ClaudeConfigDir))
 	_, projErr := os.Stat(filepath.Join(claudeDir, "projects"))
 
-	rateLimited := s.isRateLimited || s.pstate.Budget.InCooldown(now)
+	inCooldown := s.pstate.Budget.InCooldown(now)
 	var retryWait time.Duration
-	if rateLimited {
+	if inCooldown {
 		retryWait = s.pstate.Budget.RetryWait(now)
 	}
 
@@ -1477,7 +1555,7 @@ func (s *Store) ViewState() ViewState {
 		OfficialUsage:       s.officialUsage,
 		UsageFromClaudeCode: s.usageFromClaudeCode,
 		IsFetching:          s.isFetching,
-		IsRateLimited:       rateLimited,
+		IsRateLimited:       inCooldown,
 		RetryWait:           retryWait,
 		LastUpdated:         lastUp,
 		DetectedPlan:        plan,
@@ -1510,6 +1588,11 @@ func (s *Store) loadPersistedState() {
 	_ = json.Unmarshal(b, &s.pstate)
 	if s.pstate.Budget.Slowdown < 1 {
 		s.pstate.Budget.Slowdown = 1
+	} else if s.pstate.Budget.Slowdown > core.BudgetMaxSlowdown {
+		s.pstate.Budget.Slowdown = core.BudgetMaxSlowdown
+	}
+	if s.pstate.Budget.InCooldown(time.Now()) && s.pstate.Budget.Tokens < core.BudgetManualReserve {
+		s.pstate.Budget.Tokens = core.BudgetManualReserve
 	}
 }
 

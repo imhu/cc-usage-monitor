@@ -135,7 +135,8 @@ func BuildHTTPClient(proxyRaw string, network string, timeout time.Duration) *ht
 	}
 	tr := &http.Transport{
 		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
-		ForceAttemptHTTP2:   true,
+		ForceAttemptHTTP2:   false,
+		TLSNextProto:        make(map[string]func(string, *tls.Conn) http.RoundTripper),
 		MaxIdleConns:        10,
 		IdleConnTimeout:     60 * time.Second,
 		TLSHandshakeTimeout: 8 * time.Second,

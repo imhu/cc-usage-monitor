@@ -12,6 +12,7 @@ import (
 )
 
 func TestPopoverAndSettingsRender(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", t.TempDir())
 	store := service.NewStore(nil)
 	store.SetDemoState()
 

@@ -174,3 +174,105 @@ func TestDayRolloverResetsTodayUsageWithoutNewLogs(t *testing.T) {
 		t.Fatal("expected UI notify() to fire on midnight rollover")
 	}
 }
+
+func TestCredentialsEventIgnoresUnrelatedFiles(t *testing.T) {
+	tmp := t.TempDir()
+	claudeDir := filepath.Join(tmp, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	credPath := filepath.Join(claudeDir, ".credentials.json")
+	credJSON := []byte(`{"claudeAiOauth":{"accessToken":"tok-1","refreshToken":"ref-1","expiresAt":4102444800000,"scopes":["user:profile","user:inference"]}}`)
+	if err := os.WriteFile(credPath, credJSON, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(credPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Store{
+		dataDir:   tmp,
+		prefsPath: filepath.Join(tmp, "prefs.json"),
+		indexPath: filepath.Join(tmp, "index.gob"),
+		statePath: filepath.Join(tmp, "state.json"),
+		prefs:     core.DefaultPreferences(),
+		index:     core.NewUsageIndex(),
+		pstate:    persistedState{Budget: core.NewRequestBudget(time.Now())},
+		// Simulate post-429 failed state where activeLoginID is empty
+		officialState: OfficialFailed,
+		lastCredMtime: info.ModTime(),
+		lastCredSize:  info.Size(),
+	}
+	s.prefs.ClaudeConfigDir = claudeDir
+	s.prefs.ExitGuard = false
+
+	// Writing history.jsonl in ~/.claude must NOT trigger SyncOfficial.
+	if err := os.WriteFile(filepath.Join(claudeDir, "history.jsonl"), []byte(`{"prompt":"hi"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.onCredentialsFileEvent()
+	if s.lastReqAt != nil {
+		t.Fatalf("unrelated file write in .claude must not trigger SyncOfficial, got lastReqAt=%v", s.lastReqAt)
+	}
+}
+
+func TestTryReadClaudeCodeCacheAdoptsFreshUsageDuringCooldown(t *testing.T) {
+	tmp := t.TempDir()
+	claudeDir := filepath.Join(tmp, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	fetchedMs := now.Add(-10 * time.Second).UnixMilli()
+	raw := []byte(`{"oauthAccount":{"accountUuid":"acct-1","emailAddress":"u@example.com"},"cachedUsageUtilization":{"fetchedAtMs":` +
+		strconvFormatInt(fetchedMs) + `,"accountUuid":"acct-1","utilization":{"five_hour":{"utilization":15.2},"seven_day":{"utilization":48.0}}}}`)
+	if err := os.WriteFile(filepath.Join(claudeDir, ".claude.json"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Store{
+		dataDir:   tmp,
+		prefsPath: filepath.Join(tmp, "prefs.json"),
+		indexPath: filepath.Join(tmp, "index.gob"),
+		statePath: filepath.Join(tmp, "state.json"),
+		prefs:     core.DefaultPreferences(),
+		index:     core.NewUsageIndex(),
+		pstate:    persistedState{Budget: core.NewRequestBudget(now)},
+		profile:   &core.AccountProfile{AccountUUID: "acct-1"},
+		officialUsage: &core.OfficialUsage{
+			FiveHour:  &core.OfficialLimit{Utilization: 2},
+			FetchedAt: now.Add(-17 * time.Hour),
+		},
+		officialState:   OfficialFailed,
+		officialFailMsg: "HTTP 429",
+		isRateLimited:   true,
+	}
+	s.prefs.ClaudeConfigDir = claudeDir
+
+	s.TryReadClaudeCodeCache()
+	st := s.ViewState()
+	if st.OfficialUsage == nil || st.OfficialUsage.FiveHour == nil || st.OfficialUsage.FiveHour.Percent() != 15 {
+		t.Fatalf("expected Claude Code cache (15%%) to be adopted, got %+v", st.OfficialUsage)
+	}
+	if st.OfficialState != OfficialConnected {
+		t.Fatalf("expected OfficialConnected after adopting Claude Code cache, got %v", st.OfficialState)
+	}
+	if !st.UsageFromClaudeCode {
+		t.Fatal("expected UsageFromClaudeCode=true")
+	}
+}
+
+func strconvFormatInt(v int64) string {
+	if v == 0 {
+		return "0"
+	}
+	var buf [24]byte
+	i := len(buf)
+	for v > 0 {
+		i--
+		buf[i] = byte('0' + v%10)
+		v /= 10
+	}
+	return string(buf[i:])
+}

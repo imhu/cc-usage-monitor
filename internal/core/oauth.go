@@ -170,7 +170,8 @@ func RequestTokenRefresh(ctx context.Context, client *http.Client, refreshToken 
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", OAuthUserAgent)
+	req.Header.Set("User-Agent", "") // Match claude-usage-monitor: omit custom/default User-Agent
+	req.Close = true
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -185,7 +186,7 @@ func RequestTokenRefresh(ctx context.Context, client *http.Client, refreshToken 
 	return parseGrant(respBody, refreshToken, reqScopes, now)
 }
 
-func parseRetryAfter(hdr http.Header, now time.Time) time.Duration {
+func ParseRetryAfter(hdr http.Header, now time.Time) time.Duration {
 	if hdr == nil {
 		return 0
 	}
@@ -205,6 +206,43 @@ func parseRetryAfter(hdr http.Header, now time.Time) time.Duration {
 		}
 	}
 	return 0
+}
+
+// SummarizeAPIError extracts a short, credential-free error summary from an Anthropic JSON/text response.
+func SummarizeAPIError(body []byte) string {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return ""
+	}
+	var raw map[string]any
+	if json.Unmarshal(body, &raw) == nil {
+		if m, ok := raw["error"].(map[string]any); ok {
+			typ, _ := m["type"].(string)
+			msg, _ := m["message"].(string)
+			if len(msg) > 120 {
+				msg = msg[:120]
+			}
+			if typ != "" && msg != "" {
+				return typ + ": " + msg
+			}
+			if msg != "" {
+				return msg
+			}
+			if typ != "" {
+				return typ
+			}
+		} else if s, ok := raw["error"].(string); ok && s != "" {
+			desc, _ := raw["error_description"].(string)
+			if desc != "" {
+				return s + ": " + desc
+			}
+			return s
+		}
+	}
+	s := strings.Join(strings.Fields(string(body)), " ")
+	if len(s) > 120 {
+		s = s[:120]
+	}
+	return s
 }
 
 func formatRetryWait(d time.Duration) string {
@@ -252,7 +290,7 @@ func classifyOAuthError(status int, hdr http.Header, body []byte, now time.Time)
 		base = fmt.Sprintf("oauth token HTTP %d (%s: %s)", status, code, msg)
 	}
 	if status == http.StatusTooManyRequests {
-		wait := parseRetryAfter(hdr, now)
+		wait := ParseRetryAfter(hdr, now)
 		if wait > 0 {
 			return &OAuthRateLimitError{
 				RetryAfter: wait,
