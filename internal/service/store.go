@@ -44,12 +44,13 @@ const (
 type ViewState struct {
 	Prefs core.Preferences
 
-	Phase         IndexPhase
-	IndexProgress float64
-	IndexSize     int64
-	Snapshot      *core.UsageSnapshot
-	SpeedLog      core.SpeedLog
-	SpeedModelID  string
+	Phase          IndexPhase
+	IndexProgress  float64
+	IndexSize      int64
+	Snapshot       *core.UsageSnapshot
+	SpeedLog       core.SpeedLog
+	SpeedModelID   string
+	SpeedDefaultID string
 
 	// Official usage
 	OfficialState       OfficialStateKind
@@ -89,12 +90,32 @@ type ViewState struct {
 	DataRoots          []string
 }
 
+// ActiveSpeedModel returns the model currently displayed for output speed,
+// preferring user choice, then sticky auto-default, then highest-output model.
+func (st ViewState) ActiveSpeedModel(models []core.ModelSpeed) *core.ModelSpeed {
+	for _, id := range []string{st.SpeedModelID, st.SpeedDefaultID} {
+		if id == "" {
+			continue
+		}
+		for i := range models {
+			if models[i].ID() == id {
+				return &models[i]
+			}
+		}
+	}
+	if len(models) > 0 {
+		return &models[0]
+	}
+	return nil
+}
+
 type persistedState struct {
 	ClaudeConfigDir  string               `json:"claudeConfigDir,omitempty"`
 	Budget           core.RequestBudget   `json:"budget"`
 	WeeklyReset      *time.Time           `json:"weeklyReset,omitempty"`
 	WeeklyReading    *core.WeeklyReading  `json:"weeklyReading,omitempty"`
 	EarlierAllowance *core.AllowanceBasis `json:"earlierAllowance,omitempty"`
+	MidweekReset     *core.MidweekReset   `json:"midweekReset,omitempty"`
 	LastUsage        *core.OfficialUsage  `json:"lastUsage,omitempty"`
 	Profile          *core.AccountProfile `json:"profile,omitempty"`
 }
@@ -112,11 +133,12 @@ type Store struct {
 	index *core.UsageIndex
 	pstate persistedState
 
-	phase         IndexPhase
-	indexProgress float64
-	snapshot      *core.UsageSnapshot
-	speedLog      core.SpeedLog
-	speedModelID  string
+	phase          IndexPhase
+	indexProgress  float64
+	snapshot       *core.UsageSnapshot
+	speedLog       core.SpeedLog
+	speedModelID   string
+	speedDefaultID string
 
 	officialState       OfficialStateKind
 	officialFailMsg     string
@@ -279,6 +301,7 @@ func (s *Store) resetOfficialAccountLocked() {
 	s.pstate.WeeklyReset = nil
 	s.pstate.WeeklyReading = nil
 	s.pstate.EarlierAllowance = nil
+	s.pstate.MidweekReset = nil
 	s.pstate.ClaudeConfigDir = platform.ClaudeConfigDir(s.prefs.ClaudeConfigDir)
 	s.savePersistedStateLocked()
 }
@@ -387,7 +410,7 @@ func (s *Store) scanIndex(roots []string) {
 	}
 
 	s.mu.Lock()
-	_, changed := idx.ScanRoots(roots, nil)
+	stats := idx.ScanRoots(roots, nil)
 	if len(idx.Records) > 0 {
 		s.phase = PhaseReady
 	} else {
@@ -404,14 +427,16 @@ func (s *Store) scanIndex(roots []string) {
 		}
 		cooldownCleared = true
 	}
-	if changed || s.snapshot == nil || rolled {
+	if stats.RecordsChanged || s.snapshot == nil || rolled {
 		s.recomputeSnapshotLocked(now)
-		if changed && idx.Dirty {
+		if stats.RecordsChanged && idx.Dirty {
 			_ = idx.Save(s.indexPath)
 		}
+	} else if stats.TimingsChanged {
+		s.updateSpeedLogLocked(now)
 	}
 	s.mu.Unlock()
-	if changed || rolled || cooldownCleared {
+	if stats.RecordsChanged || stats.TimingsChanged || rolled || cooldownCleared {
 		s.notify()
 	}
 }
@@ -1294,23 +1319,22 @@ func (s *Store) applyOfficialToStateLocked(u *core.OfficialUsage) {
 	s.pstate.ClaudeConfigDir = platform.ClaudeConfigDir(s.prefs.ClaudeConfigDir)
 	s.pstate.LastUsage = u
 	if u.SevenDay != nil && u.SevenDay.ResetsAt != nil {
-		r := *u.SevenDay.ResetsAt
-		s.pstate.WeeklyReset = &r
-		reading := &core.WeeklyReading{
-			Utilization: u.SevenDay.Utilization,
+		newEnd := *u.SevenDay.ResetsAt
+		// Use the floored integer percentage shown on the panel, matching claude-usage-monitor.
+		newReading := core.WeeklyReading{
+			Utilization: float64(u.SevenDay.Percent()),
 			At:          u.FetchedAt,
 		}
-		// Archive previous high-utilization week basis before overwriting
-		if s.snapshot != nil && s.snapshot.WeeklyAllowance != nil &&
-			s.snapshot.WeeklyAllowance.Utilization >= core.MinWeeklyUtilizationForBasis &&
-			!s.snapshot.WeeklyAllowance.Borrowed {
-			s.pstate.EarlierAllowance = &core.AllowanceBasis{
-				Utilization: s.snapshot.WeeklyAllowance.Utilization,
-				SyncedCost:  s.snapshot.WeeklyAllowance.SyncedCost,
-				At:          u.FetchedAt,
+		if s.pstate.WeeklyReading != nil && s.pstate.WeeklyReset != nil {
+			if reset := core.MidweekResetBetween(*s.pstate.WeeklyReading, *s.pstate.WeeklyReset, newReading, newEnd); reset != nil {
+				s.pstate.MidweekReset = reset
 			}
 		}
-		s.pstate.WeeklyReading = reading
+		if s.pstate.MidweekReset != nil && !s.pstate.MidweekReset.BelongsToWeekEnding(newEnd) {
+			s.pstate.MidweekReset = nil
+		}
+		s.pstate.WeeklyReset = &newEnd
+		s.pstate.WeeklyReading = &newReading
 	}
 	if s.snapshot != nil {
 		s.lastSyncLifetimeCost = s.snapshot.LifetimeCost
@@ -1333,6 +1357,14 @@ func (s *Store) recomputeSnapshotLocked(now time.Time) {
 	if s.officialUsage != nil && s.officialUsage.FiveHour != nil {
 		fiveHourReset = s.officialUsage.FiveHour.ResetsAt
 	}
+	weeklyReading := s.pstate.WeeklyReading
+	if s.officialUsage != nil && s.officialUsage.SevenDay != nil {
+		r := core.WeeklyReading{
+			Utilization: float64(s.officialUsage.SevenDay.Percent()),
+			At:          s.officialUsage.FetchedAt,
+		}
+		weeklyReading = &r
+	}
 	h, m, sec := 0, 0, 0
 	if s.pstate.WeeklyReset != nil {
 		loc := s.pstate.WeeklyReset.Local()
@@ -1345,12 +1377,68 @@ func (s *Store) recomputeSnapshotLocked(now time.Time) {
 		BillingAnchorSecond: sec,
 		WeeklyReset:         s.pstate.WeeklyReset,
 		FiveHourReset:       fiveHourReset,
-		WeeklyReading:       s.pstate.WeeklyReading,
+		WeeklyReading:       weeklyReading,
 		EarlierAllowance:    s.pstate.EarlierAllowance,
+		MidweekReset:        s.pstate.MidweekReset,
 	}
 	snap := core.ComputeSnapshot(s.index.MakeSnapshot(), settings, now)
 	s.snapshot = &snap
+	s.updateSpeedLogLocked(now)
+	if s.rememberAllowanceLocked(snap) {
+		s.savePersistedStateLocked()
+	}
+}
+
+func (s *Store) updateSpeedLogLocked(now time.Time) {
+	if s.index == nil {
+		return
+	}
 	s.speedLog = s.index.SpeedLog()
+	nowSec := float64(now.Unix()) + float64(now.Nanosecond())/1e9
+	models := s.speedLog.Models(nowSec)
+	stillPresent := false
+	if s.speedDefaultID != "" {
+		for _, m := range models {
+			if m.ID() == s.speedDefaultID {
+				stillPresent = true
+				break
+			}
+		}
+	}
+	if !stillPresent {
+		if len(models) > 0 {
+			s.speedDefaultID = models[0].ID()
+		} else {
+			s.speedDefaultID = ""
+		}
+	}
+}
+
+func (s *Store) rememberAllowanceLocked(snap core.UsageSnapshot) bool {
+	dirty := false
+	if snap.WeeklyAllowance != nil && snap.WeeklyAllowance.Reset != nil {
+		if !s.pstate.MidweekReset.Equal(snap.WeeklyAllowance.Reset) {
+			r := *snap.WeeklyAllowance.Reset
+			s.pstate.MidweekReset = &r
+			dirty = true
+		}
+	}
+	if a := snap.WeeklyAllowance; a != nil && !a.Borrowed &&
+		a.Utilization >= core.MinWeeklyUtilizationForBasis && a.SyncedAt != nil {
+		basis := core.AllowanceBasis{
+			Utilization: a.Utilization,
+			SyncedCost:  a.SyncedCost,
+			At:          *a.SyncedAt,
+		}
+		if s.pstate.EarlierAllowance == nil ||
+			s.pstate.EarlierAllowance.Utilization != basis.Utilization ||
+			s.pstate.EarlierAllowance.SyncedCost != basis.SyncedCost ||
+			!s.pstate.EarlierAllowance.At.Equal(basis.At) {
+			s.pstate.EarlierAllowance = &basis
+			dirty = true
+		}
+	}
+	return dirty
 }
 
 func (s *Store) currentActivityLocked(now time.Time) core.SyncActivity {
@@ -1479,9 +1567,19 @@ func (s *Store) CycleSpeedModel(models []core.ModelSpeed) {
 	}
 	s.mu.Lock()
 	idx := 0
-	for i, m := range models {
-		if m.ID() == s.speedModelID {
-			idx = i
+	found := false
+	for _, id := range []string{s.speedModelID, s.speedDefaultID} {
+		if id == "" {
+			continue
+		}
+		for i, m := range models {
+			if m.ID() == id {
+				idx = i
+				found = true
+				break
+			}
+		}
+		if found {
 			break
 		}
 	}
@@ -1550,6 +1648,7 @@ func (s *Store) ViewState() ViewState {
 		Snapshot:            s.snapshot,
 		SpeedLog:            s.speedLog,
 		SpeedModelID:        s.speedModelID,
+		SpeedDefaultID:      s.speedDefaultID,
 		OfficialState:       s.officialState,
 		OfficialFailMsg:     s.officialFailMsg,
 		OfficialUsage:       s.officialUsage,
@@ -1597,6 +1696,9 @@ func (s *Store) loadPersistedState() {
 }
 
 func (s *Store) savePersistedStateLocked() {
+	if s.statePath == "" {
+		return
+	}
 	b, err := json.Marshal(s.pstate)
 	if err != nil {
 		return

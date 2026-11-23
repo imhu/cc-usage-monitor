@@ -3,6 +3,7 @@ package appui
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,6 +43,16 @@ func NewPopoverModel(store *service.Store, actions PopoverActions) *PopoverModel
 	}
 }
 
+// ResetHover clears ephemeral hover state when the popover closes or hides.
+func (m *PopoverModel) ResetHover() {
+	m.hoveredAge = -1
+	m.hoveredReply = 0
+	m.hoveredDay = -1
+	for k := range m.hoveredBar {
+		delete(m.hoveredBar, k)
+	}
+}
+
 func (m *PopoverModel) View(c *ui.Context) {
 	ApplyDarkTheme(c)
 	c.Root().Background(ui.Transparent)
@@ -63,14 +74,19 @@ func (m *PopoverModel) View(c *ui.Context) {
 	zh := st.Prefs.IsChinese()
 	now := time.Now()
 
-	// Schedule periodic 1s tick when countdown or pending generation is active
-	if st.Prefs.ShowResetCountdown || len(st.SpeedLog.Pending) > 0 {
+	if c.WindowHidden() {
+		m.ResetHover()
+	}
+
+	// Match claude-usage-monitor: tick every 1s while panel is visible when countdown
+	// or output speed is active (shifts timeline, drops expired 5m replies, ticks generating timer).
+	if st.Prefs.ShowResetCountdown || st.Prefs.SpeedDisplay != core.DisplayHidden {
 		c.After(time.Second)
 	} else {
 		c.After(15 * time.Second)
 	}
 
-	root := ui.Column(c).Width(PopoverWidth).Padding(13, PanelPadH, 8, PanelPadH).Gap(0)
+	root := ui.Column(c).Fill().Width(PopoverWidth).Padding(13, PanelPadH, 8, PanelPadH).Gap(0)
 	if c.Vibrancy() {
 		root.Background(ui.RGBA(20, 20, 18, 0.72))
 	} else {
@@ -78,25 +94,29 @@ func (m *PopoverModel) View(c *ui.Context) {
 	}
 
 	root.Children(func() {
-		// 1. Header: Claude logo + title + PlanBadge
+		// 1. Header: Claude logo + title + PlanBadge (pinned at top)
 		m.renderHeader(c, st, zh)
 
-		// 2. Exit / Network Place row
-		m.renderExitRow(c, st, zh)
+		// Scrollable middle body: expands to natural height via FitContent when
+		// the screen has room, and scrolls smoothly if content exceeds WorkArea.
+		ui.Scroll(c.Key("popover-body")).FillWidth().Grow(1).Scrollbars(false).Children(func() {
+			// 2. Exit / Network Place row
+			m.renderExitRow(c, st, zh)
 
-		// 3. Running Claude processes (collapsible)
-		if st.Prefs.ShowProcesses && len(st.Processes) > 0 {
-			m.renderProcesses(c, st, zh)
-		}
+			// 3. Running Claude processes (collapsible)
+			if st.Prefs.ShowProcesses && len(st.Processes) > 0 {
+				m.renderProcesses(c, st, zh)
+			}
+
+			Hairline(c)
+
+			// 4. Main content sections (Limits, Speed, Spend)
+			m.renderSections(c, st, now, zh)
+		})
 
 		Hairline(c)
 
-		// 4. Main content sections (Limits, Speed, Spend)
-		m.renderSections(c, st, now, zh)
-
-		Hairline(c)
-
-		// 5. Footer: 设置… | 立即刷新 | 退出
+		// 5. Footer: 设置… | 立即刷新 | 退出 (pinned at bottom)
 		m.renderFooter(c, st, zh)
 	})
 }
@@ -563,18 +583,9 @@ func (m *PopoverModel) renderLimitsUnavailable(c *ui.Context, st service.ViewSta
 }
 
 func (m *PopoverModel) renderSpeedSection(c *ui.Context, st service.ViewState, now time.Time, zh bool) {
-	nowSec := float64(now.UnixNano()) / 1e9
+	nowSec := float64(now.Unix()) + float64(now.Nanosecond())/1e9
 	models := st.SpeedLog.Models(nowSec)
-	var cur *core.ModelSpeed
-	if len(models) > 0 {
-		cur = &models[0]
-		for i := range models {
-			if models[i].ID() == st.SpeedModelID {
-				cur = &models[i]
-				break
-			}
-		}
-	}
+	cur := st.ActiveSpeedModel(models)
 	var reqs []core.TimedRequest
 	var pending []core.PendingRequest
 	if cur != nil {
@@ -593,23 +604,38 @@ func (m *PopoverModel) renderSpeedSection(c *ui.Context, st service.ViewState, n
 	untimed := !replied && st.SpeedLog.LastUntimed > nowSec-core.SpeedSpanWindow
 	collapsed := st.Prefs.CollapsedSpeed
 	detailed := st.Prefs.SpeedDisplay == core.DisplayDetailed
+	if collapsed || !replied {
+		m.hoveredAge = -1
+		m.hoveredReply = 0
+	}
 
 	ui.Column(c).FillWidth().Padding(14, 0).Gap(10).Children(func() {
 		SectionHeader(c, "sec-speed", tr(zh, "输出速度", "Output speed"), collapsed, func() {
 			m.Store.UpdatePrefs(func(p *core.Preferences) { p.CollapsedSpeed = !p.CollapsedSpeed })
 		}, func() {
 			if collapsed {
-				ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
+				sumRow := ui.Row(c).Gap(5).AlignItems(ui.Center)
+				if tip := speedSummaryTooltip(recent, hour, cur, replied, untimed, zh); tip != "" {
+					sumRow.Tooltip(tip)
+				}
+				sumRow.Children(func() {
 					if len(pending) > 0 {
 						ui.Box(c).Size(5, 5).Radius(2.5).Background(ColorLive)
 					}
 					if recent != nil {
-						ui.Text(c, fmt.Sprintf("%d tok/s", int(math.Round(recent.TokensPerSecond())))).
-							FontSize(10.5).FontWeight(500).TextColor(ColorSecondary).FontFeatures("tnum").SingleLine()
+						ui.Row(c).AlignItems(ui.Baseline).Gap(0).Children(func() {
+							ui.Text(c, fmt.Sprintf("%d", int(math.Round(recent.TokensPerSecond())))).
+								FontSize(10.5).FontWeight(500).TextColor(ColorSecondary).FontFeatures("tnum").SingleLine()
+							ui.Text(c, " tok/s").FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
+						})
 					} else if len(pending) > 0 {
 						ui.Text(c, tr(zh, "生成中", "Generating")).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
+					} else if untimed {
+						ui.Text(c, tr(zh, "更新 Claude Code 后才能计时", "Update Claude Code to time replies")).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
+					} else if replied {
+						ui.Text(c, tr(zh, "近 5 分钟没有回复", "No replies in 5 min")).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
 					} else {
-						ui.Text(c, tr(zh, "最近 1 小时没有回复", "No replies in last hour")).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
+						ui.Text(c, tr(zh, "最近 1 小时没有回复", "No replies in the last hour")).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
 					}
 				})
 				return
@@ -624,10 +650,12 @@ func (m *PopoverModel) renderSpeedSection(c *ui.Context, st service.ViewState, n
 				if len(pending) > 1 {
 					label = tr(zh, fmt.Sprintf("%d 个生成中 · %s", len(pending), tstr), fmt.Sprintf("%d generating · %s", len(pending), tstr))
 				}
-				ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
-					ui.Box(c).Size(5, 5).Radius(2.5).Background(ColorLive)
-					ui.Text(c, label).FontSize(10.5).TextColor(ColorSecondary).FontFeatures("tnum").SingleLine()
-				})
+				ui.Row(c).Gap(5).AlignItems(ui.Center).
+					Tooltip(tr(zh, "请求已经发出，回复写完后数字会更新", "The request is out. The number updates when the reply is written.")).
+					Children(func() {
+						ui.Box(c).Size(5, 5).Radius(2.5).Background(ColorLive)
+						ui.Text(c, label).FontSize(10.5).TextColor(ColorSecondary).FontFeatures("tnum").SingleLine()
+					})
 			}
 		})
 
@@ -638,39 +666,44 @@ func (m *PopoverModel) renderSpeedSection(c *ui.Context, st service.ViewState, n
 		if !replied {
 			if untimed {
 				EmptyNote(c, IconClock, tr(zh, "更新 Claude Code 后才能计时", "Update Claude Code to time replies"),
-					tr(zh, "2.1.304 起会记下每个请求发出的时刻", "2.1.304+ records request timestamps."), nil)
+					tr(zh, "2.1.304 起会记下每个请求发出的时刻", "Version 2.1.304 and later record when each request is sent."), nil)
 			} else if len(pending) > 0 {
-				EmptyNote(c, IconPulse, tr(zh, "回复写完后显示速度", "Speed appears once reply finishes"), "", nil)
+				EmptyNote(c, IconPulse, tr(zh, "回复写完后显示速度", "The speed appears once the reply is written"), "", nil)
 			} else {
 				EmptyNote(c, IconPulse, tr(zh, "最近 1 小时没有回复", "No replies in the last hour"),
-					tr(zh, "Claude Code 写完回复后，这里显示每秒输出多少 token", "Shows tokens/sec once Claude Code writes a reply."), nil)
+					tr(zh, "Claude Code 写完回复后，这里显示每秒输出多少 token", "Once Claude Code writes a reply, its tokens per second show here."), nil)
 			}
 			return
 		}
 
-		trend := core.ComputeSpeedTrend(reqs, nowSec-core.SpeedSpanWindow, nowSec)
+		var trend []core.TrendPoint
+		if !detailed {
+			trend = core.ComputeSpeedTrend(reqs, nowSec-core.SpeedSpanWindow, nowSec)
+		}
 		ui.Row(c).FillWidth().AlignItems(ui.End).Gap(12).Children(func() {
 			ui.Column(c).Grow(1).Gap(4).Children(func() {
-				// Headline: "71 tok/s"
-				ui.Row(c).AlignItems(ui.Baseline).Gap(4).Children(func() {
-					valStr := "–"
-					valCol := ColorTertiary
-					if recent != nil {
-						valStr = fmt.Sprintf("%d", int(math.Round(recent.TokensPerSecond())))
-						valCol = ColorText
-					}
-					ui.Text(c, valStr).FontSize(26).FontWeight(600).LetterSpacing(-0.4).TextColor(valCol).FontFeatures("tnum").SingleLine()
-					ui.Text(c, "tok/s").FontSize(12).FontWeight(500).TextColor(ColorTertiary).SingleLine()
-				})
+				// Headline: "71 tok/s" with recent 5m tooltip (compact also includes 1h summary)
+				var tipHour *core.SpeedRate
+				if !detailed {
+					tipHour = hour
+				}
+				ui.Row(c).AlignItems(ui.Baseline).Gap(4).
+					Tooltip(speedRecentTooltip(recent, tipHour, cur, true, zh)).
+					Children(func() {
+						valStr := "–"
+						valCol := ColorTertiary
+						if recent != nil {
+							valStr = fmt.Sprintf("%d", int(math.Round(recent.TokensPerSecond())))
+							valCol = ColorText
+						}
+						ui.Text(c, valStr).FontSize(26).FontWeight(600).LetterSpacing(-0.4).TextColor(valCol).FontFeatures("tnum").SingleLine()
+						ui.Text(c, "tok/s").FontSize(12).FontWeight(500).TextColor(ColorTertiary).SingleLine()
+					})
 
-				// Subtitle: hover point OR "近 5 分钟 · Opus 5.5"
+				// Subtitle: hovered sparkline point OR "近 5 分钟 · Opus 5.5"
 				if !detailed && m.hoveredAge >= 0 && len(trend) > 0 {
-					ni := nearestTrendIndex(trend, nowSec-m.hoveredAge)
-					if ni >= 0 {
-						tp := trend[ni]
-						tStr := time.Unix(int64(tp.T), 0).Local().Format("15:04")
-						ui.Text(c, tr(zh, fmt.Sprintf("%s 前 5 分钟 · %d tok/s", tStr, int(math.Round(tp.Rate))),
-							fmt.Sprintf("5m to %s · %d tok/s", tStr, int(math.Round(tp.Rate))))).
+					if ni := nearestTrendIndex(trend, nowSec-m.hoveredAge); ni >= 0 {
+						ui.Text(c, speedMomentText(trend[ni].T, reqs, zh)).
 							FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
 					}
 				} else {
@@ -681,6 +714,7 @@ func (m *PopoverModel) renderSpeedSection(c *ui.Context, st service.ViewState, n
 					sw := ui.Row(c.Key("speed-model-sw")).Gap(4).AlignItems(ui.Center)
 					if len(models) > 1 {
 						sw.Cursor(ui.CursorPointer)
+						sw.Tooltip(speedModelsTooltip(models, cur, nowSec, zh))
 						if sw.Clicked() {
 							m.Store.CycleSpeedModel(models)
 						}
@@ -700,14 +734,16 @@ func (m *PopoverModel) renderSpeedSection(c *ui.Context, st service.ViewState, n
 
 			if detailed {
 				if hour != nil {
-					ui.Column(c).AlignItems(ui.End).Gap(3).Children(func() {
-						ui.Text(c, tr(zh, fmt.Sprintf("1 小时 %d tok/s", int(math.Round(hour.TokensPerSecond()))),
-							fmt.Sprintf("1 hr %d tok/s", int(math.Round(hour.TokensPerSecond()))))).
-							FontSize(10.5).TextColor(ColorSecondary).FontFeatures("tnum").SingleLine()
-						ui.Text(c, tr(zh, fmt.Sprintf("%s 次 · %s tokens", core.FormatGrouped(int64(hour.Count)), core.FormatMagnitude(int64(hour.Output), zh)),
-							fmt.Sprintf("%s replies · %s tokens", core.FormatGrouped(int64(hour.Count)), core.FormatMagnitude(int64(hour.Output), zh)))).
-							FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
-					})
+					ui.Column(c).AlignItems(ui.End).Gap(3).
+						Tooltip(speedHourTooltip(hour, cur, zh)).
+						Children(func() {
+							ui.Text(c, tr(zh, fmt.Sprintf("1 小时 %d tok/s", int(math.Round(hour.TokensPerSecond()))),
+								fmt.Sprintf("1 hr %d tok/s", int(math.Round(hour.TokensPerSecond()))))).
+								FontSize(10.5).TextColor(ColorSecondary).FontFeatures("tnum").SingleLine()
+							ui.Text(c, tr(zh, fmt.Sprintf("%s 次 · %s tokens", core.FormatGrouped(int64(hour.Count)), core.FormatMagnitude(int64(hour.Output), zh)),
+								fmt.Sprintf("%s replies · %s tokens", core.FormatGrouped(int64(hour.Count)), core.FormatMagnitude(int64(hour.Output), zh)))).
+								FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
+						})
 				}
 			} else {
 				SpeedSparkline(c, "speed-spark", trend, nowSec, &m.hoveredAge)
@@ -715,34 +751,174 @@ func (m *PopoverModel) renderSpeedSection(c *ui.Context, st service.ViewState, n
 		})
 
 		if detailed {
-			SpeedChart(c, "speed-chart", reqs, pending, nowSec, &m.hoveredReply)
-			// Time axis or hovered reply detail
-			var hovReq *core.TimedRequest
-			if m.hoveredReply != 0 {
-				for i := range reqs {
-					if reqs[i].ID == m.hoveredReply {
-						hovReq = &reqs[i]
-						break
+			ui.Column(c).FillWidth().Gap(6).Children(func() {
+				SpeedChart(c, "speed-chart", reqs, pending, nowSec, &m.hoveredReply)
+				// Time axis or hovered reply detail
+				var hovReq *core.TimedRequest
+				if m.hoveredReply != 0 {
+					for i := range reqs {
+						if reqs[i].ID == m.hoveredReply {
+							hovReq = &reqs[i]
+							break
+						}
 					}
 				}
-			}
-			if hovReq != nil {
-				tStr := time.Unix(int64(hovReq.End), 0).Local().Format("15:04:05")
-				secStr := fmt.Sprintf("%.1f", hovReq.Duration())
-				ui.Text(c, tr(zh, fmt.Sprintf("%s · %s tokens ÷ %s 秒 = %d tok/s", tStr, core.FormatGrouped(int64(hovReq.Output)), secStr, int(math.Round(hovReq.Rate()))),
-					fmt.Sprintf("%s · %s tokens ÷ %ss = %d tok/s", tStr, core.FormatGrouped(int64(hovReq.Output)), secStr, int(math.Round(hovReq.Rate()))))).
-					FontSize(10.5).TextColor(ColorSecondary).FontFeatures("tnum").SingleLine()
-			} else {
-				ui.Row(c).FillWidth().Children(func() {
-					ui.Text(c, tr(zh, "60 分钟前", "60m ago")).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
-					ui.Spacer(c)
-					ui.Text(c, tr(zh, "30 分钟前", "30m ago")).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
-					ui.Spacer(c)
-					ui.Text(c, tr(zh, "现在", "Now")).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
-				})
-			}
+				if hovReq != nil {
+					ui.Text(c, speedReplyDetail(*hovReq, zh)).
+						FontSize(10.5).TextColor(ColorSecondary).FontFeatures("tnum").SingleLine()
+				} else {
+					// Three equal flex columns guarantee "30 min ago" sits dead-center at 50% width.
+					ui.Row(c).FillWidth().Children(func() {
+						ui.Row(c).Grow(1).Justify(ui.Start).Children(func() {
+							ui.Text(c, tr(zh, "60 分钟前", "60 min ago")).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
+						})
+						ui.Row(c).Grow(1).Justify(ui.Center).Children(func() {
+							ui.Text(c, tr(zh, "30 分钟前", "30 min ago")).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
+						})
+						ui.Row(c).Grow(1).Justify(ui.End).Children(func() {
+							ui.Text(c, tr(zh, "现在", "Now")).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
+						})
+					})
+				}
+			})
 		}
 	})
+}
+
+func speedBasisNote(zh bool) string {
+	return tr(zh,
+		"速度 = 输出 ÷ 生成耗时，按 token 加权。耗时从请求发出算到回复写完，包含排队和等第一个字，所以短回复显得慢。思考的 token 也算输出。",
+		"Speed = output ÷ time, weighted by tokens. Time runs from sending the request to the end of the reply, including the queue and the wait for the first token, so short replies look slow. Thinking counts as output.",
+	)
+}
+
+func speedBreakdownLines(r core.SpeedRate, zh bool) []string {
+	sec := fmt.Sprintf("%.1f", r.Duration)
+	return []string{
+		tr(zh, fmt.Sprintf("回复: %s 次", core.FormatGrouped(int64(r.Count))), fmt.Sprintf("Replies: %s", core.FormatGrouped(int64(r.Count)))),
+		tr(zh, fmt.Sprintf("输出: %s tokens", core.FormatGrouped(int64(r.Output))), fmt.Sprintf("Output: %s tokens", core.FormatGrouped(int64(r.Output)))),
+		tr(zh, fmt.Sprintf("生成耗时: %s 秒", sec), fmt.Sprintf("Time: %ss", sec)),
+	}
+}
+
+func speedRecentTooltip(recent, hour *core.SpeedRate, model *core.ModelSpeed, explains bool, zh bool) string {
+	title := tr(zh, "近 5 分钟", "Last 5 min")
+	if model != nil {
+		title += " · " + model.Title(zh)
+	}
+	lines := []string{title}
+	if recent != nil {
+		lines = append(lines, speedBreakdownLines(*recent, zh)...)
+	}
+	if hour != nil {
+		w := int(math.Round(hour.TokensPerSecond()))
+		lines = append(lines, tr(zh,
+			fmt.Sprintf("最近 1 小时: %d tok/s · %s 次", w, core.FormatGrouped(int64(hour.Count))),
+			fmt.Sprintf("Last hour: %d tok/s · %s replies", w, core.FormatGrouped(int64(hour.Count))),
+		))
+	}
+	var notes []string
+	if recent == nil {
+		notes = append(notes, tr(zh, "这 5 分钟里没有写完的回复。", "No reply finished in these 5 minutes."))
+	}
+	if explains {
+		notes = append(notes, speedBasisNote(zh))
+	}
+	if len(notes) > 0 {
+		sep := ""
+		if !zh {
+			sep = " "
+		}
+		lines = append(lines, strings.Join(notes, sep))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func speedHourTooltip(hour *core.SpeedRate, model *core.ModelSpeed, zh bool) string {
+	if hour == nil {
+		return ""
+	}
+	title := tr(zh, "最近 1 小时", "Last hour")
+	if model != nil {
+		title += " · " + model.Title(zh)
+	}
+	lines := []string{title}
+	lines = append(lines, speedBreakdownLines(*hour, zh)...)
+	lines = append(lines, speedBasisNote(zh))
+	return strings.Join(lines, "\n")
+}
+
+func speedModelsTooltip(models []core.ModelSpeed, cur *core.ModelSpeed, nowSec float64, zh bool) string {
+	lines := []string{tr(zh,
+		fmt.Sprintf("最近 1 小时用了 %d 个模型", len(models)),
+		fmt.Sprintf("%d models in the last hour", len(models)),
+	)}
+	for _, m := range models {
+		marker := "○ "
+		if cur != nil && m.ID() == cur.ID() {
+			marker = "● "
+		}
+		var val string
+		if r := core.ComputeSpeedRate(m.Requests, nowSec-core.SpeedSpanWindow, nowSec); r != nil {
+			w := int(math.Round(r.TokensPerSecond()))
+			val = tr(zh,
+				fmt.Sprintf("%d tok/s · %s 次", w, core.FormatGrouped(int64(r.Count))),
+				fmt.Sprintf("%d tok/s · %s replies", w, core.FormatGrouped(int64(r.Count))),
+			)
+		} else if len(m.Pending) > 0 {
+			val = tr(zh, "生成中", "Generating")
+		} else {
+			val = "–"
+		}
+		lines = append(lines, marker+m.Title(zh)+": "+val)
+	}
+	lines = append(lines, tr(zh, "点击换下一个", "Click to show the next one."))
+	return strings.Join(lines, "\n")
+}
+
+func speedSummaryTooltip(recent, hour *core.SpeedRate, model *core.ModelSpeed, replied, untimed bool, zh bool) string {
+	if untimed {
+		return tr(zh,
+			"2.1.304 起的 Claude Code 会记下每个请求发出的时刻，更新后就能计时",
+			"Claude Code 2.1.304 and later record when each request is sent. Update to time replies.",
+		)
+	}
+	if !replied {
+		return ""
+	}
+	return speedRecentTooltip(recent, hour, model, false, zh)
+}
+
+func speedMomentText(t float64, reqs []core.TimedRequest, zh bool) string {
+	tStr := time.Unix(int64(t), 0).Local().Format("15:04")
+	r := core.ComputeSpeedRate(reqs, t-core.SpeedRecentWindow, t)
+	if r == nil {
+		return tr(zh, tStr+" 前 5 分钟没有回复", "No replies in the 5 min to "+tStr)
+	}
+	w := int(math.Round(r.TokensPerSecond()))
+	return tr(zh,
+		fmt.Sprintf("%s 前 5 分钟 · %d tok/s", tStr, w),
+		fmt.Sprintf("5 min to %s · %d tok/s", tStr, w),
+	)
+}
+
+// speedReplyDetail formats the hovered scatter point equation using the displayed
+// 1-decimal seconds so mental math matches the shown rate (matching SpeedSection.swift).
+func speedReplyDetail(r core.TimedRequest, zh bool) string {
+	tStr := time.Unix(int64(r.End), 0).Local().Format("15:04:05")
+	secStr := fmt.Sprintf("%.1f", r.Duration())
+	shown, err := strconv.ParseFloat(secStr, 64)
+	if err != nil {
+		shown = r.Duration()
+	}
+	rateStr := "–"
+	if shown > 0 {
+		rateStr = fmt.Sprintf("%d", int(math.Round(float64(r.Output)/shown)))
+	}
+	return tr(zh,
+		fmt.Sprintf("%s · %s tokens ÷ %s 秒 = %s tok/s", tStr, core.FormatGrouped(int64(r.Output)), secStr, rateStr),
+		fmt.Sprintf("%s · %s tokens ÷ %ss = %s tok/s", tStr, core.FormatGrouped(int64(r.Output)), secStr, rateStr),
+	)
 }
 
 func (m *PopoverModel) renderSpendSection(c *ui.Context, st service.ViewState, now time.Time, zh bool) {

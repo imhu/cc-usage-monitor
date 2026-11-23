@@ -122,7 +122,7 @@ func (a *application) openPanel() {
 		MinWidth:     int(appui.PopoverWidth),
 		MaxWidth:     int(appui.PopoverWidth),
 		MinHeight:    180,
-		MaxHeight:    780,
+		MaxHeight:    0, // Let FitContent grow up to the display's work area (matching macOS visibleFrame)
 		Focusable:    true,
 		Shadow:       true,
 		Popover:      true,
@@ -132,6 +132,7 @@ func (a *application) openPanel() {
 	})
 	a.panel.OnClosed(func() {
 		a.panel = nil
+		a.popoverModel.ResetHover()
 	})
 }
 

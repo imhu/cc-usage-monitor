@@ -36,16 +36,26 @@ type RequestTiming struct {
 	IsSidechain bool
 }
 
+type ScanStats struct {
+	FilesScanned   int
+	RecordsChanged bool
+	TimingsChanged bool
+}
+
+const TimingRetention = 2 * time.Hour
+
 type UsageIndex struct {
-	Models       []string
-	modelToIdx   map[string]uint16
-	Records      []UsageRecord
-	keyToIdx     map[uint64]int
-	Cursors      map[string]FileCursor
-	Timings      map[uint64]RequestTiming
-	Pending      map[string]RequestStart
-	LastUntimed  float64
-	Dirty        bool
+	Models        []string
+	modelToIdx    map[string]uint16
+	Records       []UsageRecord
+	keyToIdx      map[uint64]int
+	Cursors       map[string]FileCursor
+	Timings       map[uint64]RequestTiming
+	Starts        map[string]RequestStart // api-request id -> start (retained for TimingRetention)
+	Pending       map[string]RequestStart // file path -> in-flight request for that session file
+	LastUntimed   float64
+	Dirty         bool
+	timingsPrimed bool
 }
 
 func NewUsageIndex() *UsageIndex {
@@ -54,6 +64,7 @@ func NewUsageIndex() *UsageIndex {
 		keyToIdx:   map[uint64]int{},
 		Cursors:    map[string]FileCursor{},
 		Timings:    map[uint64]RequestTiming{},
+		Starts:     map[string]RequestStart{},
 		Pending:    map[string]RequestStart{},
 	}
 }
@@ -83,26 +94,38 @@ func (idx *UsageIndex) rebuildMaps() {
 	if idx.Timings == nil {
 		idx.Timings = map[uint64]RequestTiming{}
 	}
+	if idx.Starts == nil {
+		idx.Starts = map[string]RequestStart{}
+	}
 	if idx.Pending == nil {
 		idx.Pending = map[string]RequestStart{}
 	}
 }
 
-func (idx *UsageIndex) ingestEvents(events []ParsedEvent, filePending map[string]RequestStart) bool {
-	changed := false
+func (idx *UsageIndex) ingestEvents(events []ParsedEvent, filePath string) (recordsChanged bool, timingsChanged bool) {
+	if idx.Starts == nil {
+		idx.Starts = map[string]RequestStart{}
+	}
+	if idx.Pending == nil {
+		idx.Pending = map[string]RequestStart{}
+	}
 	for _, ev := range events {
 		switch ev.Kind {
 		case EventRequestStarted:
-			idx.Pending[ev.Start.ID] = ev.Start
-			filePending[ev.Start.ID] = ev.Start
-			changed = true
-		case EventRequestEnded:
-			// Clear oldest pending in this file if interrupted/synthetic
-			for id := range filePending {
-				delete(idx.Pending, id)
-				delete(filePending, id)
+			idx.Starts[ev.Start.ID] = ev.Start
+			pendingKey := filePath
+			if pendingKey == "" {
+				pendingKey = ev.Start.ID
 			}
-			changed = true
+			idx.Pending[pendingKey] = ev.Start
+			timingsChanged = true
+		case EventRequestEnded:
+			if filePath != "" {
+				if _, ok := idx.Pending[filePath]; ok {
+					delete(idx.Pending, filePath)
+					timingsChanged = true
+				}
+			}
 		case EventUsage:
 			u := ev.Usage
 			mi := idx.internModel(u.Model)
@@ -116,51 +139,90 @@ func (idx *UsageIndex) ingestEvents(events []ParsedEvent, filePending map[string
 				IsSidechain: u.IsSidechain,
 			}
 			if pos, exists := idx.keyToIdx[u.Key]; exists {
-				// Streaming messages overwrite earlier partial rows with final output_tokens.
-				idx.Records[pos] = rec
+				old := idx.Records[pos]
+				// Streaming writes multiple rows per message; keep the row with largest output
+				// (tie-breaking on prompt size) and earliest timestamp, matching UsageIndex.swift.
+				better := rec.Tokens.Output > old.Tokens.Output ||
+					(rec.Tokens.Output == old.Tokens.Output && rec.Tokens.Prompt() > old.Tokens.Prompt())
+				if better {
+					if old.Time < rec.Time {
+						rec.Time = old.Time
+					}
+					idx.Records[pos] = rec
+					recordsChanged = true
+				}
 			} else {
 				idx.keyToIdx[u.Key] = len(idx.Records)
 				idx.Records = append(idx.Records, rec)
+				recordsChanged = true
 			}
-			if u.RequestRef != "" {
-				if start, ok := idx.Pending[u.RequestRef]; ok {
-					delete(idx.Pending, u.RequestRef)
-					delete(filePending, u.RequestRef)
-					if u.Time > start.Time && u.Tokens.Output > 0 {
-						idx.Timings[u.Key] = RequestTiming{
-							Key:         u.Key,
-							Start:       start.Time,
-							End:         u.Time,
-							Output:      u.Tokens.Output,
-							ModelIdx:    mi,
-							IsFast:      u.IsFast,
-							IsSidechain: u.IsSidechain,
-						}
-					}
-				} else if existing, ok := idx.Timings[u.Key]; ok {
-					if u.Time >= existing.End {
-						existing.End = u.Time
-						existing.Output = u.Tokens.Output
-						idx.Timings[u.Key] = existing
-					}
-				}
-			} else if u.Time > idx.LastUntimed {
-				idx.LastUntimed = u.Time
+			if idx.recordTiming(u, mi, filePath) {
+				timingsChanged = true
 			}
-			changed = true
 		}
 	}
-	return changed
+	return recordsChanged, timingsChanged
+}
+
+// recordTiming matches UsageIndex.swift recordTiming(_:file:) 1:1:
+// keeps Starts intact across streaming chunks, clears per-file Pending once the
+// matching reply arrives, and updates End/Output monotonically across chunks.
+func (idx *UsageIndex) recordTiming(u ParsedUsage, mi uint16, filePath string) bool {
+	if u.RequestRef == "" {
+		if u.Time > idx.LastUntimed {
+			idx.LastUntimed = u.Time
+		}
+		return false
+	}
+	changed := false
+	if filePath != "" {
+		if p, ok := idx.Pending[filePath]; ok && p.ID == u.RequestRef {
+			delete(idx.Pending, filePath)
+			changed = true
+		}
+	} else if _, ok := idx.Pending[u.RequestRef]; ok {
+		delete(idx.Pending, u.RequestRef)
+		changed = true
+	}
+
+	start, ok := idx.Starts[u.RequestRef]
+	if !ok || u.Time < start.Time {
+		return changed
+	}
+	if existing, ok := idx.Timings[u.Key]; ok {
+		end := max(existing.End, u.Time)
+		out := max(existing.Output, u.Tokens.Output)
+		if end == existing.End && out == existing.Output {
+			return changed
+		}
+		existing.End = end
+		existing.Output = out
+		idx.Timings[u.Key] = existing
+		return true
+	}
+	idx.Timings[u.Key] = RequestTiming{
+		Key:         u.Key,
+		Start:       start.Time,
+		End:         u.Time,
+		Output:      u.Tokens.Output,
+		ModelIdx:    mi,
+		IsFast:      u.IsFast,
+		IsSidechain: u.IsSidechain,
+	}
+	return true
 }
 
 // ScanRoots incrementally scans all *.jsonl files under roots.
-// onProgress is called with progress 0..1 during initial/multi-file scans.
-func (idx *UsageIndex) ScanRoots(roots []string, onProgress func(float64)) (filesScanned int, changed bool) {
-	var files []struct {
+// On the first scan after launch, recently modified files (within TimingRetention)
+// are re-read from offset 0 to prime Starts, Pending, and Timings cleanly.
+func (idx *UsageIndex) ScanRoots(roots []string, onProgress func(float64)) ScanStats {
+	type fileEntry struct {
 		path  string
 		size  int64
 		mtime int64
 	}
+	var files []fileEntry
+	seen := map[string]bool{}
 	for _, root := range roots {
 		if root == "" {
 			continue
@@ -172,58 +234,95 @@ func (idx *UsageIndex) ScanRoots(roots []string, onProgress func(float64)) (file
 			if !strings.HasSuffix(strings.ToLower(d.Name()), ".jsonl") {
 				return nil
 			}
+			if seen[p] {
+				return nil
+			}
 			info, err := d.Info()
 			if err != nil {
 				return nil
 			}
-			files = append(files, struct {
-				path  string
-				size  int64
-				mtime int64
-			}{path: p, size: info.Size(), mtime: info.ModTime().UnixNano()})
+			seen[p] = true
+			files = append(files, fileEntry{path: p, size: info.Size(), mtime: info.ModTime().UnixNano()})
 			return nil
 		})
 	}
 
-	var toScan []int
-	for i, f := range files {
-		cur, ok := idx.Cursors[f.path]
-		if ok && cur.Size == f.size && cur.Mtime == f.mtime && cur.Offset <= f.size {
-			continue
-		}
-		toScan = append(toScan, i)
+	var stats ScanStats
+	now := time.Now()
+	primeSince := int64(1<<62 - 1)
+	if !idx.timingsPrimed {
+		primeSince = now.Add(-TimingRetention).UnixNano()
+		idx.timingsPrimed = true
 	}
 
-	total := len(toScan)
-	for step, fi := range toScan {
-		f := files[fi]
-		cur := idx.Cursors[f.path]
-		offset := cur.Offset
-		if f.size < offset {
-			// File truncated or replaced; re-read from start.
-			offset = 0
+	type scanJob struct {
+		file   fileEntry
+		offset int64
+	}
+	var jobs []scanJob
+	for _, f := range files {
+		if f.mtime >= primeSince {
+			jobs = append(jobs, scanJob{file: f, offset: 0})
+		} else if cur, ok := idx.Cursors[f.path]; ok {
+			if cur.Size == f.size && cur.Mtime == f.mtime && cur.Offset <= f.size {
+				continue
+			}
+			if f.size >= cur.Offset {
+				jobs = append(jobs, scanJob{file: f, offset: cur.Offset})
+			} else {
+				// File truncated or replaced; re-read from start.
+				jobs = append(jobs, scanJob{file: f, offset: 0})
+			}
+		} else {
+			jobs = append(jobs, scanJob{file: f, offset: 0})
 		}
-		res := ParseJSONLFile(f.path, offset)
-		filePending := map[string]RequestStart{}
-		if idx.ingestEvents(res.Events, filePending) {
-			changed = true
+	}
+
+	// Clean cursors and pending requests for deleted files (keep historical records).
+	for path := range idx.Cursors {
+		if !seen[path] {
+			delete(idx.Cursors, path)
+		}
+	}
+	for path := range idx.Pending {
+		if !seen[path] {
+			delete(idx.Pending, path)
+			stats.TimingsChanged = true
+		}
+	}
+
+	total := len(jobs)
+	for step, job := range jobs {
+		f := job.file
+		res := ParseJSONLFile(f.path, job.offset)
+		recChg, timChg := idx.ingestEvents(res.Events, f.path)
+		if recChg {
+			stats.RecordsChanged = true
+		}
+		if timChg {
+			stats.TimingsChanged = true
 		}
 		idx.Cursors[f.path] = FileCursor{
 			Offset: res.EndOffset,
 			Size:   f.size,
 			Mtime:  f.mtime,
 		}
-		filesScanned++
+		stats.FilesScanned++
 		if onProgress != nil && total > 0 && (step%8 == 0 || step == total-1) {
 			onProgress(float64(step+1) / float64(total))
 		}
 	}
 
-	// Prune stale timings/pending older than 2 hours
-	cutoff := float64(time.Now().Add(-2 * time.Hour).Unix())
+	// Prune stale timings, starts, and pending older than TimingRetention (2 hours).
+	cutoff := unixSec(now.Add(-TimingRetention))
 	for k, t := range idx.Timings {
 		if t.End < cutoff {
 			delete(idx.Timings, k)
+		}
+	}
+	for k, s := range idx.Starts {
+		if s.Time < cutoff {
+			delete(idx.Starts, k)
 		}
 	}
 	for k, p := range idx.Pending {
@@ -232,10 +331,10 @@ func (idx *UsageIndex) ScanRoots(roots []string, onProgress func(float64)) (file
 		}
 	}
 
-	if changed {
+	if stats.RecordsChanged {
 		idx.Dirty = true
 	}
-	return filesScanned, changed
+	return stats
 }
 
 type IndexSnapshot struct {
@@ -324,6 +423,7 @@ func LoadUsageIndex(path string) *UsageIndex {
 		Records:     p.Records,
 		Cursors:     p.Cursors,
 		Timings:     p.Timings,
+		Starts:      map[string]RequestStart{},
 		Pending:     map[string]RequestStart{},
 		LastUntimed: p.LastUntimed,
 	}

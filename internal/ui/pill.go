@@ -36,6 +36,8 @@ func (m *FloatingPillModel) View(c *ui.Context) {
 
 	if st.Prefs.ClawdAnimation {
 		c.After(800 * time.Millisecond)
+	} else if st.Prefs.PillShowSpeed {
+		c.After(5 * time.Second)
 	} else {
 		c.After(15 * time.Second)
 	}
@@ -120,15 +122,15 @@ func (m *FloatingPillModel) View(c *ui.Context) {
 		}
 
 		if st.Prefs.PillShowSpeed {
-			nowSec := float64(now.UnixNano()) / 1e9
+			nowSec := float64(now.Unix()) + float64(now.Nanosecond())/1e9
 			models := st.SpeedLog.Models(nowSec)
 			v := "–"
-			if len(models) > 0 {
-				if r := core.ComputeSpeedRate(models[0].Requests, nowSec-core.SpeedRecentWindow, nowSec); r != nil {
+			if cur := st.ActiveSpeedModel(models); cur != nil {
+				if r := core.ComputeSpeedRate(cur.Requests, nowSec-core.SpeedRecentWindow, nowSec); r != nil {
 					v = fmt.Sprintf("%d", int(math.Round(r.TokensPerSecond())))
 				}
 			}
-			addCol(tr(zh, "速度", "tok/s"), v, ColorText)
+			addCol(tr(zh, "速度", "TOK/S"), v, ColorText)
 		}
 	})
 }

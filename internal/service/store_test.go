@@ -263,6 +263,167 @@ func TestTryReadClaudeCodeCacheAdoptsFreshUsageDuringCooldown(t *testing.T) {
 	}
 }
 
+func TestStoreMidweekResetDetectionAndPersistence(t *testing.T) {
+	tmp := t.TempDir()
+	projDir := filepath.Join(tmp, "projects")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	wStart := time.Date(2026, 11, 15, 6, 0, 0, 0, time.UTC)
+	wEnd := wStart.Add(core.WeekWindow) // Nov 22 06:00
+	tBefore := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	tAfter := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+
+	// Opus 5.5 input is $4/1M: 125M tokens = $500, 5M tokens = $20.
+	lines := `{"type":"assistant","timestamp":"2026-11-16T10:00:00Z","requestId":"r1","sessionId":"s1","message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":125000000,"output_tokens":0}}}` + "\n" +
+		`{"type":"assistant","timestamp":"2026-11-18T10:00:00Z","requestId":"r2","sessionId":"s1","message":{"id":"m2","model":"claude-opus-5-5","usage":{"input_tokens":5000000,"output_tokens":0}}}` + "\n"
+	if err := os.WriteFile(filepath.Join(projDir, "session.jsonl"), []byte(lines), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Store{
+		dataDir:   tmp,
+		prefsPath: filepath.Join(tmp, "prefs.json"),
+		indexPath: filepath.Join(tmp, "index.gob"),
+		statePath: filepath.Join(tmp, "state.json"),
+		prefs:     core.DefaultPreferences(),
+		index:     core.NewUsageIndex(),
+		pstate:    persistedState{Budget: core.NewRequestBudget(tBefore)},
+	}
+	s.index.ScanRoots([]string{projDir}, nil)
+
+	// Sync 1: 50.8% (floored to 50%) before reset.
+	u1 := &core.OfficialUsage{
+		SevenDay:  &core.OfficialLimit{Utilization: 50.8, ResetsAt: &wEnd},
+		FetchedAt: tBefore,
+	}
+	s.mu.Lock()
+	s.officialUsage = u1
+	s.applyOfficialToStateLocked(u1)
+	s.recomputeSnapshotLocked(tBefore)
+	if s.pstate.WeeklyReading == nil || s.pstate.WeeklyReading.Utilization != 50 {
+		s.mu.Unlock()
+		t.Fatalf("expected floored WeeklyReading=50, got %+v", s.pstate.WeeklyReading)
+	}
+	if s.pstate.EarlierAllowance == nil || !s.pstate.EarlierAllowance.At.Equal(tBefore) {
+		s.mu.Unlock()
+		t.Fatalf("expected EarlierAllowance remembered at %v, got %+v", tBefore, s.pstate.EarlierAllowance)
+	}
+	if s.pstate.MidweekReset != nil {
+		s.mu.Unlock()
+		t.Fatalf("did not expect MidweekReset yet, got %+v", s.pstate.MidweekReset)
+	}
+
+	// Sync 2: drops to 2.9% (floored to 2%) within the same week -> detects mid-week reset!
+	u2 := &core.OfficialUsage{
+		SevenDay:  &core.OfficialLimit{Utilization: 2.9, ResetsAt: &wEnd},
+		FetchedAt: tAfter,
+	}
+	s.officialUsage = u2
+	s.applyOfficialToStateLocked(u2)
+	s.recomputeSnapshotLocked(tAfter)
+	if s.pstate.MidweekReset == nil || s.pstate.MidweekReset.Before.Utilization != 50 || s.pstate.MidweekReset.After.Utilization != 2 {
+		s.mu.Unlock()
+		t.Fatalf("expected MidweekReset 50->2, got %+v", s.pstate.MidweekReset)
+	}
+	if s.snapshot == nil || s.snapshot.WeeklyAllowance == nil {
+		s.mu.Unlock()
+		t.Fatal("expected WeeklyAllowance after midweek reset")
+	}
+	a := s.snapshot.WeeklyAllowance
+	if !a.Borrowed || a.Forgiven < 499 || a.Forgiven > 501 {
+		s.mu.Unlock()
+		t.Fatalf("expected Borrowed=true and Forgiven=500, got %+v", a)
+	}
+	if !s.pstate.EarlierAllowance.At.Equal(tBefore) {
+		s.mu.Unlock()
+		t.Fatalf("borrowed post-reset allowance must not clobber EarlierAllowance.At, got %+v", s.pstate.EarlierAllowance)
+	}
+
+	// Sync 3: advancing into next week clears stale MidweekReset.
+	nextWeekEnd := wEnd.Add(core.WeekWindow)
+	tNext := wEnd.Add(time.Hour)
+	u3 := &core.OfficialUsage{
+		SevenDay:  &core.OfficialLimit{Utilization: 1.0, ResetsAt: &nextWeekEnd},
+		FetchedAt: tNext,
+	}
+	s.officialUsage = u3
+	s.applyOfficialToStateLocked(u3)
+	s.recomputeSnapshotLocked(tNext)
+	if s.pstate.MidweekReset != nil {
+		s.mu.Unlock()
+		t.Fatalf("expected stale MidweekReset cleared on new week, got %+v", s.pstate.MidweekReset)
+	}
+	s.mu.Unlock()
+}
+
+func TestStickySpeedDefaultAndCycle(t *testing.T) {
+	tmp := t.TempDir()
+	projDir := filepath.Join(tmp, "projects")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	t0 := now.Add(-2 * time.Minute)
+	sessionFile := filepath.Join(projDir, "s1.jsonl")
+
+	// Start with Opus 5.5 having more output (1000 tokens) than Haiku 4.5 (200 tokens).
+	part1 := `{"type":"api-request","id":"r1","timestamp":"` + t0.Format(time.RFC3339) + `","params":{"model":"claude-opus-5-5"}}` + "\n" +
+		`{"type":"assistant","timestamp":"` + t0.Add(10*time.Second).Format(time.RFC3339) + `","requestId":"req1","requestRef":"r1","sessionId":"s1","message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":10,"output_tokens":1000}}}` + "\n" +
+		`{"type":"api-request","id":"r2","timestamp":"` + t0.Add(15*time.Second).Format(time.RFC3339) + `","params":{"model":"claude-haiku-4-5"}}` + "\n" +
+		`{"type":"assistant","timestamp":"` + t0.Add(17*time.Second).Format(time.RFC3339) + `","requestId":"req2","requestRef":"r2","sessionId":"s1","message":{"id":"m2","model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":200}}}` + "\n"
+	if err := os.WriteFile(sessionFile, []byte(part1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Store{
+		dataDir:   tmp,
+		prefsPath: filepath.Join(tmp, "prefs.json"),
+		indexPath: filepath.Join(tmp, "index.gob"),
+		statePath: filepath.Join(tmp, "state.json"),
+		prefs:     core.DefaultPreferences(),
+		index:     core.NewUsageIndex(),
+		pstate:    persistedState{Budget: core.NewRequestBudget(now)},
+	}
+	s.scanIndex([]string{projDir})
+
+	st := s.ViewState()
+	nowSec := float64(now.Unix()) + float64(now.Nanosecond())/1e9
+	models := st.SpeedLog.Models(nowSec)
+	if len(models) != 2 {
+		t.Fatalf("expected 2 speed models, got %+v", models)
+	}
+	if active := st.ActiveSpeedModel(models); active == nil || active.ID() != "Opus 5.5" {
+		t.Fatalf("expected initial sticky default Opus 5.5, got %+v", active)
+	}
+
+	// Now Haiku 4.5 outputs 3000 tokens (exceeding Opus 5.5's 1000) -> sticky default must STAY on Opus 5.5!
+	part2 := part1 + `{"type":"api-request","id":"r3","timestamp":"` + t0.Add(30*time.Second).Format(time.RFC3339) + `","params":{"model":"claude-haiku-4-5"}}` + "\n" +
+		`{"type":"assistant","timestamp":"` + t0.Add(40*time.Second).Format(time.RFC3339) + `","requestId":"req3","requestRef":"r3","sessionId":"s1","message":{"id":"m3","model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":3000}}}` + "\n"
+	if err := os.WriteFile(sessionFile, []byte(part2), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.scanIndex([]string{projDir})
+
+	st = s.ViewState()
+	models = st.SpeedLog.Models(nowSec)
+	if models[0].ID() != "Haiku 4.5" {
+		t.Fatalf("expected Haiku 4.5 ranked first by output, got %+v", models)
+	}
+	if active := st.ActiveSpeedModel(models); active == nil || active.ID() != "Opus 5.5" {
+		t.Fatalf("expected sticky default to stay on Opus 5.5 even when Haiku leads, got %+v", active)
+	}
+
+	// Clicking CycleSpeedModel from sticky Opus 5.5 (index 1) must switch to Haiku 4.5 (index 0).
+	s.CycleSpeedModel(models)
+	st = s.ViewState()
+	if active := st.ActiveSpeedModel(models); active == nil || active.ID() != "Haiku 4.5" {
+		t.Fatalf("expected CycleSpeedModel to advance from Opus 5.5 to Haiku 4.5, got %+v", active)
+	}
+}
+
 func strconvFormatInt(v int64) string {
 	if v == 0 {
 		return "0"

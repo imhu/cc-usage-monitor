@@ -183,19 +183,21 @@ func MiniBars(c *ui.Context, key string, values []float64, highlightIdx int, per
 
 // SpeedSparkline replicates SpeedSection.swift SpeedSparkline 1:1 (104x30 smooth curve + accent dot).
 func SpeedSparkline(c *ui.Context, key string, trend []core.TrendPoint, nowSec float64, hoveredAge *float64) {
-	box := ui.Box(c.Key(key)).Size(104, 30)
+	box := ui.Box(c.Key(key)).Size(104, 30).Margin(0, 0, 3, 0)
+	prevAge := *hoveredAge
+	nextAge := -1.0
 	if box.Hovered() && len(trend) > 0 {
-		px, _, ok := box.PointerPosition()
-		if ok {
+		if px, _, ok := box.PointerPosition(); ok {
 			frac := max(0.0, min(1.0, float64(px)/104.0))
 			t := nowSec - core.SpeedSpanWindow*(1.0-frac)
-			ni := nearestTrendIndex(trend, t)
-			if ni >= 0 {
-				*hoveredAge = nowSec - trend[ni].T
+			if ni := nearestTrendIndex(trend, t); ni >= 0 {
+				nextAge = nowSec - trend[ni].T
 			}
 		}
-	} else {
-		*hoveredAge = -1
+	}
+	if nextAge != prevAge {
+		*hoveredAge = nextAge
+		c.Invalidate()
 	}
 
 	curAge := *hoveredAge
@@ -224,12 +226,16 @@ func SpeedSparkline(c *ui.Context, key string, trend []core.TrendPoint, nowSec f
 			pts[i] = ui.Point{X: x, Y: r.Y + r.H - 1 - rise}
 		}
 
-		path := buildMonotonePath(pts)
-		p.StrokePath(path, 1.5, ui.RGBA(255, 255, 255, 0.55))
+		if len(pts) == 1 {
+			p.Fill(ui.Rect{X: pts[0].X - 0.75, Y: pts[0].Y - 0.75, W: 1.5, H: 1.5}, ui.RGBA(255, 255, 255, 0.55), 0.75)
+		} else {
+			path := buildMonotonePath(pts)
+			p.StrokePath(path, 1.5, ui.RGBA(255, 255, 255, 0.55))
+		}
 
-		// Live orange dot at right end if last point is now
+		// Live orange dot at right end only when last point is now (recent 5m has replies).
 		last := trend[len(trend)-1]
-		if math.Abs(last.T-nowSec) < 2.0 {
+		if last.T == nowSec {
 			lp := pts[len(pts)-1]
 			p.Fill(ui.Rect{X: lp.X - 2.5, Y: lp.Y - 2.5, W: 5, H: 5}, ColorAccent, 2.5)
 		}
@@ -254,12 +260,12 @@ func SpeedChart(c *ui.Context, key string, requests []core.TimedRequest, pending
 	ceiling := core.SpeedCeiling(shown)
 	const inset float32 = 4
 
+	prevID := *hoveredID
+	var nextID uint64
 	if box.Hovered() && len(shown) > 0 {
-		px, py, ok := box.PointerPosition()
-		if ok {
+		if px, py, ok := box.PointerPosition(); ok {
 			w := PopoverWidth - PanelPadH*2
 			plotW := max(1, w-inset*2)
-			var best uint64
 			bestDist := float32(144)
 			for _, req := range shown {
 				qx := inset + plotW*float32(1.0-(nowSec-req.End)/core.SpeedSpanWindow)
@@ -267,13 +273,14 @@ func SpeedChart(c *ui.Context, key string, requests []core.TimedRequest, pending
 				d := (qx-px)*(qx-px) + (qy-py)*(qy-py)
 				if d < bestDist {
 					bestDist = d
-					best = req.ID
+					nextID = req.ID
 				}
 			}
-			*hoveredID = best
 		}
-	} else {
-		*hoveredID = 0
+	}
+	if nextID != prevID {
+		*hoveredID = nextID
+		c.Invalidate()
 	}
 
 	curHover := *hoveredID
@@ -292,7 +299,7 @@ func SpeedChart(c *ui.Context, key string, requests []core.TimedRequest, pending
 		// Reference gridline
 		grid := core.SpeedGridline(ceiling)
 		gy := yOf(grid)
-		p.Fill(ui.Rect{X: r.X, Y: gy, W: r.W, H: 0.5}, ColorDivider, 0)
+		p.Fill(ui.Rect{X: r.X, Y: gy - 0.25, W: r.W, H: 0.5}, ColorDivider, 0)
 		label := ui.Span{Text: core.FormatGrouped(int64(grid)), Size: 9.5, Weight: 500, Color: ui.RGBA(255, 255, 255, 0.28)}
 		_, lh := p.MeasureText(0, label)
 		p.RichText(r.X, gy-lh-1, 0, label)
@@ -314,7 +321,11 @@ func SpeedChart(c *ui.Context, key string, requests []core.TimedRequest, pending
 			for i, tp := range trend {
 				pts[i] = ui.Point{X: xOf(tp.T), Y: yOf(tp.Rate)}
 			}
-			p.StrokePath(buildMonotonePath(pts), 1.5, ui.RGBA(255, 255, 255, 0.90))
+			if len(pts) == 1 {
+				p.Fill(ui.Rect{X: pts[0].X - 0.75, Y: pts[0].Y - 0.75, W: 1.5, H: 1.5}, ui.RGBA(255, 255, 255, 0.90), 0.75)
+			} else {
+				p.StrokePath(buildMonotonePath(pts), 1.5, ui.RGBA(255, 255, 255, 0.90))
+			}
 		}
 
 		// Pending live green bars
@@ -404,7 +415,11 @@ func buildMonotonePath(raw []ui.Point) *ui.Path {
 	tan := make([]float32, n)
 	for i := 1; i < n-1; i++ {
 		s0, s1 := slope[i-1], slope[i]
-		mean := (s0*h[i] + s1*h[i-1]) / (h[i-1] + h[i])
+		denom := h[i-1] + h[i]
+		if denom <= 0 {
+			continue
+		}
+		mean := (s0*h[i] + s1*h[i-1]) / denom
 		lim := min(abs32(s0), min(abs32(s1), abs32(mean)/2))
 		tan[i] = (sign(s0) + sign(s1)) * lim
 	}

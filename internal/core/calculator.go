@@ -33,6 +33,7 @@ type UsageSettings struct {
 	FiveHourReset       *time.Time
 	WeeklyReading       *WeeklyReading
 	EarlierAllowance    *AllowanceBasis
+	MidweekReset        *MidweekReset
 }
 
 type WeeklyAllowance struct {
@@ -43,6 +44,9 @@ type WeeklyAllowance struct {
 	Spent       float64
 	SyncedAt    *time.Time
 	Borrowed    bool
+	RestartedAt *time.Time
+	Forgiven    float64
+	Reset       *MidweekReset
 }
 
 const MinWeeklyUtilizationForBasis = 10.0
@@ -56,6 +60,25 @@ func (a WeeklyAllowance) Full() float64 {
 
 func (a WeeklyAllowance) Remaining() float64 {
 	return max(0, a.Full()-a.Spent)
+}
+
+// FullWeek returns the total local spend for the week when the active weekly
+// allowance reaches 100%, including spend forgiven by a mid-week reset.
+func (a WeeklyAllowance) FullWeek() float64 {
+	return a.Forgiven + a.Full()
+}
+
+// Admits reports whether another full-week allowance estimate is consistent
+// with this reading within a 2x sanity band. Because official utilization is
+// floored to an integer, reading u% implies true utilization in [u, u+1), so
+// the implied full allowance lies in [SyncedCost*100/(u+1), SyncedCost*100/u].
+func (a WeeklyAllowance) Admits(otherFull float64) bool {
+	if !(a.Utilization > 0 && a.SyncedCost > 0 && !math.IsNaN(otherFull) && !math.IsInf(otherFull, 0) && otherFull > 0) {
+		return true
+	}
+	low := a.SyncedCost * 100.0 / (a.Utilization + 1.0)
+	high := a.SyncedCost * 100.0 / a.Utilization
+	return otherFull >= low/2.0 && otherFull <= high*2.0
 }
 
 func (a WeeklyAllowance) Ahead(from, end time.Time) float64 {
@@ -170,7 +193,7 @@ func (p PeriodUsage) Projection(now time.Time, allowance *WeeklyAllowance) *Proj
 		return nil
 	}
 	if p.Start.Equal(allowance.Start) && p.End.Equal(allowance.End) {
-		return &Projection{Cost: max(p.Cost, allowance.Full())}
+		return &Projection{Cost: max(p.Cost, allowance.FullWeek())}
 	}
 	return &Projection{Cost: p.Cost + allowance.Ahead(now, p.End)}
 }
@@ -308,7 +331,7 @@ func ComputeSnapshot(idx IndexSnapshot, settings UsageSettings, now time.Time) U
 		wStart, wEnd := WeeklyInterval(now, *settings.WeeklyReset)
 		w := summarizePeriod(records, costs, infos, wStart, wEnd, now)
 		week = &w
-		allowance = computeWeeklyAllowance(records, costs, wStart, wEnd, w.Cost, settings.WeeklyReading, settings.EarlierAllowance)
+		allowance = computeWeeklyAllowance(records, costs, wStart, wEnd, w.Cost, settings.WeeklyReading, settings.EarlierAllowance, settings.MidweekReset)
 	}
 
 	var fiveHourCost *float64
@@ -416,9 +439,42 @@ func summarizePeriod(records []UsageRecord, costs []float64, infos []ModelInfo, 
 	}
 }
 
+func unixSec(t time.Time) float64 {
+	return float64(t.Unix()) + float64(t.Nanosecond())/1e9
+}
+
+func timeFromUnixSec(sec float64) time.Time {
+	s, frac := math.Modf(sec)
+	ns := int64(math.Round(frac * 1e9))
+	if ns >= 1e9 {
+		s += 1
+		ns -= 1e9
+	} else if ns < 0 {
+		s -= 1
+		ns += 1e9
+	}
+	return time.Unix(int64(s), ns)
+}
+
+func lowerBound(records []UsageRecord, t time.Time) int {
+	sec := unixSec(t)
+	return sort.Search(len(records), func(i int) bool { return records[i].Time >= sec })
+}
+
+func sumCosts(costs []float64, from, to int) float64 {
+	if to <= from {
+		return 0
+	}
+	sum := 0.0
+	for i := from; i < to; i++ {
+		sum += costs[i]
+	}
+	return sum
+}
+
 func sumCostInRange(records []UsageRecord, costs []float64, start, end time.Time) float64 {
-	sSec := float64(start.UnixNano()) / 1e9
-	eSec := float64(end.UnixNano()) / 1e9
+	sSec := unixSec(start)
+	eSec := unixSec(end)
 	lo := sort.Search(len(records), func(i int) bool { return records[i].Time >= sSec })
 	sum := 0.0
 	for i := lo; i < len(records) && records[i].Time < eSec; i++ {
@@ -427,48 +483,108 @@ func sumCostInRange(records []UsageRecord, costs []float64, start, end time.Time
 	return sum
 }
 
-func computeWeeklyAllowance(records []UsageRecord, costs []float64, wStart, wEnd time.Time, spent float64, reading *WeeklyReading, earlier *AllowanceBasis) *WeeklyAllowance {
-	if reading != nil && reading.Utilization >= MinWeeklyUtilizationForBasis && !reading.At.Before(wStart) && reading.At.Before(wEnd) {
-		syncedCost := sumCostInRange(records, costs, wStart, reading.At)
-		if syncedCost > 0 {
-			at := reading.At
-			return &WeeklyAllowance{
-				Start:       wStart,
-				End:         wEnd,
-				Utilization: reading.Utilization,
-				SyncedCost:  syncedCost,
-				Spent:       spent,
-				SyncedAt:    &at,
-			}
-		}
+func computeWeeklyAllowance(records []UsageRecord, costs []float64, wStart, wEnd time.Time, weekCost float64, reading *WeeklyReading, earlier *AllowanceBasis, knownReset *MidweekReset) *WeeklyAllowance {
+	var reset *MidweekReset
+	if knownReset != nil && knownReset.BelongsToWeekEnding(wEnd) {
+		c := *knownReset
+		reset = &c
 	}
-	if earlier != nil && earlier.Utilization >= MinWeeklyUtilizationForBasis && earlier.SyncedCost > 0 {
-		at := earlier.At
+	if reset == nil && earlier != nil && reading != nil && !earlier.At.Before(wStart) && earlier.At.Before(reading.At) {
+		reset = MidweekResetBetween(
+			WeeklyReading{Utilization: earlier.Utilization, At: earlier.At}, wEnd,
+			*reading, wEnd,
+		)
+	}
+
+	weekFrom := lowerBound(records, wStart)
+	from := weekFrom
+	var restartedAt *time.Time
+	forgiven := 0.0
+	if reset != nil {
+		at := restartTime(*reset, records, costs, wStart)
+		from = lowerBound(records, at)
+		forgiven = sumCosts(costs, weekFrom, max(weekFrom, from))
+		restartedAt = &at
+	}
+
+	spent := max(0.0, weekCost-forgiven)
+	made := func(util, synced float64, at time.Time, borrowed bool) *WeeklyAllowance {
+		t := at
 		return &WeeklyAllowance{
 			Start:       wStart,
 			End:         wEnd,
-			Utilization: earlier.Utilization,
-			SyncedCost:  earlier.SyncedCost,
+			Utilization: util,
+			SyncedCost:  synced,
 			Spent:       spent,
-			SyncedAt:    &at,
-			Borrowed:    true,
+			SyncedAt:    &t,
+			Borrowed:    borrowed,
+			RestartedAt: restartedAt,
+			Forgiven:    forgiven,
+			Reset:       reset,
 		}
 	}
-	if reading != nil && reading.Utilization > 0 && !reading.At.Before(wStart) && reading.At.Before(wEnd) {
-		syncedCost := sumCostInRange(records, costs, wStart, reading.At)
-		if syncedCost > 0 {
-			at := reading.At
-			return &WeeklyAllowance{
-				Start:       wStart,
-				End:         wEnd,
-				Utilization: reading.Utilization,
-				SyncedCost:  syncedCost,
-				Spent:       spent,
-				SyncedAt:    &at,
-			}
+
+	floorStart := wStart
+	if restartedAt != nil {
+		floorStart = *restartedAt
+	}
+	var current *WeeklyAllowance
+	if reading != nil && !math.IsNaN(reading.Utilization) && !math.IsInf(reading.Utilization, 0) &&
+		reading.Utilization > 0 && !reading.At.Before(floorStart) && reading.At.Before(wEnd) {
+		to := lowerBound(records, reading.At)
+		synced := sumCosts(costs, from, max(from, to))
+		if synced > 0 {
+			current = made(reading.Utilization, synced, reading.At, false)
 		}
 	}
-	return nil
+
+	if current != nil && current.Utilization >= MinWeeklyUtilizationForBasis {
+		return current
+	}
+	if earlier != nil && !math.IsNaN(earlier.Utilization) && !math.IsInf(earlier.Utilization, 0) &&
+		earlier.Utilization >= MinWeeklyUtilizationForBasis &&
+		!math.IsNaN(earlier.SyncedCost) && !math.IsInf(earlier.SyncedCost, 0) &&
+		earlier.SyncedCost > 0 {
+		if current != nil && !current.Admits(earlier.Full()) {
+			return current
+		}
+		return made(earlier.Utilization, earlier.SyncedCost, earlier.At, true)
+	}
+	return current
+}
+
+// restartTime estimates when Anthropic reset the weekly quota mid-week.
+// Using the pre-reset cost/utilization ratio to translate post-reset utilization
+// back into local cost, it walks backward from reset.After.At toward reset.Before.At
+// until reaching that target cost.
+func restartTime(reset MidweekReset, records []UsageRecord, costs []float64, wStart time.Time) time.Time {
+	earliest := reset.Before.At
+	if wStart.After(earliest) {
+		earliest = wStart
+	}
+	latest := reset.After.At
+	if earliest.After(latest) {
+		latest = earliest
+	}
+	weekFrom := lowerBound(records, wStart)
+	lower := lowerBound(records, earliest)
+	upper := lowerBound(records, latest)
+	beforeCost := sumCosts(costs, weekFrom, max(weekFrom, lower))
+	if !(reset.Before.Utilization > 0 && beforeCost > 0) {
+		return latest
+	}
+	target := beforeCost / reset.Before.Utilization * max(0.0, reset.After.Utilization)
+	if !(target > 0) {
+		return latest
+	}
+	sum := 0.0
+	for i := upper - 1; i >= lower; i-- {
+		sum += costs[i]
+		if sum >= target {
+			return timeFromUnixSec(records[i].Time)
+		}
+	}
+	return earliest
 }
 
 func computeDaily(records []UsageRecord, costs []float64, now time.Time, days int) []DayUsage {

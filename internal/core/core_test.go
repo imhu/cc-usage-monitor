@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -68,7 +70,7 @@ func TestJSONLParserAndStreamingDedup(t *testing.T) {
 		t.Fatalf("expected 3 complete lines, got %d", res.LinesParsed)
 	}
 	idx := NewUsageIndex()
-	idx.ingestEvents(res.Events, map[string]RequestStart{})
+	idx.ingestEvents(res.Events, "session.jsonl")
 	if len(idx.Records) != 1 {
 		t.Fatalf("expected 1 deduplicated record, got %d", len(idx.Records))
 	}
@@ -229,5 +231,296 @@ func TestClaudeCodeCacheAndAutoSyncStep(t *testing.T) {
 	b.RecordRateLimit(now, 0)
 	if cd := b.Cooldown(now.Add(-24 * time.Hour)); cd != BudgetLongestCooldown {
 		t.Fatalf("expected clock-rollback cooldown cap %v, got %v", BudgetLongestCooldown, cd)
+	}
+}
+
+func TestMidweekResetBetween(t *testing.T) {
+	wEnd := time.Date(2026, 11, 22, 6, 0, 0, 0, time.UTC)
+	t1 := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+
+	// Same week, chronological, >= 5 point drop -> detected.
+	r := MidweekResetBetween(WeeklyReading{Utilization: 95, At: t1}, wEnd, WeeklyReading{Utilization: 1, At: t2}, wEnd.Add(30*time.Second))
+	if r == nil || !r.BelongsToWeekEnding(wEnd) {
+		t.Fatalf("expected MidweekReset, got %+v", r)
+	}
+	// Exact 5 point drop boundary -> detected.
+	if MidweekResetBetween(WeeklyReading{Utilization: 20, At: t1}, wEnd, WeeklyReading{Utilization: 15, At: t2}, wEnd) == nil {
+		t.Fatal("expected exact 5-point drop to trigger MidweekReset")
+	}
+	// Drop < 5 points -> ignored.
+	if MidweekResetBetween(WeeklyReading{Utilization: 20, At: t1}, wEnd, WeeklyReading{Utilization: 15.1, At: t2}, wEnd) != nil {
+		t.Fatal("drop < 5 points must not trigger MidweekReset")
+	}
+	// Different week (>= 60s apart) -> ignored.
+	if MidweekResetBetween(WeeklyReading{Utilization: 95, At: t1}, wEnd, WeeklyReading{Utilization: 1, At: t2}, wEnd.Add(7*24*time.Hour)) != nil {
+		t.Fatal("next week reset must not trigger MidweekReset")
+	}
+	// Non-chronological -> ignored.
+	if MidweekResetBetween(WeeklyReading{Utilization: 95, At: t2}, wEnd, WeeklyReading{Utilization: 1, At: t1}, wEnd) != nil {
+		t.Fatal("out-of-order readings must not trigger MidweekReset")
+	}
+	// NaN utilization -> ignored.
+	if MidweekResetBetween(WeeklyReading{Utilization: math.NaN(), At: t1}, wEnd, WeeklyReading{Utilization: 1, At: t2}, wEnd) != nil {
+		t.Fatal("NaN utilization must not trigger MidweekReset")
+	}
+}
+
+func makeOpus55Record(at time.Time, costUSD float64) UsageRecord {
+	// Opus 5.5 input is $4 / 1M tokens -> 250,000 tokens per $1.
+	return UsageRecord{
+		Time:     unixSec(at),
+		ModelIdx: 0,
+		Tokens:   TokenCounts{Input: int64(math.Round(costUSD * 250_000))},
+	}
+}
+
+func TestMidweekResetAllowanceAndProjection(t *testing.T) {
+	wStart := time.Date(2026, 11, 15, 6, 0, 0, 0, time.UTC)
+	wEnd := wStart.Add(WeekWindow) // Nov 22 06:00
+	tBefore := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	tAfter := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 11, 18, 15, 0, 0, 0, time.UTC)
+
+	// Pre-reset: $500 before tBefore (50% => $10/pct, $1000 full).
+	// Between tBefore and tAfter: $30 (pre-reset), $10 at 09:00, $10 at 11:00.
+	// Post-sync: $40 at 14:00. Total week cost = $590.
+	tPost1 := time.Date(2026, 11, 18, 9, 0, 0, 0, time.UTC)
+	idx := IndexSnapshot{
+		Models: []string{"claude-opus-5-5"},
+		Records: []UsageRecord{
+			makeOpus55Record(time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC), 500),
+			makeOpus55Record(time.Date(2026, 11, 17, 15, 0, 0, 0, time.UTC), 30),
+			makeOpus55Record(tPost1, 10),
+			makeOpus55Record(time.Date(2026, 11, 18, 11, 0, 0, 0, time.UTC), 10),
+			makeOpus55Record(time.Date(2026, 11, 18, 14, 0, 0, 0, time.UTC), 40),
+		},
+	}
+
+	reset := MidweekResetBetween(
+		WeeklyReading{Utilization: 50, At: tBefore}, wEnd,
+		WeeklyReading{Utilization: 2, At: tAfter}, wEnd,
+	)
+	if reset == nil {
+		t.Fatal("expected valid MidweekReset")
+	}
+
+	settings := UsageSettings{
+		BillingAnchorDay: 1,
+		WeeklyReset:      &wEnd,
+		WeeklyReading:    &WeeklyReading{Utilization: 2, At: tAfter},
+		EarlierAllowance: &AllowanceBasis{Utilization: 50, SyncedCost: 500, At: tBefore},
+		MidweekReset:     reset,
+	}
+	snap := ComputeSnapshot(idx, settings, now)
+	a := snap.WeeklyAllowance
+	if a == nil {
+		t.Fatal("expected WeeklyAllowance")
+	}
+	if a.RestartedAt == nil || !a.RestartedAt.Equal(tPost1) {
+		t.Fatalf("expected RestartedAt=%v, got %v", tPost1, a.RestartedAt)
+	}
+	if math.Abs(a.Forgiven-530) > 1e-6 {
+		t.Fatalf("expected Forgiven=530, got %f", a.Forgiven)
+	}
+	if math.Abs(a.Spent-60) > 1e-6 {
+		t.Fatalf("expected post-reset Spent=60, got %f", a.Spent)
+	}
+	if !a.Borrowed {
+		t.Fatal("expected borrowed earlier allowance while post-reset utilization < 10%")
+	}
+	if math.Abs(a.Full()-1000) > 1e-6 {
+		t.Fatalf("expected Full=1000, got %f", a.Full())
+	}
+	if math.Abs(a.Remaining()-940) > 1e-6 {
+		t.Fatalf("expected Remaining=940, got %f", a.Remaining())
+	}
+	if math.Abs(a.FullWeek()-1530) > 1e-6 {
+		t.Fatalf("expected FullWeek=1530, got %f", a.FullWeek())
+	}
+	proj := snap.Week.Projection(now, a)
+	if proj == nil || math.Abs(proj.Cost-1530) > 1e-6 {
+		t.Fatalf("expected week projection=1530, got %+v", proj)
+	}
+
+	// Fallback detection when MidweekReset was not pre-populated (upgrade path).
+	settings.MidweekReset = nil
+	snapFallback := ComputeSnapshot(idx, settings, now)
+	af := snapFallback.WeeklyAllowance
+	if af == nil || af.Reset == nil {
+		t.Fatalf("expected fallback MidweekReset detection, got %+v", af)
+	}
+	if math.Abs(af.Forgiven-530) > 1e-6 || math.Abs(af.FullWeek()-1530) > 1e-6 {
+		t.Fatalf("fallback mismatch: forgiven=%f fullWeek=%f", af.Forgiven, af.FullWeek())
+	}
+
+	// Once post-reset utilization reaches >= 10%, use current post-reset ratio directly.
+	settings.MidweekReset = reset
+	settings.WeeklyReading = &WeeklyReading{Utilization: 12, At: now}
+	snapPost := ComputeSnapshot(idx, settings, now)
+	ap := snapPost.WeeklyAllowance
+	if ap == nil || ap.Borrowed {
+		t.Fatalf("expected non-borrowed allowance at 12%%, got %+v", ap)
+	}
+	// Post-reset synced cost = $60 at 12% => Full = $500, FullWeek = $530 + $500 = $1030.
+	if math.Abs(ap.Full()-500) > 1e-6 || math.Abs(ap.FullWeek()-1030) > 1e-6 {
+		t.Fatalf("unexpected post-reset 12%% allowance: full=%f fullWeek=%f", ap.Full(), ap.FullWeek())
+	}
+}
+
+func TestWeeklyAllowanceAdmitsSanityCheck(t *testing.T) {
+	wStart := time.Date(2026, 11, 15, 6, 0, 0, 0, time.UTC)
+	wEnd := wStart.Add(WeekWindow)
+	tSync := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 11, 16, 13, 0, 0, 0, time.UTC)
+	prevWeekAt := wStart.Add(-24 * time.Hour)
+
+	// Current week: $50 at 5% => low = 50*100/6 = 833.33, high = 50*100/5 = 1000.
+	// Admissible earlier.Full() range is [416.67, 2000].
+	idx := IndexSnapshot{
+		Models:  []string{"claude-opus-5-5"},
+		Records: []UsageRecord{makeOpus55Record(time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC), 50)},
+	}
+
+	base := UsageSettings{
+		BillingAnchorDay: 1,
+		WeeklyReset:      &wEnd,
+		WeeklyReading:    &WeeklyReading{Utilization: 5, At: tSync},
+	}
+
+	// Consistent earlier basis ($1200 full) -> borrowed.
+	sOK := base
+	sOK.EarlierAllowance = &AllowanceBasis{Utilization: 50, SyncedCost: 600, At: prevWeekAt}
+	aOK := ComputeSnapshot(idx, sOK, now).WeeklyAllowance
+	if aOK == nil || !aOK.Borrowed || math.Abs(aOK.Full()-1200) > 1e-6 {
+		t.Fatalf("expected consistent earlier basis ($1200) to be borrowed, got %+v", aOK)
+	}
+
+	// Earlier basis > 2x high ($2500 > $2000, e.g. downgraded plan) -> rejected, keep current ($1000).
+	sHigh := base
+	sHigh.EarlierAllowance = &AllowanceBasis{Utilization: 40, SyncedCost: 1000, At: prevWeekAt}
+	aHigh := ComputeSnapshot(idx, sHigh, now).WeeklyAllowance
+	if aHigh == nil || aHigh.Borrowed || math.Abs(aHigh.Full()-1000) > 1e-6 {
+		t.Fatalf("expected oversized earlier basis ($2500) to be rejected, got %+v", aHigh)
+	}
+
+	// Earlier basis < low/2 ($300 < $416.67, e.g. upgraded plan) -> rejected, keep current ($1000).
+	sLow := base
+	sLow.EarlierAllowance = &AllowanceBasis{Utilization: 50, SyncedCost: 150, At: prevWeekAt}
+	aLow := ComputeSnapshot(idx, sLow, now).WeeklyAllowance
+	if aLow == nil || aLow.Borrowed || math.Abs(aLow.Full()-1000) > 1e-6 {
+		t.Fatalf("expected undersized earlier basis ($300) to be rejected, got %+v", aLow)
+	}
+
+	// Direct boundary check on Admits.
+	probe := WeeklyAllowance{Utilization: 5, SyncedCost: 50}
+	low := 50.0 * 100.0 / 6.0
+	high := 50.0 * 100.0 / 5.0
+	if !probe.Admits(low/2.0) || !probe.Admits(high*2.0) {
+		t.Fatal("expected exact boundary values to be admitted")
+	}
+	if probe.Admits(low/2.0-0.01) || probe.Admits(high*2.0+0.01) {
+		t.Fatal("expected values just outside 2x band to be rejected")
+	}
+	if !probe.Admits(0) || !probe.Admits(math.NaN()) || !probe.Admits(math.Inf(1)) {
+		t.Fatal("expected non-positive / non-finite guard to return true")
+	}
+}
+
+func TestSpeedTimingStreamingZeroFirstChunkInterruptAndStartupPrime(t *testing.T) {
+	tmp := t.TempDir()
+	sessionFile := filepath.Join(tmp, "session.jsonl")
+	now := time.Now().UTC().Truncate(time.Second)
+	t0 := now.Add(-2 * time.Minute)
+	t1 := t0.Add(5 * time.Second)
+	t2 := now.Add(-1 * time.Minute)
+	t3 := t2.Add(2 * time.Second)
+	t4 := now.Add(-30 * time.Second)
+
+	// 1. Streaming chunk 1 has output_tokens=0 and same timestamp as api-request;
+	//    chunk 2 arrives 5s later with 500 output_tokens -> must NOT lose start time!
+	part1 := fmt.Sprintf(
+		`{"type":"api-request","id":"req-1","timestamp":"%s","params":{"model":"claude-opus-5-5"}}`+"\n"+
+			`{"type":"assistant","timestamp":"%s","requestId":"r1","requestRef":"req-1","sessionId":"s1","message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":100,"output_tokens":0}}}`+"\n",
+		t0.Format(time.RFC3339), t0.Format(time.RFC3339),
+	)
+	if err := os.WriteFile(sessionFile, []byte(part1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idx := NewUsageIndex()
+	idx.ScanRoots([]string{tmp}, nil)
+
+	// Chunk 2 arrives in a subsequent incremental scan.
+	part2 := part1 + fmt.Sprintf(
+		`{"type":"assistant","timestamp":"%s","requestId":"r1","requestRef":"req-1","sessionId":"s1","message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":100,"output_tokens":500}}}`+"\n",
+		t1.Format(time.RFC3339),
+	)
+	if err := os.WriteFile(sessionFile, []byte(part2), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idx.ScanRoots([]string{tmp}, nil)
+
+	log := idx.SpeedLog()
+	if len(log.Requests) != 1 || log.Requests[0].Output != 500 || math.Abs(log.Requests[0].Rate()-100.0) > 1e-6 {
+		t.Fatalf("expected timed request 500 tokens @ 100 tok/s after 0-output first chunk, got %+v", log.Requests)
+	}
+
+	// 2. Request starts in scan A, then gets interrupted in scan B -> Pending must clear across scans!
+	part3 := part2 + fmt.Sprintf(
+		`{"type":"api-request","id":"req-2","timestamp":"%s","params":{"model":"claude-opus-5-5"}}`+"\n",
+		t2.Format(time.RFC3339),
+	)
+	if err := os.WriteFile(sessionFile, []byte(part3), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idx.ScanRoots([]string{tmp}, nil)
+	if len(idx.SpeedLog().Pending) != 1 {
+		t.Fatalf("expected 1 pending request, got %+v", idx.SpeedLog().Pending)
+	}
+
+	part4 := part3 + fmt.Sprintf(
+		`{"type":"user","timestamp":"%s","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}`+"\n",
+		t3.Format(time.RFC3339),
+	)
+	if err := os.WriteFile(sessionFile, []byte(part4), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stats := idx.ScanRoots([]string{tmp}, nil)
+	if !stats.TimingsChanged {
+		t.Fatal("expected TimingsChanged=true when pending request is interrupted")
+	}
+	if len(idx.SpeedLog().Pending) != 0 {
+		t.Fatalf("expected 0 pending requests after interrupt in next scan, got %+v", idx.SpeedLog().Pending)
+	}
+
+	// 3. New api-request in same file replaces unclosed pending (never piles up duplicates),
+	//    and startup priming recovers in-flight pending & starts after LoadUsageIndex!
+	part5 := part4 + fmt.Sprintf(
+		`{"type":"api-request","id":"req-3a","timestamp":"%s","params":{"model":"claude-opus-5-5"}}`+"\n"+
+			`{"type":"api-request","id":"req-3b","timestamp":"%s","params":{"model":"claude-opus-5-5"}}`+"\n",
+		t4.Format(time.RFC3339), t4.Add(time.Second).Format(time.RFC3339),
+	)
+	if err := os.WriteFile(sessionFile, []byte(part5), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idx.ScanRoots([]string{tmp}, nil)
+	if pend := idx.SpeedLog().Pending; len(pend) != 1 || pend[0].ID != "req-3b" {
+		t.Fatalf("expected single latest pending req-3b for same file, got %+v", pend)
+	}
+
+	indexPath := filepath.Join(tmp, "index.gob")
+	if err := idx.Save(indexPath); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := LoadUsageIndex(indexPath)
+	if len(reloaded.Pending) != 0 {
+		t.Fatalf("expected empty pending before first scan after reload, got %+v", reloaded.Pending)
+	}
+	reloaded.ScanRoots([]string{tmp}, nil)
+	if pend := reloaded.SpeedLog().Pending; len(pend) != 1 || pend[0].ID != "req-3b" {
+		t.Fatalf("expected startup priming to recover in-flight pending req-3b, got %+v", pend)
+	}
+	if len(reloaded.Records) != 1 {
+		t.Fatalf("startup priming must not duplicate records, got %d", len(reloaded.Records))
 	}
 }
