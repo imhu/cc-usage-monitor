@@ -14,11 +14,12 @@ import (
 const PillHeight = 38
 
 type PillActions struct {
-	OnOpenPanel    func()
-	SetAlwaysOnTop func(bool)
-	ResetPosition  func()
-	HidePill       func()
-	StartDrag      func(dx, dy int)
+	OnOpenPanel       func()
+	SetAlwaysOnTop    func(bool)
+	ResetPosition     func()
+	HidePill          func()
+	StartDrag         func(dx, dy int)
+	OnProviderChanged func()
 }
 
 // FloatingPillModel renders the optional Windows compact desktop strip
@@ -44,6 +45,39 @@ func NewFloatingPillModel(store *service.Store, actions PillActions) *FloatingPi
 
 // PillTargetWidth estimates a clean window width (in DIPs) for the enabled metrics.
 func PillTargetWidth(st service.ViewState) int {
+	if core.NormalizeProvider(st.Prefs.ActiveProvider) == core.ProviderAntigravity {
+		cols := 0
+		if st.Prefs.AGPillShowFiveHour {
+			cols++
+		}
+		if st.Prefs.AGPillShowWeek {
+			cols++
+		}
+		if st.Prefs.AGPillShowCache {
+			cols++
+		}
+		if st.Prefs.AGPillShowTodayCost {
+			cols++
+		}
+		if st.Prefs.AGPillShowContext {
+			cols++
+		}
+		if cols == 0 {
+			return 48
+		}
+		if cols == 1 {
+			return 88
+		}
+		w := 44 + cols*48
+		if w < 100 {
+			return 100
+		}
+		if w > 420 {
+			return 420
+		}
+		return w
+	}
+
 	cols := 0
 	if st.Prefs.PillShowFiveHour {
 		cols++
@@ -80,17 +114,18 @@ func PillTargetWidth(st service.ViewState) int {
 }
 
 func (m *FloatingPillModel) View(c *ui.Context) {
-	ApplyDarkTheme(c)
+	st := m.Store.ViewState()
+	provider := core.NormalizeProvider(st.Prefs.ActiveProvider)
+	ApplyThemeFor(c, provider)
 	c.Root().Background(ui.Transparent)
 
-	st := m.Store.ViewState()
 	zh := st.Prefs.IsChinese()
 	now := time.Now()
 	money := core.NewMoneyFormat(st.Prefs.Currency)
 
-	if st.Prefs.ClawdAnimation {
+	if provider == core.ProviderClaude && st.Prefs.ClawdAnimation {
 		c.After(800 * time.Millisecond)
-	} else if st.Prefs.PillShowSpeed {
+	} else if provider == core.ProviderClaude && st.Prefs.PillShowSpeed {
 		c.After(5 * time.Second)
 	} else {
 		c.After(15 * time.Second)
@@ -139,6 +174,19 @@ func (m *FloatingPillModel) View(c *ui.Context) {
 		if menu.Item(tr(zh, "打开主面板", "Open Panel")).Chosen() && m.Actions.OnOpenPanel != nil {
 			m.Actions.OnOpenPanel()
 		}
+		switchLabel := tr(zh, "切换到 Antigravity 用量", "Switch to Antigravity")
+		nextProvider := core.ProviderAntigravity
+		if provider == core.ProviderAntigravity {
+			switchLabel = tr(zh, "切换到 Claude 用量", "Switch to Claude")
+			nextProvider = core.ProviderClaude
+		}
+		if menu.Item(switchLabel).Chosen() {
+			m.Store.SetActiveProvider(nextProvider)
+			if m.Actions.OnProviderChanged != nil {
+				m.Actions.OnProviderChanged()
+			}
+		}
+		menu.Separator()
 		if menu.Item(tr(zh, "始终置顶", "Always on top")).Checked(st.Prefs.PillAlwaysOnTop).Chosen() {
 			next := !st.Prefs.PillAlwaysOnTop
 			m.Store.UpdatePrefs(func(p *core.Preferences) { p.PillAlwaysOnTop = next })
@@ -165,6 +213,11 @@ func (m *FloatingPillModel) View(c *ui.Context) {
 	})
 
 	pill.Children(func() {
+		if provider == core.ProviderAntigravity {
+			m.renderAGPillContent(c, st, money, zh)
+			return
+		}
+
 		col := ColorLive
 		if st.OfficialUsage != nil && st.OfficialUsage.FiveHour != nil {
 			eff := st.OfficialUsage.EffectiveAt(now)
@@ -248,4 +301,65 @@ func (m *FloatingPillModel) View(c *ui.Context) {
 			addCol(tr(zh, "速度", "TOK/S"), v, ColorText)
 		}
 	})
+}
+
+type agPillCol struct {
+	top string
+	val string
+	col ui.Color
+}
+
+func buildAGPillColumns(st service.ViewState, money core.MoneyFormat) []agPillCol {
+	off := st.AG.OfficialReport
+	local := st.AG.LocalReport
+	var cols []agPillCol
+
+	if st.Prefs.AGPillShowFiveHour {
+		if b := off.PrimaryFiveHour; b != nil {
+			cols = append(cols, agPillCol{"5H", fmt.Sprintf("%d%%", b.UsedPercentInt()), AGLevelColor(b.UsedFraction, b.IsOverPace())})
+		} else {
+			cols = append(cols, agPillCol{"5H", "--", ColorSecondary})
+		}
+	}
+	if st.Prefs.AGPillShowWeek {
+		if b := off.PrimaryWeekly; b != nil {
+			cols = append(cols, agPillCol{"WEEK", fmt.Sprintf("%d%%", b.UsedPercentInt()), AGLevelColor(b.UsedFraction, b.IsOverPace())})
+		} else {
+			cols = append(cols, agPillCol{"WEEK", "--", ColorSecondary})
+		}
+	}
+	if st.Prefs.AGPillShowCache {
+		if local.Today.TotalInputTokens() > 0 {
+			cols = append(cols, agPillCol{"CACHE", core.FormatPercent(local.Today.CacheHitRate(), 0), ColorAGAccent})
+		} else {
+			cols = append(cols, agPillCol{"CACHE", "--", ColorSecondary})
+		}
+	}
+	if st.Prefs.AGPillShowTodayCost {
+		cols = append(cols, agPillCol{"TODAY", money.Compact(local.Today.EstimatedCostUSD), ColorText})
+	}
+	if st.Prefs.AGPillShowContext {
+		if off.ContextWindow != nil && off.ContextWindow.UsedPercentage != nil {
+			u := *off.ContextWindow.UsedPercentage
+			cols = append(cols, agPillCol{"CTX", fmt.Sprintf("%d%%", int(u)), AGLevelColor(u/100.0, false)})
+		} else {
+			cols = append(cols, agPillCol{"CTX", "--", ColorSecondary})
+		}
+	}
+	return cols
+}
+
+func (m *FloatingPillModel) renderAGPillContent(c *ui.Context, st service.ViewState, money core.MoneyFormat, zh bool) {
+	AntigravityLogo(c, 16, 0)
+	cols := buildAGPillColumns(st, money)
+	if len(cols) == 1 {
+		ui.Text(c, cols[0].val).FontSize(12.5).FontWeight(600).TextColor(cols[0].col).FontFeatures("tnum").SingleLine()
+		return
+	}
+	for _, col := range cols {
+		ui.Column(c).Center().Gap(0).Children(func() {
+			ui.Text(c, col.top).FontSize(8.5).TextColor(ColorTertiary).SingleLine()
+			ui.Text(c, col.val).FontSize(11).FontWeight(600).TextColor(col.col).FontFeatures("tnum").SingleLine()
+		})
+	}
 }

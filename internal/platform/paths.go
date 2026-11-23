@@ -2,6 +2,7 @@ package platform
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -117,4 +118,75 @@ func ClaudeProjectRoots(customConfigDir, customDataDir string) []string {
 		add(filepath.Join(HomeDir(), ".claude", "projects"))
 	}
 	return roots
+}
+
+// DefaultAGBrainDir returns ~/.gemini/antigravity/brain.
+func DefaultAGBrainDir() string {
+	return filepath.Join(HomeDir(), ".gemini", "antigravity", "brain")
+}
+
+// AGBrainDir resolves the effective Antigravity brain directory.
+func AGBrainDir(custom string) string {
+	if p := expandPath(custom); p != "" {
+		return p
+	}
+	return DefaultAGBrainDir()
+}
+
+// DefaultAGCLIConfigDir returns ~/.gemini/antigravity-cli.
+func DefaultAGCLIConfigDir() string {
+	return filepath.Join(HomeDir(), ".gemini", "antigravity-cli")
+}
+
+// AGCLIConfigDir resolves the effective Antigravity CLI config directory.
+func AGCLIConfigDir(custom string) string {
+	if p := expandPath(custom); p != "" {
+		return p
+	}
+	return DefaultAGCLIConfigDir()
+}
+
+// AGSnapshotFile returns the path to usage-monitor-snapshot.json.
+func AGSnapshotFile(customCLIDir string) string {
+	return filepath.Join(AGCLIConfigDir(customCLIDir), "usage-monitor-snapshot.json")
+}
+
+// LocateAgyBinary finds the agy CLI executable on Windows, preferring customPath if valid.
+func LocateAgyBinary(customPath string) string {
+	if p := expandPath(customPath); p != "" {
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p
+		}
+	}
+	if p, err := exec.LookPath("agy"); err == nil && p != "" {
+		return p
+	}
+	home := HomeDir()
+	localApp := os.Getenv("LOCALAPPDATA")
+	roamingApp := os.Getenv("APPDATA")
+	candidates := []string{
+		filepath.Join(home, ".local", "bin", "agy.exe"),
+		filepath.Join(home, ".local", "bin", "agy.cmd"),
+		filepath.Join(home, ".gemini", "antigravity", "bin", "agy.exe"),
+		filepath.Join(home, ".gemini", "antigravity", "bin", "agy.cmd"),
+	}
+	if localApp != "" {
+		candidates = append(candidates,
+			filepath.Join(localApp, "Programs", "Antigravity", "bin", "agy.exe"),
+			filepath.Join(localApp, "Programs", "Antigravity", "resources", "app", "bin", "agy.cmd"),
+		)
+	}
+	if roamingApp != "" {
+		candidates = append(candidates,
+			filepath.Join(roamingApp, "Antigravity", "bin", "agy.exe"),
+			filepath.Join(roamingApp, "Antigravity", "bin", "agy.cmd"),
+			filepath.Join(roamingApp, "npm", "agy.cmd"),
+		)
+	}
+	for _, c := range candidates {
+		if info, err := os.Stat(c); err == nil && !info.IsDir() {
+			return c
+		}
+	}
+	return ""
 }

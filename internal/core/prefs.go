@@ -47,6 +47,8 @@ const (
 )
 
 type Preferences struct {
+	ActiveProvider ProviderKind `json:"activeProvider"`
+
 	// Usage tab
 	OfficialEnabled    bool   `json:"officialEnabled"`
 	CheckOnOpen        bool   `json:"checkOnOpen"`
@@ -55,6 +57,27 @@ type Preferences struct {
 	AutoRenewLogin     bool   `json:"autoRenewLogin"`
 	BillingAnchorDay   int    `json:"billingAnchorDay"`
 	ManualPlan         PlanKind `json:"manualPlan"`
+
+	// Antigravity Usage & Data
+	AGOfficialEnabled    bool        `json:"agOfficialEnabled"`
+	AGSyncIntervalSec    int         `json:"agSyncIntervalSec"`
+	AGAgyCLIPath         string      `json:"agAgyCliPath"`
+	AGBrainDir           string      `json:"agBrainDir"`
+	AGCLIConfigDir       string      `json:"agCliConfigDir"`
+	AGBillingAnchorDay   int         `json:"agBillingAnchorDay"`
+	AGShowEstimatedSpeed bool        `json:"agShowEstimatedSpeed"`
+	AGProcessesDisplay   DisplayMode `json:"agProcessesDisplay"`
+	AGPillShowFiveHour   bool        `json:"agPillShowFiveHour"`
+	AGPillShowWeek       bool        `json:"agPillShowWeek"`
+	AGPillShowCache      bool        `json:"agPillShowCache"`
+	AGPillShowTodayCost  bool        `json:"agPillShowTodayCost"`
+	AGPillShowContext    bool        `json:"agPillShowContext"`
+	AGCostSpan           CostSpan    `json:"agCostSpan"`
+	AGCollapsedLimits    bool        `json:"agCollapsedLimits"`
+	AGCollapsedSpeed     bool        `json:"agCollapsedSpeed"`
+	AGCollapsedSpend     bool        `json:"agCollapsedSpend"`
+	AGAlertEnabled       bool        `json:"agAlertEnabled"`
+	AGBillingReminders   bool        `json:"agBillingReminders"`
 
 	// Menubar / Tray & Floating Pill tab
 	IconStyle          IconStyle `json:"iconStyle"`
@@ -100,12 +123,22 @@ type Preferences struct {
 
 func DefaultPreferences() Preferences {
 	return Preferences{
-		OfficialEnabled:     true,
-		CheckOnOpen:         true,
-		SyncIntervalSec:     30,
-		AutoRenewLogin:      true,
-		BillingAnchorDay:    0,
-		IconStyle:           IconStyleClawd,
+		ActiveProvider:       ProviderClaude,
+		OfficialEnabled:      true,
+		CheckOnOpen:          true,
+		SyncIntervalSec:      30,
+		AutoRenewLogin:       true,
+		BillingAnchorDay:     0,
+		AGOfficialEnabled:    true,
+		AGSyncIntervalSec:    30,
+		AGBillingAnchorDay:   0,
+		AGShowEstimatedSpeed: true,
+		AGProcessesDisplay:   DisplayCompact,
+		AGPillShowFiveHour:   true,
+		AGCostSpan:           SpanWeek,
+		AGAlertEnabled:       true,
+		AGBillingReminders:   true,
+		IconStyle:            IconStyleClawd,
 		ClawdAnimation:      true,
 		ShowFloatingPill:    false,
 		PillAlwaysOnTop:     true,
@@ -144,11 +177,30 @@ func LoadPreferences(path string) Preferences {
 		return p
 	}
 	_ = json.Unmarshal(b, &p)
+	p.ActiveProvider = NormalizeProvider(p.ActiveProvider)
 	if p.SyncIntervalSec < 10 {
 		p.SyncIntervalSec = 10
 	}
 	if p.SyncIntervalSec > 3600 {
 		p.SyncIntervalSec = 3600
+	}
+	if p.AGSyncIntervalSec < 10 {
+		p.AGSyncIntervalSec = 10
+	}
+	if p.AGSyncIntervalSec > 3600 {
+		p.AGSyncIntervalSec = 3600
+	}
+	if p.AGBillingAnchorDay < 0 {
+		p.AGBillingAnchorDay = 0
+	}
+	if p.AGBillingAnchorDay > 31 {
+		p.AGBillingAnchorDay = 31
+	}
+	if p.AGProcessesDisplay == "" {
+		p.AGProcessesDisplay = DisplayCompact
+	}
+	if p.AGCostSpan == "" {
+		p.AGCostSpan = SpanWeek
 	}
 	if p.AlertThresholdPct < 50 || p.AlertThresholdPct > 95 {
 		p.AlertThresholdPct = 80

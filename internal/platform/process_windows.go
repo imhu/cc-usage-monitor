@@ -4,6 +4,7 @@ package platform
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -111,6 +112,84 @@ func ListClaudeProcesses() []ClaudeTask {
 		if err := windows.Process32Next(snap, &entry); err != nil {
 			break
 		}
+	}
+
+	sort.Slice(tasks, func(i, j int) bool {
+		if tasks[i].Bytes != tasks[j].Bytes {
+			return tasks[i].Bytes > tasks[j].Bytes
+		}
+		return tasks[i].PID < tasks[j].PID
+	})
+	return tasks
+}
+
+// ListAntigravityProcesses finds running Antigravity Desktop (grouped), Language Server, and agy CLI processes.
+func ListAntigravityProcesses() []ClaudeTask {
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return nil
+	}
+	defer windows.CloseHandle(snap)
+
+	var entry windows.ProcessEntry32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+	if err := windows.Process32First(snap, &entry); err != nil {
+		return nil
+	}
+
+	selfPID := uint32(os.Getpid())
+	var tasks []ClaudeTask
+	var desktopPID uint32
+	var desktopCount int
+	var desktopBytes uint64
+
+	for {
+		pid := entry.ProcessID
+		if pid != selfPID {
+			exe := windows.UTF16ToString(entry.ExeFile[:])
+			lower := strings.ToLower(exe)
+			switch lower {
+			case "antigravity.exe":
+				if desktopPID == 0 || pid < desktopPID {
+					desktopPID = pid
+				}
+				desktopCount++
+				desktopBytes += processMemory(pid)
+			case "language_server.exe":
+				imgPath := strings.ToLower(processImagePath(pid))
+				if strings.Contains(imgPath, "antigravity") {
+					tasks = append(tasks, ClaudeTask{
+						PID:    pid,
+						Name:   "Language Server",
+						Detail: fmt.Sprintf("PID %d", pid),
+						Bytes:  processMemory(pid),
+					})
+				}
+			case "agy.exe":
+				tasks = append(tasks, ClaudeTask{
+					PID:    pid,
+					Name:   "agy CLI",
+					Detail: fmt.Sprintf("PID %d", pid),
+					Bytes:  processMemory(pid),
+				})
+			}
+		}
+		if err := windows.Process32Next(snap, &entry); err != nil {
+			break
+		}
+	}
+
+	if desktopCount > 0 {
+		detail := "Desktop"
+		if desktopCount > 1 {
+			detail = fmt.Sprintf("%d procs", desktopCount)
+		}
+		tasks = append(tasks, ClaudeTask{
+			PID:    desktopPID,
+			Name:   "Antigravity",
+			Detail: detail,
+			Bytes:  desktopBytes,
+		})
 	}
 
 	sort.Slice(tasks, func(i, j int) bool {

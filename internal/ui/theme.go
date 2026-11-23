@@ -35,7 +35,52 @@ var (
 	ColorCacheWrite = ColorAccent.Alpha(0.50)
 	ColorInputTok   = ui.RGBA(255, 255, 255, 0.62)
 	ColorOutputTok  = ui.RGBA(255, 255, 255, 0.32)
+
+	// Antigravity brand palette (Theme.swift)
+	ColorAGAccent    = ui.Hex("#4F8CFF")
+	ColorAGStarTop   = ui.Hex("#7AB8FF")
+	ColorAGStarBot   = ui.Hex("#7361FA")
+	ColorAGSafeGreen = ui.Hex("#5EC27B")
 )
+
+type ProviderPalette struct {
+	Accent     ui.Color
+	AccentSoft ui.Color
+	CacheRead  ui.Color
+	CacheWrite ui.Color
+}
+
+func PaletteFor(p core.ProviderKind) ProviderPalette {
+	if core.NormalizeProvider(p) == core.ProviderAntigravity {
+		return ProviderPalette{
+			Accent:     ColorAGAccent,
+			AccentSoft: ColorAGAccent.Alpha(0.20),
+			CacheRead:  ColorAGAccent,
+			CacheWrite: ColorAGAccent.Alpha(0.50),
+		}
+	}
+	return ProviderPalette{
+		Accent:     ColorAccent,
+		AccentSoft: ColorAccentSoft,
+		CacheRead:  ColorCacheRead,
+		CacheWrite: ColorCacheWrite,
+	}
+}
+
+func AGLevelColor(fraction float64, overPace bool) ui.Color {
+	switch {
+	case overPace || fraction >= 0.90:
+		return ui.Hex("#E5584F")
+	case fraction >= 0.75:
+		return ui.Hex("#E57A4B")
+	case fraction >= 0.55:
+		return ui.Hex("#E3A24B")
+	case fraction >= 0.35:
+		return ui.Hex("#9EC95A")
+	default:
+		return ColorAGSafeGreen
+	}
+}
 
 const (
 	PopoverWidth  float32 = 356
@@ -49,7 +94,12 @@ func LevelColor(fraction float64) ui.Color {
 }
 
 func ApplyDarkTheme(c *ui.Context) {
-	t := ui.DarkTheme().WithAccent(ColorAccent)
+	ApplyThemeFor(c, core.ProviderClaude)
+}
+
+func ApplyThemeFor(c *ui.Context, p core.ProviderKind) {
+	pal := PaletteFor(p)
+	t := ui.DarkTheme().WithAccent(pal.Accent)
 	t.Background = ColorSurfaceDark
 	t.Surface = ColorSurfacePanel
 	t.SurfaceHover = ColorHover
@@ -60,6 +110,6 @@ func ApplyDarkTheme(c *ui.Context) {
 	t.InverseText = ColorText
 	t.Radius = 8
 	t.TooltipDelay = 300_000_000 // 300ms
-	t.InactiveAccent = ColorAccent
+	t.InactiveAccent = pal.Accent
 	c.SetTheme(t)
 }

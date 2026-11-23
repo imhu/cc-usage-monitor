@@ -15,10 +15,11 @@ import (
 )
 
 type PopoverActions struct {
-	OpenSettings func()
-	Quit         func()
-	ChooseDir    func()
-	TogglePill   func()
+	OpenSettings      func()
+	Quit              func()
+	ChooseDir         func()
+	TogglePill        func()
+	OnProviderChanged func()
 }
 
 type PopoverModel struct {
@@ -31,15 +32,26 @@ type PopoverModel struct {
 	hoveredDay   int
 	hoveredAge   float64
 	hoveredReply uint64
+
+	// Antigravity ephemeral UI state
+	agProcExpanded  bool
+	agHoveredBucket map[string]bool
+	agHoveredBar    int
+	agHoveredSpark  int
+	agShowDotChart  bool
+	agHoveredDotID  int
 }
 
 func NewPopoverModel(store *service.Store, actions PopoverActions) *PopoverModel {
 	return &PopoverModel{
-		Store:      store,
-		Actions:    actions,
-		hoveredBar: map[string]bool{},
-		hoveredDay: -1,
-		hoveredAge: -1,
+		Store:           store,
+		Actions:         actions,
+		hoveredBar:      map[string]bool{},
+		hoveredDay:      -1,
+		hoveredAge:      -1,
+		agHoveredBucket: map[string]bool{},
+		agHoveredBar:    -1,
+		agHoveredSpark:  -1,
 	}
 }
 
@@ -51,13 +63,35 @@ func (m *PopoverModel) ResetHover() {
 	for k := range m.hoveredBar {
 		delete(m.hoveredBar, k)
 	}
+	m.agHoveredBar = -1
+	m.agHoveredSpark = -1
+	m.agHoveredDotID = 0
+	for k := range m.agHoveredBucket {
+		delete(m.agHoveredBucket, k)
+	}
+}
+
+func (m *PopoverModel) switchProvider(p core.ProviderKind) {
+	norm := core.NormalizeProvider(p)
+	cur := core.NormalizeProvider(m.Store.ViewState().Prefs.ActiveProvider)
+	if cur == norm {
+		return
+	}
+	m.ResetHover()
+	m.Store.SetActiveProvider(norm)
+	if m.Actions.OnProviderChanged != nil {
+		m.Actions.OnProviderChanged()
+	}
 }
 
 func (m *PopoverModel) View(c *ui.Context) {
-	ApplyDarkTheme(c)
+	st := m.Store.ViewState()
+	provider := core.NormalizeProvider(st.Prefs.ActiveProvider)
+	ApplyThemeFor(c, provider)
 	c.Root().Background(ui.Transparent)
 
 	// Shortcuts matching original app: Ctrl+, settings, Ctrl+R refresh, Ctrl+Q quit
+	// Plus provider switching: Ctrl+1 Claude, Ctrl+2 Antigravity, Ctrl+Tab toggle.
 	c.OnShortcut(ui.Cmd, ui.KeyComma, func() {
 		if m.Actions.OpenSettings != nil {
 			m.Actions.OpenSettings()
@@ -69,8 +103,16 @@ func (m *PopoverModel) View(c *ui.Context) {
 			m.Actions.Quit()
 		}
 	})
+	c.OnShortcut(ui.Cmd, ui.Key1, func() { m.switchProvider(core.ProviderClaude) })
+	c.OnShortcut(ui.Cmd, ui.Key2, func() { m.switchProvider(core.ProviderAntigravity) })
+	c.OnShortcut(ui.Cmd, ui.KeyTab, func() {
+		if provider == core.ProviderAntigravity {
+			m.switchProvider(core.ProviderClaude)
+		} else {
+			m.switchProvider(core.ProviderAntigravity)
+		}
+	})
 
-	st := m.Store.ViewState()
 	zh := st.Prefs.IsChinese()
 	now := time.Now()
 
@@ -80,7 +122,9 @@ func (m *PopoverModel) View(c *ui.Context) {
 
 	// Match claude-usage-monitor: tick every 1s while panel is visible when countdown
 	// or output speed is active (shifts timeline, drops expired 5m replies, ticks generating timer).
-	if st.Prefs.ShowResetCountdown || st.Prefs.SpeedDisplay != core.DisplayHidden {
+	if st.Prefs.ShowResetCountdown ||
+		(provider == core.ProviderClaude && st.Prefs.SpeedDisplay != core.DisplayHidden) ||
+		(provider == core.ProviderAntigravity && st.AG.LocalReport.OutputSpeed.IsRecentlyActive) {
 		c.After(time.Second)
 	} else {
 		c.After(15 * time.Second)
@@ -94,12 +138,24 @@ func (m *PopoverModel) View(c *ui.Context) {
 	}
 
 	root.Children(func() {
-		// 1. Header: Claude logo + title + PlanBadge (pinned at top)
-		m.renderHeader(c, st, zh)
+		// 1. Header: brand logo + title + PlanBadge (pinned at top)
+		if provider == core.ProviderAntigravity {
+			m.renderAGHeader(c, st, zh)
+		} else {
+			m.renderHeader(c, st, zh)
+		}
+
+		// 1.5 Compact Provider Switcher (Claude <-> Antigravity)
+		m.renderProviderSwitcher(c, provider, zh)
 
 		// Scrollable middle body: expands to natural height via FitContent when
 		// the screen has room, and scrolls smoothly if content exceeds WorkArea.
 		ui.Scroll(c.Key("popover-body")).FillWidth().Grow(1).Scrollbars(false).Children(func() {
+			if provider == core.ProviderAntigravity {
+				m.renderAGBody(c, st, now, zh)
+				return
+			}
+
 			// 2. Exit / Network Place row
 			m.renderExitRow(c, st, zh)
 
@@ -118,6 +174,46 @@ func (m *PopoverModel) View(c *ui.Context) {
 
 		// 5. Footer: 设置… | 立即刷新 | 退出 (pinned at bottom)
 		m.renderFooter(c, st, zh)
+	})
+}
+
+func (m *PopoverModel) renderProviderSwitcher(c *ui.Context, active core.ProviderKind, zh bool) {
+	wrap := ui.Row(c.Key("provider-sw")).FillWidth().Margin(0, 0, 8, 0).Padding(2).Gap(2).Radius(9).Background(ColorPillBg)
+	wrap.Children(func() {
+		renderTab := func(key string, p core.ProviderKind, label, tip string, drawIcon func(ui.Color)) {
+			isSel := active == p
+			tab := ui.Row(c.Key(key)).Grow(1).Height(24).Padding(0, 8).Radius(7).Center().Gap(5).Cursor(ui.CursorPointer)
+			if isSel {
+				tab.Background(ColorPillSel)
+			} else if tab.Hovered() {
+				tab.Background(ColorHover)
+			}
+			if tab.Clicked() && !isSel {
+				m.switchProvider(p)
+			}
+			tab.Tooltip(tip)
+			tab.Children(func() {
+				col := ColorSecondary
+				weight := 400
+				if isSel {
+					col = ColorText
+					weight = 500
+				}
+				drawIcon(col)
+				ui.Text(c, label).FontSize(11.5).FontWeight(weight).TextColor(col).SingleLine()
+			})
+		}
+
+		renderTab("prov-claude", core.ProviderClaude, "Claude", tr(zh, "切换到 Claude 用量 (Ctrl+1)", "Switch to Claude usage (Ctrl+1)"), func(col ui.Color) {
+			ic := ColorTertiary
+			if active == core.ProviderClaude {
+				ic = ColorAccent
+			}
+			ClaudeLogo(c, 11, ic)
+		})
+		renderTab("prov-ag", core.ProviderAntigravity, "Antigravity", tr(zh, "切换到 Antigravity 用量 (Ctrl+2)", "Switch to Antigravity usage (Ctrl+2)"), func(col ui.Color) {
+			AntigravityLogo(c, 11, 0)
+		})
 	})
 }
 
@@ -1217,6 +1313,10 @@ func (m *PopoverModel) renderNoSessions(c *ui.Context, st service.ViewState, zh 
 }
 
 func (m *PopoverModel) renderFooter(c *ui.Context, st service.ViewState, zh bool) {
+	spinning := st.IsFetching
+	if core.NormalizeProvider(st.Prefs.ActiveProvider) == core.ProviderAntigravity {
+		spinning = st.AG.IsSyncing || st.AG.IsRefreshing
+	}
 	ui.Row(c).FillWidth().Padding(7, 0, 0, 0).Margin(0, -8, 0, -8).AlignItems(ui.Center).Children(func() {
 		FooterButton(c, "ft-settings", IconSliders, tr(zh, "设置…", "Settings…"), false, func() {
 			if m.Actions.OpenSettings != nil {
@@ -1224,7 +1324,7 @@ func (m *PopoverModel) renderFooter(c *ui.Context, st service.ViewState, zh bool
 			}
 		}).Tooltip(tr(zh, "快捷键 Ctrl+,", "Shortcut Ctrl+,"))
 		ui.Spacer(c)
-		FooterButton(c, "ft-refresh", IconRefresh, tr(zh, "立即刷新", "Refresh"), st.IsFetching, func() {
+		FooterButton(c, "ft-refresh", IconRefresh, tr(zh, "立即刷新", "Refresh"), spinning, func() {
 			m.Store.RefreshNow()
 		}).Tooltip(tr(zh, "快捷键 Ctrl+R", "Shortcut Ctrl+R"))
 		ui.Spacer(c)

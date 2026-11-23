@@ -88,6 +88,9 @@ type ViewState struct {
 	HasCredentialsFile bool
 	HasProjectsDir     bool
 	DataRoots          []string
+
+	// Antigravity
+	AG AGViewState
 }
 
 // ActiveSpeedModel returns the model currently displayed for output speed,
@@ -174,6 +177,24 @@ type Store struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	watchCancel context.CancelFunc
+
+	// Antigravity state
+	agIndex          *core.AGTranscriptIndex
+	agIndexDir       string
+	agSyncer         *AGSilentSyncer
+	agLocal          core.AGLocalUsageReport
+	agOfficial       core.AGOfficialQuotaReport
+	agBridge         core.AGBridgeStatus
+	agCLIPath        string
+	agProcs          []platform.ClaudeTask
+	agRefreshing     bool
+	agSyncing        bool
+	agAuthRequired   bool
+	agFeedback       string
+	agLastAutoSync   time.Time
+	agLastSeenTokens int64
+	agLastAlertKey   string
+	agWatchCancel    context.CancelFunc
 }
 
 func NewStore(onChange func()) *Store {
@@ -333,6 +354,9 @@ func (s *Store) Start() {
 
 	// 4. Watch ~/.claude/projects and ~/.claude.json via mygo.WatchFiles
 	go s.startFileWatchers()
+
+	// 5. Start Antigravity local scanner, watchers, and background CLI syncer
+	go s.startAG()
 }
 
 func (s *Store) Stop() {
@@ -340,6 +364,10 @@ func (s *Store) Stop() {
 	if s.watchCancel != nil {
 		s.watchCancel()
 		s.watchCancel = nil
+	}
+	if s.agWatchCancel != nil {
+		s.agWatchCancel()
+		s.agWatchCancel = nil
 	}
 	s.mu.Unlock()
 	if s.cancel != nil {
@@ -663,6 +691,14 @@ func (s *Store) maybeAutoSync() {
 
 func (s *Store) OnPanelOpened() {
 	go func() {
+		s.mu.RLock()
+		activeProvider := core.NormalizeProvider(s.prefs.ActiveProvider)
+		s.mu.RUnlock()
+		if activeProvider == core.ProviderAntigravity {
+			s.RefreshAntigravity(false)
+			return
+		}
+
 		s.RefreshProcesses()
 		s.mu.RLock()
 		roots := platform.ClaudeProjectRoots(s.prefs.ClaudeConfigDir, s.prefs.CustomDataDir)
@@ -685,6 +721,14 @@ func (s *Store) OnPanelOpened() {
 
 func (s *Store) RefreshNow() {
 	go func() {
+		s.mu.RLock()
+		activeProvider := core.NormalizeProvider(s.prefs.ActiveProvider)
+		s.mu.RUnlock()
+		if activeProvider == core.ProviderAntigravity {
+			s.RefreshAntigravity(true)
+			return
+		}
+
 		s.RefreshProcesses()
 		s.mu.RLock()
 		roots := platform.ClaudeProjectRoots(s.prefs.ClaudeConfigDir, s.prefs.CustomDataDir)
@@ -1494,17 +1538,40 @@ func (s *Store) shieldLocked() platform.ShieldState {
 
 func (s *Store) UpdatePrefs(fn func(*core.Preferences)) {
 	var proxyChanged, officialToggledOn, claudeDirChanged, dirChanged, officialEnabled bool
+	var agWatchChanged, agRefreshNeeded, agToggledOn bool
 	s.mu.Lock()
 	oldProxy := s.prefs.ProxyURL
 	oldOfficial := s.prefs.OfficialEnabled
 	oldClaudeDir := platform.ClaudeConfigDir(s.prefs.ClaudeConfigDir)
 	oldDir := s.prefs.CustomDataDir
+	oldProvider := s.prefs.ActiveProvider
+	oldAGBrain := platform.AGBrainDir(s.prefs.AGBrainDir)
+	oldAGCLIDir := platform.AGCLIConfigDir(s.prefs.AGCLIConfigDir)
+	oldAGCLIPath := s.prefs.AGAgyCLIPath
+	oldAGBilling := s.prefs.AGBillingAnchorDay
+	oldAGOfficial := s.prefs.AGOfficialEnabled
+
 	fn(&s.prefs)
+	s.prefs.ActiveProvider = core.NormalizeProvider(s.prefs.ActiveProvider)
+
 	proxyChanged = s.prefs.ProxyURL != oldProxy
 	officialToggledOn = s.prefs.OfficialEnabled && !oldOfficial
 	claudeDirChanged = !strings.EqualFold(platform.ClaudeConfigDir(s.prefs.ClaudeConfigDir), oldClaudeDir)
 	dirChanged = s.prefs.CustomDataDir != oldDir
 	officialEnabled = s.prefs.OfficialEnabled
+
+	newAGBrain := platform.AGBrainDir(s.prefs.AGBrainDir)
+	newAGCLIDir := platform.AGCLIConfigDir(s.prefs.AGCLIConfigDir)
+	agBrainChanged := !strings.EqualFold(newAGBrain, oldAGBrain)
+	agCLIConfigChanged := !strings.EqualFold(newAGCLIDir, oldAGCLIDir)
+	agWatchChanged = agBrainChanged || agCLIConfigChanged
+	agRefreshNeeded = agWatchChanged || s.prefs.AGAgyCLIPath != oldAGCLIPath || s.prefs.AGBillingAnchorDay != oldAGBilling || (s.prefs.ActiveProvider != oldProvider && s.prefs.ActiveProvider == core.ProviderAntigravity)
+	agToggledOn = s.prefs.AGOfficialEnabled && !oldAGOfficial
+	if agBrainChanged && s.agIndex != nil {
+		s.agIndex.SetBrainDir(newAGBrain)
+		s.agIndexDir = newAGBrain
+	}
+
 	if claudeDirChanged {
 		s.resetOfficialAccountLocked()
 	}
@@ -1517,6 +1584,15 @@ func (s *Store) UpdatePrefs(fn func(*core.Preferences)) {
 	_ = core.SavePreferences(s.prefsPath, s.prefs)
 	s.mu.Unlock()
 	s.notify()
+
+	if agWatchChanged {
+		go s.startAGWatchers()
+	}
+	if agToggledOn {
+		go s.RefreshAntigravity(true)
+	} else if agRefreshNeeded {
+		go s.RefreshAntigravity(false)
+	}
 
 	if proxyChanged {
 		go func() {
@@ -1676,6 +1752,7 @@ func (s *Store) ViewState() ViewState {
 		HasCredentialsFile:  credErr == nil,
 		HasProjectsDir:      projErr == nil,
 		DataRoots:           platform.ClaudeProjectRoots(s.prefs.ClaudeConfigDir, s.prefs.CustomDataDir),
+		AG:                  s.agViewStateLocked(),
 	}
 }
 

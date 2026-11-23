@@ -27,10 +27,13 @@ const (
 type SettingsActions struct {
 	ChooseClaudeDir    func()
 	ChooseDir          func()
+	ChooseAGBrainDir   func()
+	ChooseAgyBinary    func()
 	ToggleFloatingPill func(show bool)
 	SetPillAlwaysOnTop func(on bool)
 	SyncPillSize       func()
 	SyncTray           func()
+	OnProviderChanged  func()
 	GetOpenAtLogin     func() bool
 	SetOpenAtLogin     func(bool) error
 }
@@ -39,16 +42,24 @@ type SettingsModel struct {
 	Store   *service.Store
 	Actions SettingsActions
 
-	ActiveTab       SettingsTab
-	proxyDraft      string
-	proxySynced     bool
-	intervalStr     string
-	intSynced       bool
-	claudeDirDraft  string
-	lastClaudePref  string
-	claudeDirSynced bool
-	openAtLogin     bool
-	loginSynced     bool
+	ActiveTab              SettingsTab
+	menuBarPreviewProvider core.ProviderKind
+	menuBarPreviewSynced   bool
+	proxyDraft             string
+	proxySynced            bool
+	intervalStr            string
+	intSynced              bool
+	claudeDirDraft         string
+	lastClaudePref         string
+	claudeDirSynced        bool
+	agBrainDraft           string
+	lastAGBrainPref        string
+	agBrainSynced          bool
+	agCLIDraft             string
+	lastAGCLIPref          string
+	agCLISynced            bool
+	openAtLogin            bool
+	loginSynced            bool
 }
 
 func NewSettingsModel(store *service.Store, actions SettingsActions) *SettingsModel {
@@ -60,12 +71,15 @@ func NewSettingsModel(store *service.Store, actions SettingsActions) *SettingsMo
 }
 
 func (m *SettingsModel) View(c *ui.Context) {
-	ApplyDarkTheme(c)
-	c.Root().Background(ColorSurfaceSettings)
-
 	st := m.Store.ViewState()
 	zh := st.Prefs.IsChinese()
+	ApplyThemeFor(c, st.Prefs.ActiveProvider)
+	c.Root().Background(ColorSurfaceSettings)
 
+	if !m.menuBarPreviewSynced {
+		m.menuBarPreviewProvider = core.NormalizeProvider(st.Prefs.ActiveProvider)
+		m.menuBarPreviewSynced = true
+	}
 	if !m.proxySynced {
 		m.proxyDraft = st.Prefs.ProxyURL
 		m.proxySynced = true
@@ -78,6 +92,16 @@ func (m *SettingsModel) View(c *ui.Context) {
 		m.claudeDirDraft = st.Prefs.ClaudeConfigDir
 		m.lastClaudePref = st.Prefs.ClaudeConfigDir
 		m.claudeDirSynced = true
+	}
+	if !m.agBrainSynced || st.Prefs.AGBrainDir != m.lastAGBrainPref {
+		m.agBrainDraft = st.Prefs.AGBrainDir
+		m.lastAGBrainPref = st.Prefs.AGBrainDir
+		m.agBrainSynced = true
+	}
+	if !m.agCLISynced || st.Prefs.AGAgyCLIPath != m.lastAGCLIPref {
+		m.agCLIDraft = st.Prefs.AGAgyCLIPath
+		m.lastAGCLIPref = st.Prefs.AGAgyCLIPath
+		m.agCLISynced = true
 	}
 	if !m.loginSynced {
 		if m.Actions.GetOpenAtLogin != nil {
@@ -292,43 +316,198 @@ func (m *SettingsModel) renderUsageTab(c *ui.Context, st service.ViewState, zh b
 			}
 		}
 	})
-}
 
-func (m *SettingsModel) renderMenuBarTab(c *ui.Context, st service.ViewState, zh bool) {
-	settingsGroupTitle(c, tr(zh, "菜单栏与悬浮条预览", "Menubar & Floating Bar Preview"))
+	Hairline(c)
 
-	// Live preview strip matching hero.png!
-	ui.Row(c).FillWidth().Height(42).Padding(0, 16).Radius(10).Background(ColorPillBg).Center().Gap(12).Children(func() {
-		ui.Box(c).Size(12, 3).Radius(1.5).Background(ColorQuaternary)
-		m.renderPreviewPillContent(c, st, zh)
-		ui.Box(c).Size(12, 3).Radius(1.5).Background(ColorQuaternary)
-		ui.Text(c, time.Now().Format("15:04")).FontSize(12).FontWeight(500).TextColor(ColorSecondary).FontFeatures("tnum")
-	})
+	settingsGroupTitle(c, tr(zh, "Antigravity 官方额度（agy CLI）", "Antigravity official limits (agy CLI)"))
 
-	settingsRow(c, tr(zh, "图标", "Icon"), "", func() {
-		idx := 0
-		if st.Prefs.IconStyle == core.IconStyleLogo {
-			idx = 1
+	agSub := tr(zh, "通过官方 agy --settings 在后台静默获取 5 小时与每周额度（零抓包）",
+		"Silently syncs 5h & weekly limits via official agy --settings (zero sniffing)")
+	if st.AG.OfficialReport.HasSnapshot() && st.AG.OfficialReport.SnapshotCapturedAt != nil {
+		rel := core.FormatRelative(*st.AG.OfficialReport.SnapshotCapturedAt, time.Now(), zh)
+		tier := st.AG.OfficialReport.PlanTier
+		if tier != "" {
+			tier = " · " + strings.ToUpper(tier)
 		}
-		SegmentedTabs(c, "seg-icon", []string{"Clawd", tr(zh, "Claude 标志", "Claude logo")}, idx, false, func(i int) {
-			m.Store.UpdatePrefs(func(p *core.Preferences) {
-				if i == 0 {
-					p.IconStyle = core.IconStyleClawd
-				} else {
-					p.IconStyle = core.IconStyleLogo
-				}
-			})
-			if m.Actions.SyncTray != nil {
-				m.Actions.SyncTray()
-			}
+		agSub = tr(zh, fmt.Sprintf("已读取快照%s · 上次同步 %s", tier, rel),
+			fmt.Sprintf("Snapshot ready%s · Synced %s", tier, rel))
+	}
+	settingsRow(c, tr(zh, "Antigravity 后台静默同步", "Antigravity background sync"), agSub, func() {
+		AccentSwitch(c, "sw-ag-off", st.Prefs.AGOfficialEnabled, ColorAGAccent, func(on bool) {
+			m.Store.UpdatePrefs(func(p *core.Preferences) { p.AGOfficialEnabled = on })
 		})
 	})
 
 	Hairline(c)
 
+	agIntVals := []int{10, 30, 60, 300}
+	agIntIdx := 1
+	for i, v := range agIntVals {
+		if st.Prefs.AGSyncIntervalSec == v {
+			agIntIdx = i
+			break
+		}
+	}
+	settingsRow(c, tr(zh, "Antigravity 同步间隔", "Antigravity sync interval"),
+		tr(zh, "后台检查与刷新快照频率", "Interval for background snapshot & quota refresh."), func() {
+			SegmentedTabs(c, "seg-ag-int", []string{"10s", "30s", "60s", "5m"}, agIntIdx, false, func(i int) {
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.AGSyncIntervalSec = agIntVals[i] })
+			})
+		})
+
+	Hairline(c)
+
+	// agy CLI binary path + detect status
+	ui.Column(c).FillWidth().Gap(8).Children(func() {
+		cliDesc := tr(zh, "未检测到 agy CLI，留空自动从 PATH 与常见目录探测，或手动指定可执行路径。",
+			"agy CLI not found. Leave blank to auto-detect from PATH, or browse to agy.exe / agy.cmd.")
+		if st.AG.CLIBinaryPath != "" {
+			cliDesc = tr(zh, "已检测到：", "Detected: ") + st.AG.CLIBinaryPath
+		}
+		ui.Text(c, tr(zh, "agy CLI 路径", "agy CLI path")).FontSize(13).FontWeight(500).TextColor(ColorText)
+		ui.Text(c, cliDesc).FontSize(11.5).TextColor(ColorTertiary)
+
+		ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
+			inp := ui.TextInput(c.Key("in-ag-cli"), &m.agCLIDraft).Grow(1).Placeholder("agy").FontSize(12)
+			if inp.Submitted() {
+				val := strings.TrimSpace(m.agCLIDraft)
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.AGAgyCLIPath = val })
+			}
+			applyBtn := ui.Row(c.Key("btn-apply-ag-cli")).Height(28).Padding(0, 12).Radius(7).Center().
+				Background(ColorAGAccent.Alpha(0.22)).Cursor(ui.CursorPointer)
+			if applyBtn.Clicked() {
+				val := strings.TrimSpace(m.agCLIDraft)
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.AGAgyCLIPath = val })
+			}
+			applyBtn.Children(func() {
+				ui.Text(c, tr(zh, "应用", "Apply")).FontSize(12).FontWeight(500).TextColor(ColorAGAccent).SingleLine()
+			})
+			if m.Actions.ChooseAgyBinary != nil {
+				pickBtn := ui.Row(c.Key("btn-pick-ag-cli")).Height(28).Padding(0, 12).Radius(7).Center().
+					Background(ColorPillSel).Cursor(ui.CursorPointer)
+				if pickBtn.Clicked() {
+					m.Actions.ChooseAgyBinary()
+				}
+				pickBtn.Children(func() {
+					ui.Text(c, tr(zh, "浏览…", "Browse…")).FontSize(12).TextColor(ColorText).SingleLine()
+				})
+			}
+			if strings.TrimSpace(st.Prefs.AGAgyCLIPath) != "" {
+				clrBtn := ui.Row(c.Key("btn-clr-ag-cli")).Height(28).Padding(0, 10).Radius(7).Center().
+					Background(ColorPillBg).Cursor(ui.CursorPointer)
+				if clrBtn.Clicked() {
+					m.agCLIDraft = ""
+					m.Store.UpdatePrefs(func(p *core.Preferences) { p.AGAgyCLIPath = "" })
+				}
+				clrBtn.Children(func() {
+					ui.Text(c, tr(zh, "自动", "Auto")).FontSize(11.5).TextColor(ColorSecondary).SingleLine()
+				})
+			}
+		})
+
+		ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
+			syncBtn := ui.Row(c.Key("btn-ag-sync-now")).Height(28).Padding(0, 12).Radius(7).Center().
+				Background(ColorPillSel).Cursor(ui.CursorPointer)
+			if syncBtn.Clicked() && !st.AG.IsSyncing {
+				go m.Store.SyncAntigravityOfficial(true)
+			}
+			syncBtn.Children(func() {
+				lbl := tr(zh, "立即后台同步", "Sync now")
+				if st.AG.IsSyncing {
+					lbl = tr(zh, "正在同步…", "Syncing…")
+				}
+				ui.Text(c, lbl).FontSize(11.5).FontWeight(500).TextColor(ColorText).SingleLine()
+			})
+
+			loginBtn := ui.Row(c.Key("btn-ag-login")).Height(28).Padding(0, 12).Radius(7).Center().
+				Background(ColorPillBg).Cursor(ui.CursorPointer)
+			if loginBtn.Clicked() {
+				m.Store.LaunchAgyLogin()
+			}
+			loginBtn.Children(func() {
+				ui.Text(c, tr(zh, "终端登录 agy", "CLI Login")).FontSize(11.5).FontWeight(500).TextColor(ColorText).SingleLine()
+			})
+
+			bridgeLbl := tr(zh, "安装 statusLine 桥接", "Install bridge")
+			if st.AG.BridgeStatus.IsInstalled() {
+				bridgeLbl = tr(zh, "移除 statusLine 桥接", "Remove bridge")
+			}
+			bridgeBtn := ui.Row(c.Key("btn-ag-bridge")).Height(28).Padding(0, 12).Radius(7).Center().
+				Background(ColorPillBg).Cursor(ui.CursorPointer)
+			if bridgeBtn.Clicked() {
+				if st.AG.BridgeStatus.IsInstalled() {
+					go m.Store.UninstallAGBridge()
+				} else {
+					go m.Store.InstallAGBridge()
+				}
+			}
+			bridgeBtn.Children(func() {
+				ui.Text(c, bridgeLbl).FontSize(11.5).TextColor(ColorSecondary).SingleLine()
+			})
+		})
+
+		if st.AG.Feedback != "" {
+			ui.Text(c, st.AG.Feedback).FontSize(11).TextColor(ColorSecondary)
+		}
+	})
+
+	Hairline(c)
+
+	agCurDay := dayOpts[0]
+	if st.Prefs.AGBillingAnchorDay >= 1 && st.Prefs.AGBillingAnchorDay <= 31 {
+		agCurDay = dayOpts[st.Prefs.AGBillingAnchorDay]
+	}
+	agRangeDesc := tr(zh, "设置后按账单日切分 Antigravity 本月周期并显示剩余天数",
+		"Aligns Antigravity monthly spend cycle and shows days left")
+	if st.AG.LocalReport.MonthPeriod != nil && st.Prefs.AGBillingAnchorDay > 0 {
+		agRangeDesc = tr(zh, "当前周期 ", "Current period ") + core.FormatPeriodRange(
+			st.AG.LocalReport.MonthPeriod.Start, st.AG.LocalReport.MonthPeriod.End.Add(time.Second), zh)
+	}
+	settingsRow(c, tr(zh, "Antigravity 每月账单日", "Antigravity billing day"), agRangeDesc, func() {
+		sel := agCurDay
+		if ui.Select(c.Key("sel-ag-anchor"), &sel, dayOpts).Width(120).Changed() {
+			for i, o := range dayOpts {
+				if o == sel {
+					m.Store.UpdatePrefs(func(p *core.Preferences) { p.AGBillingAnchorDay = i })
+					break
+				}
+			}
+		}
+	})
+}
+
+func (m *SettingsModel) renderMenuBarTab(c *ui.Context, st service.ViewState, zh bool) {
+	previewIdx := 0
+	if m.menuBarPreviewProvider == core.ProviderAntigravity {
+		previewIdx = 1
+	}
+	ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
+		ui.Text(c, tr(zh, "菜单栏与悬浮条预览", "Menubar & Floating Bar Preview")).FontSize(11.5).FontWeight(500).TextColor(ColorTertiary)
+		ui.Spacer(c)
+		SegmentedTabs(c, "seg-mb-prov", []string{"Claude", "Antigravity"}, previewIdx, false, func(i int) {
+			if i == 1 {
+				m.menuBarPreviewProvider = core.ProviderAntigravity
+			} else {
+				m.menuBarPreviewProvider = core.ProviderClaude
+			}
+		})
+	})
+
+	// Live preview strip matching hero.png / settings.png!
+	ui.Row(c).FillWidth().Height(42).Padding(0, 16).Radius(10).Background(ColorPillBg).Center().Gap(12).Children(func() {
+		ui.Box(c).Size(12, 3).Radius(1.5).Background(ColorQuaternary)
+		if m.menuBarPreviewProvider == core.ProviderAntigravity {
+			m.renderAGPreviewPillContent(c, st)
+		} else {
+			m.renderPreviewPillContent(c, st, zh)
+		}
+		ui.Box(c).Size(12, 3).Radius(1.5).Background(ColorQuaternary)
+		ui.Text(c, time.Now().Format("15:04")).FontSize(12).FontWeight(500).TextColor(ColorSecondary).FontFeatures("tnum")
+	})
+
 	settingsRow(c, tr(zh, "桌面 Mini 悬浮条（Windows 专属）", "Floating Mini Bar (Windows)"),
-		tr(zh, "还原 macOS 菜单栏常驻多列数值体验。单击打开主面板，按住左键可拖动位置，右键可快速置顶或隐藏。",
-			"Compact strip replicating macOS menu bar metrics. Click to open panel, hold left button to drag, right-click for menu."), func() {
+		tr(zh, "还原 macOS 菜单栏常驻多列数值体验。随主面板切换显示 Claude 或 Antigravity。",
+			"Compact desktop strip following the active monitor (Claude or Antigravity)."), func() {
 			TerracottaSwitch(c, "sw-pill", st.Prefs.ShowFloatingPill, func(on bool) {
 				m.Store.UpdatePrefs(func(p *core.Preferences) { p.ShowFloatingPill = on })
 				if m.Actions.ToggleFloatingPill != nil {
@@ -349,6 +528,32 @@ func (m *SettingsModel) renderMenuBarTab(c *ui.Context, st service.ViewState, zh
 				}
 			})
 		})
+
+	Hairline(c)
+
+	if m.menuBarPreviewProvider == core.ProviderAntigravity {
+		m.renderAGMenuBarSettings(c, st, zh)
+		return
+	}
+
+	settingsRow(c, tr(zh, "图标", "Icon"), "", func() {
+		idx := 0
+		if st.Prefs.IconStyle == core.IconStyleLogo {
+			idx = 1
+		}
+		SegmentedTabs(c, "seg-icon", []string{"Clawd", tr(zh, "Claude 标志", "Claude logo")}, idx, false, func(i int) {
+			m.Store.UpdatePrefs(func(p *core.Preferences) {
+				if i == 0 {
+					p.IconStyle = core.IconStyleClawd
+				} else {
+					p.IconStyle = core.IconStyleLogo
+				}
+			})
+			if m.Actions.SyncTray != nil {
+				m.Actions.SyncTray()
+			}
+		})
+	})
 
 	Hairline(c)
 
@@ -494,6 +699,108 @@ func (m *SettingsModel) renderPreviewPillContent(c *ui.Context, st service.ViewS
 	}
 }
 
+func (m *SettingsModel) renderAGPreviewPillContent(c *ui.Context, st service.ViewState) {
+	AntigravityLogo(c, 15, 0)
+	money := core.NewMoneyFormat(st.Prefs.Currency)
+	cols := buildAGPillColumns(st, money)
+	if len(cols) == 1 {
+		ui.Text(c, cols[0].val).FontSize(12).FontWeight(600).TextColor(cols[0].col).FontFeatures("tnum").SingleLine()
+		return
+	}
+	for _, col := range cols {
+		ui.Column(c).Center().Gap(0).Children(func() {
+			ui.Text(c, col.top).FontSize(8.5).TextColor(ColorTertiary).SingleLine()
+			ui.Text(c, col.val).FontSize(11).FontWeight(600).TextColor(col.col).FontFeatures("tnum").SingleLine()
+		})
+	}
+}
+
+func (m *SettingsModel) renderAGMenuBarSettings(c *ui.Context, st service.ViewState, zh bool) {
+	money := core.NewMoneyFormat(st.Prefs.Currency)
+	off := st.AG.OfficialReport
+	local := st.AG.LocalReport
+
+	v5h := "--"
+	c5h := ColorAGSafeGreen
+	if off.PrimaryFiveHour != nil {
+		v5h = fmt.Sprintf("%d%%", off.PrimaryFiveHour.UsedPercentInt())
+		c5h = AGLevelColor(off.PrimaryFiveHour.UsedFraction, off.PrimaryFiveHour.IsOverPace())
+	}
+	vWk := "--"
+	cWk := ColorAGSafeGreen
+	if off.PrimaryWeekly != nil {
+		vWk = fmt.Sprintf("%d%%", off.PrimaryWeekly.UsedPercentInt())
+		cWk = AGLevelColor(off.PrimaryWeekly.UsedFraction, off.PrimaryWeekly.IsOverPace())
+	}
+	vCache := "--"
+	if local.Today.TotalInputTokens() > 0 {
+		vCache = core.FormatPercent(local.Today.CacheHitRate(), 0)
+	}
+	vToday := money.Compact(local.Today.EstimatedCostUSD)
+	vCtx := "--"
+	if off.ContextWindow != nil && off.ContextWindow.UsedPercentage != nil {
+		vCtx = fmt.Sprintf("%d%%", int(*off.ContextWindow.UsedPercentage))
+	}
+
+	ui.Column(c).FillWidth().Gap(8).Children(func() {
+		ui.Text(c, tr(zh, "Antigravity 显示项", "Antigravity visible metrics")).FontSize(13).FontWeight(500).TextColor(ColorText)
+		ui.Text(c, tr(zh, "亮起的数值会显示在 Antigravity 悬浮条与预览栏中，点击即可开启或关闭。",
+			"Lit values appear in the Antigravity floating bar. Click to toggle.")).
+			FontSize(11.5).TextColor(ColorTertiary)
+
+		type agChip struct {
+			key   string
+			label string
+			val   string
+			col   ui.Color
+			on    bool
+			set   func(*core.Preferences, bool)
+		}
+		items := []agChip{
+			{"ag-m5h", "5H", v5h, c5h, st.Prefs.AGPillShowFiveHour, func(p *core.Preferences, v bool) { p.AGPillShowFiveHour = v }},
+			{"ag-mwk", "WEEK", vWk, cWk, st.Prefs.AGPillShowWeek, func(p *core.Preferences, v bool) { p.AGPillShowWeek = v }},
+			{"ag-mca", "CACHE", vCache, ColorAGAccent, st.Prefs.AGPillShowCache, func(p *core.Preferences, v bool) { p.AGPillShowCache = v }},
+			{"ag-mtd", "TODAY", vToday, ColorText, st.Prefs.AGPillShowTodayCost, func(p *core.Preferences, v bool) { p.AGPillShowTodayCost = v }},
+			{"ag-mctx", "CTX", vCtx, ColorWarning, st.Prefs.AGPillShowContext, func(p *core.Preferences, v bool) { p.AGPillShowContext = v }},
+		}
+		ui.Row(c).Padding(4).Gap(4).Radius(9).Background(ColorPillBg).Children(func() {
+			for _, it := range items {
+				item := it
+				box := ui.Column(c.Key(item.key)).Grow(1).Padding(4, 9).Radius(7).Center().Gap(1).Cursor(ui.CursorPointer)
+				if item.on {
+					box.Background(ColorPillSel)
+				} else if box.Hovered() {
+					box.Background(ColorHover)
+				}
+				if box.Clicked() {
+					m.Store.UpdatePrefs(func(p *core.Preferences) { item.set(p, !item.on) })
+					if m.Actions.SyncPillSize != nil {
+						m.Actions.SyncPillSize()
+					}
+				}
+				op := float32(0.35)
+				if item.on {
+					op = 1
+				}
+				box.Opacity(op).Children(func() {
+					ui.Text(c, item.label).FontSize(9.5).TextColor(ColorSecondary).SingleLine()
+					ui.Text(c, item.val).FontSize(11.5).FontWeight(600).TextColor(item.col).FontFeatures("tnum").SingleLine()
+				})
+			}
+		})
+	})
+
+	Hairline(c)
+
+	settingsGroupTitle(c, tr(zh, "Antigravity 提醒", "Antigravity alerts"))
+	settingsRow(c, tr(zh, "额度预警通知", "Usage alerts"),
+		tr(zh, "超过安全配速线或达到 95% 时发送 Windows 系统通知", "Notify once past safe line and again at 95%."), func() {
+			AccentSwitch(c, "sw-ag-alert", st.Prefs.AGAlertEnabled, ColorAGAccent, func(on bool) {
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.AGAlertEnabled = on })
+			})
+		})
+}
+
 func (m *SettingsModel) renderPanelTab(c *ui.Context, st service.ViewState, zh bool) {
 	settingsGroupTitle(c, tr(zh, "内容", "Content"))
 
@@ -602,6 +909,25 @@ func (m *SettingsModel) renderPanelTab(c *ui.Context, st service.ViewState, zh b
 			m.Store.UpdatePrefs(func(p *core.Preferences) { p.Currency = core.CurrencyUnit(curSel) })
 		}
 	})
+
+	settingsGroupTitle(c, "Antigravity")
+
+	settingsRow(c, tr(zh, "Antigravity 活跃进程", "Antigravity processes"),
+		tr(zh, "控制 Antigravity 面板顶部活跃进程行的展示方式", "Controls the active processes row in Antigravity view."), func() {
+			SegmentedTabs(c, "seg-ag-proc", modeLabels, modeIdx(st.Prefs.AGProcessesDisplay), false, func(i int) {
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.AGProcessesDisplay = idxMode(i) })
+			})
+		})
+
+	Hairline(c)
+
+	settingsRow(c, tr(zh, "Antigravity 近似输出速度（估算）", "Antigravity estimated output speed"),
+		tr(zh, "基于本地对话日志间隔近似估算，非真实生成速度，可随时关闭",
+			"Approximated from local transcript intervals, not real token timing."), func() {
+			AccentSwitch(c, "sw-ag-spd", st.Prefs.AGShowEstimatedSpeed, ColorAGAccent, func(on bool) {
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.AGShowEstimatedSpeed = on })
+			})
+		})
 }
 
 func (m *SettingsModel) renderDataTab(c *ui.Context, st service.ViewState, zh bool) {
@@ -734,6 +1060,84 @@ func (m *SettingsModel) renderDataTab(c *ui.Context, st service.ViewState, zh bo
 			ui.Text(c, tr(zh, "打开文件夹", "Open folder")).FontSize(12).TextColor(ColorSecondary).SingleLine()
 		})
 	})
+
+	Hairline(c)
+
+	settingsGroupTitle(c, tr(zh, "Antigravity 数据源", "Antigravity data"))
+
+	ui.Column(c).FillWidth().Gap(8).Children(func() {
+		ui.Text(c, tr(zh, "自定义 Antigravity brain 目录", "Custom Antigravity brain directory")).FontSize(13).FontWeight(500).TextColor(ColorText)
+		ui.Text(c, tr(zh, "留空使用默认位置（~/.gemini/antigravity/brain），读取其中会话的 transcript.jsonl。",
+			"Leave empty for default (~/.gemini/antigravity/brain) to scan transcript.jsonl files.")).
+			FontSize(11.5).TextColor(ColorTertiary)
+
+		ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
+			inp := ui.TextInput(c.Key("in-ag-brain"), &m.agBrainDraft).
+				Grow(1).Placeholder(platform.DefaultAGBrainDir()).FontSize(12)
+			if inp.Submitted() {
+				val := strings.TrimSpace(m.agBrainDraft)
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.AGBrainDir = val })
+			}
+			applyBtn := ui.Row(c.Key("btn-apply-ag-brain")).Height(28).Padding(0, 12).Radius(7).Center().
+				Background(ColorAGAccent.Alpha(0.22)).Cursor(ui.CursorPointer)
+			if applyBtn.Clicked() {
+				val := strings.TrimSpace(m.agBrainDraft)
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.AGBrainDir = val })
+			}
+			applyBtn.Children(func() {
+				ui.Text(c, tr(zh, "应用", "Apply")).FontSize(12).FontWeight(500).TextColor(ColorAGAccent).SingleLine()
+			})
+			if m.Actions.ChooseAGBrainDir != nil {
+				pickBtn := ui.Row(c.Key("btn-pick-ag-brain")).Height(28).Padding(0, 12).Radius(7).Center().
+					Background(ColorPillSel).Cursor(ui.CursorPointer)
+				if pickBtn.Clicked() {
+					m.Actions.ChooseAGBrainDir()
+				}
+				pickBtn.Children(func() {
+					ui.Text(c, tr(zh, "选择目录…", "Browse…")).FontSize(12).TextColor(ColorText).SingleLine()
+				})
+			}
+			if strings.TrimSpace(st.Prefs.AGBrainDir) != "" {
+				resetBtn := ui.Row(c.Key("btn-reset-ag-brain")).Height(28).Padding(0, 10).Radius(7).Center().
+					Background(ColorPillBg).Cursor(ui.CursorPointer)
+				if resetBtn.Clicked() {
+					m.agBrainDraft = ""
+					m.Store.UpdatePrefs(func(p *core.Preferences) { p.AGBrainDir = "" })
+				}
+				resetBtn.Children(func() {
+					ui.Text(c, tr(zh, "默认", "Reset")).FontSize(11.5).TextColor(ColorSecondary).SingleLine()
+				})
+			}
+		})
+
+		ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, tr(zh, "当前生效：", "Active: ")+st.AG.BrainDir).
+				FontSize(11).TextColor(ColorTertiary).SingleLine().Grow(1)
+			if st.AG.HasBrainDir {
+				Chip(c, tr(zh, "已找到日志", "Logs OK"), ColorLive)
+			} else {
+				Chip(c, tr(zh, "无 brain 目录", "No brain dir"), ColorTertiary)
+			}
+		})
+	})
+
+	Hairline(c)
+
+	agIdxDesc := tr(zh, fmt.Sprintf("已扫描 %d 个会话 · %s 条记录", st.AG.LocalReport.ConversationCount, core.FormatGrouped(int64(st.AG.LocalReport.TotalRecords))),
+		fmt.Sprintf("%d conversations · %s records", st.AG.LocalReport.ConversationCount, core.FormatGrouped(int64(st.AG.LocalReport.TotalRecords))))
+	settingsRow(c, tr(zh, "Antigravity 对话索引", "Antigravity log index"), agIdxDesc, func() {
+		b := ui.Row(c.Key("btn-ag-reidx")).Height(28).Padding(0, 12).Radius(7).Center().Background(ColorPillSel).Cursor(ui.CursorPointer)
+		if b.Clicked() {
+			m.Store.RebuildAGIndex()
+		}
+		b.Children(func() {
+			ui.Text(c, tr(zh, "重新扫描", "Rescan")).FontSize(12).TextColor(ColorText).SingleLine()
+		})
+	})
+
+	Hairline(c)
+
+	settingsRow(c, tr(zh, "Antigravity 官方快照", "Antigravity snapshot file"), st.AG.SnapshotPath, nil)
 }
 
 func (m *SettingsModel) renderGeneralTab(c *ui.Context, st service.ViewState, zh bool) {
@@ -784,10 +1188,11 @@ func (m *SettingsModel) renderGeneralTab(c *ui.Context, st service.ViewState, zh
 	ui.Column(c).FillWidth().Padding(8, 0).Gap(4).Children(func() {
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 			ClaudeLogo(c, 16, ColorAccent)
-			ui.Text(c, "Claude Usage Monitor for Windows").FontSize(13).FontWeight(600).TextColor(ColorText)
+			AntigravityLogo(c, 16, 0)
+			ui.Text(c, "Claude & Antigravity Usage Monitor").FontSize(13).FontWeight(600).TextColor(ColorText)
 		})
-		ui.Text(c, tr(zh, "基于 egoist/mygo Native UI (Direct3D 11) 1:1 复刻自 kittors/claude-usage-monitor。",
-			"Windows native replica of kittors/claude-usage-monitor powered by egoist/mygo Direct3D 11 UI.")).
+		ui.Text(c, tr(zh, "基于 egoist/mygo Native UI (Direct3D 11)，整合 Claude 与 Antigravity 双源用量与额度监控。",
+			"Windows native dual-provider monitor (Claude & Antigravity) powered by egoist/mygo Direct3D 11 UI.")).
 			FontSize(11).TextColor(ColorTertiary)
 	})
 }

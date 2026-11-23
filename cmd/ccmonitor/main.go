@@ -60,6 +60,47 @@ func (a *application) updateTray() {
 	st := a.store.ViewState()
 	zh := st.Prefs.IsChinese()
 	now := time.Now()
+	money := core.NewMoneyFormat(st.Prefs.Currency)
+
+	if core.NormalizeProvider(st.Prefs.ActiveProvider) == core.ProviderAntigravity {
+		pct := 0
+		hasUsage := false
+		overPace := false
+		var tipParts []string
+		if zh {
+			tipParts = append(tipParts, "Antigravity 用量")
+		} else {
+			tipParts = append(tipParts, "Antigravity Usage")
+		}
+		if b := st.AG.OfficialReport.PrimaryFiveHour; b != nil {
+			pct = b.UsedPercentInt()
+			hasUsage = true
+			overPace = b.IsOverPace()
+			if zh {
+				tipParts = append(tipParts, fmt.Sprintf("5小时 %d%%", pct))
+			} else {
+				tipParts = append(tipParts, fmt.Sprintf("5h %d%%", pct))
+			}
+		}
+		if b := st.AG.OfficialReport.PrimaryWeekly; b != nil {
+			if zh {
+				tipParts = append(tipParts, fmt.Sprintf("本周 %d%%", b.UsedPercentInt()))
+			} else {
+				tipParts = append(tipParts, fmt.Sprintf("Week %d%%", b.UsedPercentInt()))
+			}
+		}
+		if st.AG.LocalReport.Today.EstimatedCostUSD > 0 {
+			if zh {
+				tipParts = append(tipParts, "今日 "+money.Compact(st.AG.LocalReport.Today.EstimatedCostUSD))
+			} else {
+				tipParts = append(tipParts, "Today "+money.Compact(st.AG.LocalReport.Today.EstimatedCostUSD))
+			}
+		}
+		iconBytes := platform.RenderAntigravityTrayIcon(pct, hasUsage, overPace, a.tray.Dark())
+		a.tray.SetIcon(iconBytes, false)
+		a.tray.SetToolTip(strings.Join(tipParts, " · "))
+		return
+	}
 
 	pct := 0
 	hasUsage := false
@@ -89,11 +130,10 @@ func (a *application) updateTray() {
 		}
 	}
 	if st.Snapshot != nil && st.Snapshot.Today() != nil && st.Snapshot.Today().Cost > 0 {
-		m := core.NewMoneyFormat(st.Prefs.Currency)
 		if zh {
-			tipParts = append(tipParts, "今日 "+m.Whole(st.Snapshot.Today().Cost))
+			tipParts = append(tipParts, "今日 "+money.Whole(st.Snapshot.Today().Cost))
 		} else {
-			tipParts = append(tipParts, "Today "+m.Whole(st.Snapshot.Today().Cost))
+			tipParts = append(tipParts, "Today "+money.Whole(st.Snapshot.Today().Cost))
 		}
 	}
 
@@ -151,9 +191,9 @@ func (a *application) openSettings() {
 		return
 	}
 	st := a.store.ViewState()
-	title := "设置 — Claude 用量"
+	title := "设置 — 用量监控"
 	if !st.Prefs.IsChinese() {
-		title = "Settings — Claude Usage"
+		title = "Settings — Usage Monitor"
 	}
 	a.settings = mygo.NewWindow(mygo.WindowOptions{
 		Title:     title,
@@ -379,6 +419,48 @@ func (a *application) chooseDataDir() {
 	}()
 }
 
+func (a *application) chooseAGBrainDir() {
+	go func() {
+		cur := a.store.ViewState().AG.BrainDir
+		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
+			Title:           "选择 Antigravity brain 目录",
+			DefaultPath:     cur,
+			Directory:       true,
+			ShowHiddenFiles: true,
+		})
+		if err != nil || len(paths) == 0 {
+			return
+		}
+		a.store.UpdatePrefs(func(p *core.Preferences) {
+			p.AGBrainDir = paths[0]
+		})
+	}()
+}
+
+func (a *application) chooseAgyBinary() {
+	go func() {
+		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
+			Title:           "选择 agy CLI 可执行文件",
+			ShowHiddenFiles: true,
+		})
+		if err != nil || len(paths) == 0 {
+			return
+		}
+		a.store.UpdatePrefs(func(p *core.Preferences) {
+			p.AGAgyCLIPath = paths[0]
+		})
+	}()
+}
+
+func (a *application) syncProviderState() {
+	a.invalidateAll()
+}
+
+func (a *application) switchProvider(p core.ProviderKind) {
+	a.store.SetActiveProvider(p)
+	a.syncProviderState()
+}
+
 func (a *application) ready() {
 	a.store = service.NewStore(a.invalidateAll)
 
@@ -392,23 +474,28 @@ func (a *application) ready() {
 			a.store.UpdatePrefs(func(p *core.Preferences) { p.ShowFloatingPill = next })
 			a.setFloatingPill(next)
 		},
+		OnProviderChanged: a.syncProviderState,
 	})
 	a.settingsModel = appui.NewSettingsModel(a.store, appui.SettingsActions{
 		ChooseClaudeDir:    a.chooseClaudeDir,
 		ChooseDir:          a.chooseDataDir,
+		ChooseAGBrainDir:   a.chooseAGBrainDir,
+		ChooseAgyBinary:    a.chooseAgyBinary,
 		ToggleFloatingPill: a.setFloatingPill,
 		SetPillAlwaysOnTop: a.setPillAlwaysOnTop,
 		SyncPillSize:       a.syncPillSize,
 		SyncTray:           a.updateTray,
+		OnProviderChanged:  a.syncProviderState,
 		GetOpenAtLogin:     mygo.App.OpenAtLogin,
 		SetOpenAtLogin:     mygo.App.SetOpenAtLogin,
 	})
 	a.pillModel = appui.NewFloatingPillModel(a.store, appui.PillActions{
-		OnOpenPanel:    a.togglePanel,
-		SetAlwaysOnTop: a.setPillAlwaysOnTop,
-		ResetPosition:  a.resetPillPosition,
-		HidePill:       func() { a.setFloatingPill(false) },
-		StartDrag:      a.startPillDrag,
+		OnOpenPanel:       a.togglePanel,
+		SetAlwaysOnTop:    a.setPillAlwaysOnTop,
+		ResetPosition:     a.resetPillPosition,
+		HidePill:          func() { a.setFloatingPill(false) },
+		StartDrag:         a.startPillDrag,
+		OnProviderChanged: a.syncProviderState,
 	})
 
 	var err error
@@ -436,6 +523,19 @@ func (a *application) ready() {
 		items := []*mygo.MenuItem{
 			{Label: openLbl, Click: func(*mygo.MenuItem, *mygo.Window) { a.openPanel() }},
 			{Label: refLbl, Click: func(*mygo.MenuItem, *mygo.Window) { a.store.RefreshNow() }},
+			mygo.Separator(),
+			{
+				Label:   trMenu(zh, "Claude 用量", "Claude Usage"),
+				Type:    mygo.MenuItemCheckbox,
+				Checked: core.NormalizeProvider(st.Prefs.ActiveProvider) == core.ProviderClaude,
+				Click:   func(*mygo.MenuItem, *mygo.Window) { a.switchProvider(core.ProviderClaude) },
+			},
+			{
+				Label:   trMenu(zh, "Antigravity 用量", "Antigravity Usage"),
+				Type:    mygo.MenuItemCheckbox,
+				Checked: core.NormalizeProvider(st.Prefs.ActiveProvider) == core.ProviderAntigravity,
+				Click:   func(*mygo.MenuItem, *mygo.Window) { a.switchProvider(core.ProviderAntigravity) },
+			},
 			mygo.Separator(),
 			{
 				Label:   pillLbl,
@@ -502,8 +602,37 @@ func (a *application) ready() {
 	})
 }
 
+func trMenu(zh bool, cn, en string) string {
+	if zh {
+		return cn
+	}
+	return en
+}
+
+func parseAGCaptureArgs(args []string) (snapshotPath, chainCmd string, ok bool) {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--ag-capture-snapshot" && i+1 < len(args) {
+			snapshotPath = args[i+1]
+			ok = true
+			i++
+		} else if args[i] == "--chain" && i+1 < len(args) {
+			chainCmd = args[i+1]
+			i++
+		}
+	}
+	return snapshotPath, chainCmd, ok
+}
+
 func main() {
-	mygo.App.SetName("Claude Usage Monitor")
+	if snapPath, chainCmd, ok := parseAGCaptureArgs(os.Args[1:]); ok {
+		if err := service.RunAGCaptureSnapshot(snapPath, chainCmd); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	mygo.App.SetName("Usage Monitor")
 	if !mygo.App.RequestSingleInstanceLock() {
 		os.Exit(0)
 	}

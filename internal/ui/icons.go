@@ -47,6 +47,36 @@ func ClaudeLogo(c *ui.Context, size float32, col ui.Color) ui.Element {
 	})
 }
 
+// AntigravityLogo draws the 30-degree tilted gradient 4-point star brand mark.
+func AntigravityLogo(c *ui.Context, size float32, spinDeg float32) ui.Element {
+	return ui.Box(c).Size(size, size).Draw(func(p *ui.Painter, r ui.Rect) {
+		cx := r.X + r.W/2
+		cy := r.Y + r.H/2
+		rad := min(r.W, r.H) / 2
+		ctrl := rad * 0.14
+
+		var path ui.Path
+		path.MoveTo(cx, cy-rad)
+		path.QuadTo(cx+ctrl, cy-ctrl, cx+rad, cy)
+		path.QuadTo(cx+ctrl, cy+ctrl, cx, cy+rad)
+		path.QuadTo(cx-ctrl, cy+ctrl, cx-rad, cy)
+		path.QuadTo(cx-ctrl, cy-ctrl, cx, cy-rad)
+		path.Close()
+
+		grad := ui.LinearGradient{
+			Angle: 135,
+			Stops: []ui.GradientStop{
+				{Color: ColorAGStarTop, At: 0},
+				{Color: ColorAGAccent, At: 0.55},
+				{Color: ColorAGStarBot, At: 1},
+			},
+		}
+		p.Transform(ui.Rotation(30+spinDeg), cx, cy, func() {
+			p.FillPathGradient(&path, grad)
+		})
+	})
+}
+
 // Clawd pixel masks (5 rows x 17 cols, matching BrandAssets.swift)
 var clawdPoses = map[string][5]string{
 	"idle": {

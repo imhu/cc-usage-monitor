@@ -72,8 +72,8 @@ func TestPopoverAndSettingsRender(t *testing.T) {
 	if err := st.Click("数据"); err != nil {
 		t.Fatalf("click Data tab failed: %v", err)
 	}
-	if !st.HasText("自定义 .claude 目录位置") {
-		t.Errorf("settings Data tab missing .claude directory setting; got: %q", st.Texts())
+	if !st.HasText("自定义 .claude 目录位置") || !st.HasText("Antigravity 数据源") {
+		t.Errorf("settings Data tab missing expected directory settings; got: %q", st.Texts())
 	}
 	saveSnap("settings-data.png", st)
 
@@ -173,4 +173,99 @@ func TestFloatingPillClickVsDrag(t *testing.T) {
 	if opened != 2 {
 		t.Fatalf("expected click after drag to open panel, got opened=%d", opened)
 	}
+}
+
+func TestAntigravityPopoverSwitchAndRender(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+	store := service.NewStore(nil)
+	store.SetDemoState()
+
+	changedCount := 0
+	pop := NewPopoverModel(store, PopoverActions{
+		OnProviderChanged: func() { changedCount++ },
+	})
+	tt := ui.NewTesterWith(pop.View, 356, 760, ui.TesterOptions{Dark: true})
+
+	// Starts on Claude view
+	if !tt.HasText("Claude 用量") {
+		t.Fatalf("expected initial Claude view, got: %q", tt.Texts())
+	}
+
+	// Switch to Antigravity via UI switcher tab
+	if err := tt.Click("Antigravity"); err != nil {
+		t.Fatalf("click Antigravity switcher failed: %v", err)
+	}
+	if changedCount != 1 {
+		t.Fatalf("expected OnProviderChanged=1, got %d", changedCount)
+	}
+	for _, want := range []string{
+		"Antigravity 用量", "ULTRA", "活跃进程", "用量限额",
+		"Gemini 5小时", "42%", "Gemini 每周", "31%",
+		"输出速度", "~68", "本期消耗", "$186.20", "83.4%",
+		"Gemini 4 Neon", "Claude Sonnet 4.5", "设置…", "立即刷新", "退出",
+	} {
+		if !tt.HasText(want) {
+			t.Errorf("antigravity popover missing expected text %q; got texts: %q", want, tt.Texts())
+		}
+	}
+
+	snapDir := os.Getenv("CCMONITOR_SNAPSHOT_DIR")
+	saveSnap := func(name string, tester *ui.Tester) {
+		if snapDir == "" {
+			return
+		}
+		_ = os.MkdirAll(snapDir, 0o755)
+		if img := tester.Image(); img != nil {
+			if f, err := os.Create(filepath.Join(snapDir, name)); err == nil {
+				_ = png.Encode(f, img)
+				f.Close()
+			}
+		}
+	}
+	saveSnap("popover-ag.png", tt)
+
+	// Antigravity Floating Pill renders cleanly
+	pill := NewFloatingPillModel(store, PillActions{})
+	pw := PillTargetWidth(store.ViewState())
+	pt := ui.NewTesterWith(pill.View, pw, PillHeight, ui.TesterOptions{Dark: true})
+	if !pt.HasText("42%") {
+		t.Errorf("antigravity floating pill missing 42%%; got: %q", pt.Texts())
+	}
+	saveSnap("pill-ag.png", pt)
+
+	// Short viewport (600px) keeps Antigravity footer visible inside bounds
+	short := ui.NewTesterWith(pop.View, 356, 600, ui.TesterOptions{Dark: true})
+	for _, footerBtn := range []string{"设置…", "立即刷新", "退出"} {
+		r, ok := short.Find(footerBtn)
+		if !ok {
+			t.Fatalf("short AG viewport missing footer button %q", footerBtn)
+		}
+		if r.Y+r.H > 600 {
+			t.Fatalf("footer button %q clipped outside 600px viewport: %+v", footerBtn, r)
+		}
+	}
+
+	// Switch back to Claude cleanly
+	if err := tt.Click("Claude"); err != nil {
+		t.Fatalf("click Claude switcher failed: %v", err)
+	}
+	if !tt.HasText("Claude 用量") || changedCount != 2 {
+		t.Fatalf("expected switch back to Claude view, changedCount=%d", changedCount)
+	}
+
+	// Test Settings Menubar Antigravity preview tab
+	set := NewSettingsModel(store, SettingsActions{})
+	st := ui.NewTesterWith(set.View, 540, 620, ui.TesterOptions{Dark: true})
+	if err := st.Click("菜单栏"); err != nil {
+		t.Fatalf("click Menubar tab failed: %v", err)
+	}
+	if err := st.Click("Antigravity"); err != nil {
+		t.Fatalf("click Antigravity preview toggle failed: %v", err)
+	}
+	for _, want := range []string{"Antigravity 显示项", "5H", "WEEK", "CACHE", "TODAY", "CTX"} {
+		if !st.HasText(want) {
+			t.Errorf("settings Antigravity menubar tab missing %q; got: %q", want, st.Texts())
+		}
+	}
+	saveSnap("settings-menubar-ag.png", st)
 }

@@ -131,6 +131,10 @@ func ThinBar(c *ui.Context, key string, fraction float64, fillColor ui.Color, pa
 
 // MiniBars replicates Gauges.swift MiniBars 1:1 (104x30 14-day bar chart).
 func MiniBars(c *ui.Context, key string, values []float64, highlightIdx int, periodStart int, hoveredIdx *int) {
+	MiniBarsColored(c, key, values, highlightIdx, periodStart, ColorAccent, hoveredIdx)
+}
+
+func MiniBarsColored(c *ui.Context, key string, values []float64, highlightIdx int, periodStart int, accent ui.Color, hoveredIdx *int) {
 	box := ui.Box(c.Key(key)).Size(104, 30)
 	n := max(1, len(values))
 	if box.Hovered() {
@@ -171,7 +175,7 @@ func MiniBars(c *ui.Context, key string, values []float64, highlightIdx int, per
 				col = ui.RGBA(255, 255, 255, 0.34)
 			}
 			if curHover == i || (curHover < 0 && i == highlightIdx) {
-				col = ColorAccent
+				col = accent
 			}
 			x := r.X + float32(i)*(bw+spacing)
 			y := r.Y + r.H - h
@@ -523,6 +527,10 @@ func EmptyNote(c *ui.Context, icon *ui.SVG, title, detail string, action func())
 
 // TerracottaSwitch replicates the exact #D97757 pill switch from Settings screenshots.
 func TerracottaSwitch(c *ui.Context, key string, on bool, onToggle func(bool)) {
+	AccentSwitch(c, key, on, ColorAccent, onToggle)
+}
+
+func AccentSwitch(c *ui.Context, key string, on bool, accent ui.Color, onToggle func(bool)) {
 	sw := ui.Box(c.Key(key)).Size(38, 22).Radius(11).Cursor(ui.CursorPointer)
 	if sw.Clicked() && onToggle != nil {
 		onToggle(!on)
@@ -535,12 +543,194 @@ func TerracottaSwitch(c *ui.Context, key string, on bool, onToggle func(bool)) {
 	sw.Draw(func(p *ui.Painter, r ui.Rect) {
 		bg := ui.RGBA(255, 255, 255, 0.16)
 		if prog > 0.5 {
-			bg = ColorAccent
+			bg = accent
 		}
 		p.Fill(r, bg, r.H/2)
 		knobSize := r.H - 4
 		kx := r.X + 2 + (r.W-knobSize-4)*prog
 		ky := r.Y + 2
 		p.Fill(ui.Rect{X: kx, Y: ky, W: knobSize, H: knobSize}, ui.RGB(255, 255, 255), knobSize/2)
+	})
+}
+
+func AGPlanTag(c *ui.Context, rawTier string) {
+	lower := strings.ToLower(strings.TrimSpace(rawTier))
+	if lower == "" {
+		return
+	}
+	var label string
+	var fill, stroke, text ui.Color
+	switch {
+	case strings.Contains(lower, "ultra"):
+		label = "ULTRA"
+		fill = ColorAGAccent
+		text = ui.Hex("#0A1930")
+	case strings.Contains(lower, "max"):
+		label = "MAX"
+		fill = ColorAGAccent.Alpha(0.22)
+		text = ui.Hex("#89B4FF")
+	case strings.Contains(lower, "pro"):
+		label = "PRO"
+		fill = ui.Transparent
+		stroke = ColorAGAccent.Alpha(0.65)
+		text = ui.Hex("#89B4FF")
+	default:
+		label = strings.ToUpper(strings.TrimSpace(rawTier))
+		fill = ui.RGBA(255, 255, 255, 0.08)
+		text = ColorSecondary
+	}
+	box := ui.Row(c).Height(16).Padding(0, 6).Radius(8).Center().Background(fill)
+	if stroke.A > 0 {
+		box.Border(1, stroke)
+	}
+	box.Children(func() {
+		ui.Text(c, label).FontSize(9.5).FontWeight(600).LetterSpacing(0.8).TextColor(text).SingleLine()
+	})
+}
+
+func AGSparkline(c *ui.Context, key string, samples []core.AGSpeedSample, hoveredIdx *int, onClick func()) {
+	n := len(samples)
+	if n > 18 {
+		samples = samples[n-18:]
+		n = 18
+	}
+	box := ui.Box(c.Key(key)).Size(104, 30).Margin(0, 0, 3, 0).Cursor(ui.CursorPointer)
+	prevIdx := *hoveredIdx
+	nextIdx := -1
+	if box.Hovered() && n >= 2 {
+		if px, _, ok := box.PointerPosition(); ok {
+			ratio := max(0.0, min(1.0, float64(px)/104.0))
+			nextIdx = int(math.Round(ratio * float64(n-1)))
+		}
+	}
+	if nextIdx != prevIdx {
+		*hoveredIdx = nextIdx
+		c.Invalidate()
+	}
+	if box.Clicked() && onClick != nil {
+		onClick()
+	}
+
+	curIdx := *hoveredIdx
+	box.Draw(func(p *ui.Painter, r ui.Rect) {
+		if n < 2 {
+			p.Fill(ui.Rect{X: r.X, Y: r.Y + r.H - 1.5, W: r.W, H: 1.5}, ui.RGBA(255, 255, 255, 0.12), 0.75)
+			return
+		}
+		minV, maxV := samples[0].TokensPerSec, samples[0].TokensPerSec
+		for _, s := range samples {
+			if s.TokensPerSec < minV {
+				minV = s.TokensPerSec
+			}
+			if s.TokensPerSec > maxV {
+				maxV = s.TokensPerSec
+			}
+		}
+		low := minV * 0.85
+		high := max(low+1.0, maxV*1.05)
+
+		pts := make([]ui.Point, n)
+		for i, s := range samples {
+			x := r.X + r.W*float32(i)/float32(n-1)
+			norm := float32((s.TokensPerSec - low) / (high - low))
+			y := r.Y + r.H - 3 - norm*(r.H-6)
+			pts[i] = ui.Point{X: x, Y: y}
+		}
+		lineCol := ui.RGBA(255, 255, 255, 0.45)
+		if curIdx >= 0 {
+			lineCol = ui.RGBA(255, 255, 255, 0.65)
+		}
+		p.StrokePath(buildMonotonePath(pts), 1.5, lineCol)
+
+		active := n - 1
+		if curIdx >= 0 && curIdx < n {
+			active = curIdx
+			p.Fill(ui.Rect{X: pts[active].X - 0.5, Y: r.Y, W: 1, H: r.H}, ui.RGBA(255, 255, 255, 0.16), 0)
+		}
+		dotR := float32(2.25)
+		if curIdx >= 0 {
+			dotR = 3.0
+		}
+		ap := pts[active]
+		p.Fill(ui.Rect{X: ap.X - dotR, Y: ap.Y - dotR, W: dotR * 2, H: dotR * 2}, ColorAGAccent, dotR)
+	})
+}
+
+func AGSpeedDotChart(c *ui.Context, key string, samples []core.AGSpeedSample, now time.Time, hoveredID *int, onClick func()) {
+	box := ui.Box(c.Key(key)).FillWidth().Height(64).Radius(7).Background(ui.RGBA(255, 255, 255, 0.03)).Cursor(ui.CursorPointer)
+	if len(samples) == 0 {
+		return
+	}
+	minSpeed := samples[0].TokensPerSec
+	maxSpeed := samples[0].TokensPerSec
+	var maxOut int64 = 1
+	for _, s := range samples {
+		if s.TokensPerSec < minSpeed {
+			minSpeed = s.TokensPerSec
+		}
+		if s.TokensPerSec > maxSpeed {
+			maxSpeed = s.TokensPerSec
+		}
+		if s.OutputTokens > maxOut {
+			maxOut = s.OutputTokens
+		}
+	}
+	minSpeed = max(0, minSpeed*0.8)
+	maxSpeed = max(minSpeed+10, maxSpeed*1.1)
+
+	const spanSec = 3600.0
+	const inset float32 = 6
+	prevID := *hoveredID
+	nextID := 0
+	if box.Hovered() {
+		if px, py, ok := box.PointerPosition(); ok {
+			w := PopoverWidth - PanelPadH*2
+			plotW := max(1, w-inset*2)
+			bestDist := float32(24 * 24)
+			for _, s := range samples {
+				age := max(0.0, min(spanSec, now.Sub(s.Timestamp).Seconds()))
+				sx := inset + plotW*float32(1.0-age/spanSec)
+				normY := float32((s.TokensPerSec - minSpeed) / (maxSpeed - minSpeed))
+				sy := 64 - 7 - normY*(64-14)
+				d := (px-sx)*(px-sx) + (py-sy)*(py-sy)
+				if d < bestDist {
+					bestDist = d
+					nextID = s.ID
+				}
+			}
+		}
+	}
+	if nextID != prevID {
+		*hoveredID = nextID
+		c.Invalidate()
+	}
+	if box.Clicked() && onClick != nil {
+		onClick()
+	}
+
+	curHover := *hoveredID
+	latestID := samples[len(samples)-1].ID
+	box.Draw(func(p *ui.Painter, r ui.Rect) {
+		plotW := max(1, r.W-inset*2)
+		for _, frac := range []float32{0.15, 0.5, 0.85} {
+			gy := r.Y + r.H*frac
+			p.Fill(ui.Rect{X: r.X + 4, Y: gy, W: r.W - 8, H: 0.5}, ui.RGBA(255, 255, 255, 0.05), 0)
+		}
+		for _, s := range samples {
+			age := max(0.0, min(spanSec, now.Sub(s.Timestamp).Seconds()))
+			cx := r.X + inset + plotW*float32(1.0-age/spanSec)
+			normY := float32((s.TokensPerSec - minSpeed) / (maxSpeed - minSpeed))
+			cy := r.Y + r.H - 7 - normY*(r.H-14)
+			sizeRatio := math.Sqrt(float64(s.OutputTokens) / float64(maxOut))
+			rad := float32(2.25 + sizeRatio*2.5)
+			col := ui.RGBA(255, 255, 255, float32(0.25+0.45*(1.0-age/spanSec)))
+			if s.ID == curHover || s.ID == latestID {
+				col = ColorAGAccent
+			}
+			if s.ID == curHover {
+				rad += 1.5
+			}
+			p.Fill(ui.Rect{X: cx - rad, Y: cy - rad, W: rad * 2, H: rad * 2}, col, rad)
+		}
 	})
 }

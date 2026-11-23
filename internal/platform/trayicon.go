@@ -60,6 +60,150 @@ func RenderTrayIcon(style core.IconStyle, percent int, hasUsage bool, shield Shi
 	return buf.Bytes()
 }
 
+// RenderAntigravityTrayIcon draws a crisp 32x32 PNG tray icon with the tilted
+// gradient 4-point star and optional usage status badge.
+func RenderAntigravityTrayIcon(percent int, hasUsage bool, overPace bool, darkTaskbar bool) []byte {
+	const size = 32
+	img := image.NewNRGBA(image.Rect(0, 0, size, size))
+
+	cx, cy, radius := 16.0, 16.0, 13.5
+	if hasUsage {
+		cx, cy, radius = 14.2, 14.5, 12.2
+	}
+	drawFourPointStar(img, cx, cy, radius, 30.0*math.Pi/180.0)
+
+	if hasUsage {
+		badge := agLevelColor(float64(percent)/100.0, overPace)
+		bg := color.NRGBA{R: 0x1E, G: 0x1E, B: 0x1C, A: 255}
+		if !darkTaskbar {
+			bg = color.NRGBA{R: 0xF5, G: 0xF5, B: 0xF5, A: 255}
+		}
+		fillCircle(img, 25, 25, 6.2, bg)
+		fillCircle(img, 25, 25, 4.6, badge)
+	}
+
+	var buf bytes.Buffer
+	_ = png.Encode(&buf, img)
+	return buf.Bytes()
+}
+
+func agLevelColor(fraction float64, overPace bool) color.NRGBA {
+	switch {
+	case overPace || fraction >= 0.90:
+		return color.NRGBA{R: 0xE5, G: 0x58, B: 0x4F, A: 255}
+	case fraction >= 0.75:
+		return color.NRGBA{R: 0xE5, G: 0x7A, B: 0x4B, A: 255}
+	case fraction >= 0.55:
+		return color.NRGBA{R: 0xE3, G: 0xA2, B: 0x4B, A: 255}
+	case fraction >= 0.35:
+		return color.NRGBA{R: 0x9E, G: 0xC9, B: 0x5A, A: 255}
+	default:
+		return color.NRGBA{R: 0x5E, G: 0xC2, B: 0x7B, A: 255}
+	}
+}
+
+type starPt struct{ x, y float64 }
+
+func drawFourPointStar(img *image.NRGBA, cx, cy, r, rotRad float64) {
+	// Sample the 4 quadratic bezier arcs matching FourPointStarShape (c = 0.14*r).
+	c := r * 0.14
+	quad := func(p0, pc, p1 starPt, steps int) []starPt {
+		pts := make([]starPt, 0, steps)
+		for i := 0; i < steps; i++ {
+			t := float64(i) / float64(steps)
+			u := 1.0 - t
+			pts = append(pts, starPt{
+				x: u*u*p0.x + 2*u*t*pc.x + t*t*p1.x,
+				y: u*u*p0.y + 2*u*t*pc.y + t*t*p1.y,
+			})
+		}
+		return pts
+	}
+	var poly []starPt
+	poly = append(poly, quad(starPt{0, -r}, starPt{c, -c}, starPt{r, 0}, 14)...)
+	poly = append(poly, quad(starPt{r, 0}, starPt{c, c}, starPt{0, r}, 14)...)
+	poly = append(poly, quad(starPt{0, r}, starPt{-c, c}, starPt{-r, 0}, 14)...)
+	poly = append(poly, quad(starPt{-r, 0}, starPt{-c, -c}, starPt{0, -r}, 14)...)
+
+	cosA, sinA := math.Cos(rotRad), math.Sin(rotRad)
+	for i, pt := range poly {
+		poly[i] = starPt{
+			x: cx + pt.x*cosA - pt.y*sinA,
+			y: cy + pt.x*sinA + pt.y*cosA,
+		}
+	}
+
+	cTop := [3]float64{0x7A, 0xB8, 0xFF}
+	cMid := [3]float64{0x4F, 0x8C, 0xFF}
+	cBot := [3]float64{0x73, 0x61, 0xFA}
+
+	const sub = 4
+	minX := max(0, int(math.Floor(cx-r-1)))
+	maxX := min(img.Bounds().Dx()-1, int(math.Ceil(cx+r+1)))
+	minY := max(0, int(math.Floor(cy-r-1)))
+	maxY := min(img.Bounds().Dy()-1, int(math.Ceil(cy+r+1)))
+
+	for y := minY; y <= maxY; y++ {
+		for x := minX; x <= maxX; x++ {
+			hits := 0
+			for sy := 0; sy < sub; sy++ {
+				for sx := 0; sx < sub; sx++ {
+					px := float64(x) + (float64(sx)+0.5)/float64(sub)
+					py := float64(y) + (float64(sy)+0.5)/float64(sub)
+					if pointInStarPoly(px, py, poly) {
+						hits++
+					}
+				}
+			}
+			if hits == 0 {
+				continue
+			}
+			alpha := uint8(math.Round(255.0 * float64(hits) / float64(sub*sub)))
+			// Linear gradient from top-left (-r,-r) to bottom-right (+r,+r)
+			t := ((float64(x)+0.5-(cx-r)) + (float64(y)+0.5-(cy-r))) / (4.0 * r)
+			if t < 0 {
+				t = 0
+			} else if t > 1 {
+				t = 1
+			}
+			var rgb [3]float64
+			if t <= 0.55 {
+				f := t / 0.55
+				for k := 0; k < 3; k++ {
+					rgb[k] = cTop[k]*(1-f) + cMid[k]*f
+				}
+			} else {
+				f := (t - 0.55) / 0.45
+				for k := 0; k < 3; k++ {
+					rgb[k] = cMid[k]*(1-f) + cBot[k]*f
+				}
+			}
+			img.SetNRGBA(x, y, color.NRGBA{
+				R: uint8(math.Round(rgb[0])),
+				G: uint8(math.Round(rgb[1])),
+				B: uint8(math.Round(rgb[2])),
+				A: alpha,
+			})
+		}
+	}
+}
+
+func pointInStarPoly(px, py float64, poly []starPt) bool {
+	inside := false
+	j := len(poly) - 1
+	for i := 0; i < len(poly); i++ {
+		yi, yj := poly[i].y, poly[j].y
+		if (yi > py) != (yj > py) {
+			xint := (poly[j].x-poly[i].x)*(py-yi)/(yj-yi) + poly[i].x
+			if px < xint {
+				inside = !inside
+			}
+		}
+		j = i
+	}
+	return inside
+}
+
 // 5x17 Clawd idle pixel mask matching BrandAssets.swift (columns 1..17, rows 0..4)
 var clawdIdleMask = [5]string{
 	"  XXXXXXXXXXXXX  ",
