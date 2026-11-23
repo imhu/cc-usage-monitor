@@ -524,3 +524,29 @@ func TestSpeedTimingStreamingZeroFirstChunkInterruptAndStartupPrime(t *testing.T
 		t.Fatalf("startup priming must not duplicate records, got %d", len(reloaded.Records))
 	}
 }
+
+func TestPillPreferencesPersistence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "prefs.json")
+
+	// Missing pillAlwaysOnTop in legacy JSON must default to true.
+	if err := os.WriteFile(path, []byte(`{"showFloatingPill":true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := LoadPreferences(path)
+	if !p.PillAlwaysOnTop || p.PillPosX != nil || p.PillPosY != nil {
+		t.Fatalf("unexpected legacy pill defaults: %+v", p)
+	}
+
+	// Explicit false and (0, 0) coordinates must persist cleanly.
+	x, y := 0, 0
+	p.PillAlwaysOnTop = false
+	p.PillPosX = &x
+	p.PillPosY = &y
+	if err := SavePreferences(path, p); err != nil {
+		t.Fatal(err)
+	}
+	p2 := LoadPreferences(path)
+	if p2.PillAlwaysOnTop || p2.PillPosX == nil || *p2.PillPosX != 0 || p2.PillPosY == nil || *p2.PillPosY != 0 {
+		t.Fatalf("unexpected reloaded pill prefs: %+v", p2)
+	}
+}

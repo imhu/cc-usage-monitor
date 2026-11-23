@@ -28,6 +28,10 @@ type application struct {
 	settingsModel *appui.SettingsModel
 	pillModel     *appui.FloatingPillModel
 
+	pillWidth     int
+	pillReady     bool
+	pillSaveTimer *time.Timer
+
 	openOnStart bool
 	demoMode    bool
 	quitting    bool
@@ -42,6 +46,7 @@ func (a *application) invalidateAll() {
 			a.settings.Invalidate()
 		}
 		if a.pill != nil {
+			a.syncPillSize()
 			a.pill.Invalidate()
 		}
 		a.updateTray()
@@ -164,25 +169,147 @@ func (a *application) openSettings() {
 	})
 }
 
+func (a *application) defaultPillPosition(width int) (int, int) {
+	disp := mygo.Screen.PrimaryDisplay()
+	wa := disp.WorkArea
+	if wa.Width > 0 && wa.Height > 0 {
+		return wa.X + wa.Width - width - 16, wa.Y + wa.Height - appui.PillHeight - 14
+	}
+	return 100, 100
+}
+
+func isPillPositionVisible(x, y, w, h int) bool {
+	displays := mygo.Screen.Displays()
+	if len(displays) == 0 {
+		displays = []mygo.Display{mygo.Screen.PrimaryDisplay()}
+	}
+	for _, d := range displays {
+		wa := d.WorkArea
+		if wa.Width <= 0 || wa.Height <= 0 {
+			continue
+		}
+		ovW := min(x+w, wa.X+wa.Width) - max(x, wa.X)
+		ovH := min(y+h, wa.Y+wa.Height) - max(y, wa.Y)
+		if ovW >= 32 && ovH >= 20 {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *application) scheduleSavePillPos() {
+	if !a.pillReady || a.pill == nil {
+		return
+	}
+	if a.pillSaveTimer != nil {
+		a.pillSaveTimer.Stop()
+	}
+	a.pillSaveTimer = time.AfterFunc(250*time.Millisecond, func() {
+		mygo.RunOnMain(func() {
+			if a.pill == nil || !a.pillReady {
+				return
+			}
+			x, y := a.pill.Position()
+			if !isPillPositionVisible(x, y, max(a.pillWidth, 120), appui.PillHeight) {
+				return
+			}
+			px, py := x, y
+			a.store.UpdatePrefs(func(p *core.Preferences) {
+				p.PillPosX = &px
+				p.PillPosY = &py
+			})
+		})
+	})
+}
+
+func (a *application) setPillAlwaysOnTop(on bool) {
+	if a.pill != nil {
+		a.pill.SetAlwaysOnTop(on)
+	}
+}
+
+func (a *application) startPillDrag(dx, dy int) {
+	w := a.pill
+	if w == nil {
+		return
+	}
+	// Run on the next turn of the Windows main message loop (after View finishes)
+	// so ReleaseCapture + modal WM_NCLBUTTONDOWN(HTCAPTION) never re-enter View().
+	go func() {
+		mygo.RunOnMain(func() {
+			if a.pill != w || !platform.IsPrimaryMouseDown() {
+				return
+			}
+			if dx != 0 || dy != 0 {
+				wx, wy := w.Position()
+				w.SetPosition(wx+dx, wy+dy)
+			}
+			platform.StartWindowDrag(w.NativeHandle())
+			a.scheduleSavePillPos()
+		})
+	}()
+}
+
+func (a *application) resetPillPosition() {
+	if a.pill == nil {
+		return
+	}
+	if a.pillSaveTimer != nil {
+		a.pillSaveTimer.Stop()
+		a.pillSaveTimer = nil
+	}
+	w := a.pillWidth
+	if w <= 0 {
+		w = appui.PillTargetWidth(a.store.ViewState())
+	}
+	x, y := a.defaultPillPosition(w)
+	a.pillReady = false
+	a.pill.SetPosition(x, y)
+	a.pillReady = true
+}
+
+func (a *application) syncPillSize() {
+	if a.pill == nil {
+		return
+	}
+	targetW := appui.PillTargetWidth(a.store.ViewState())
+	if targetW == a.pillWidth {
+		return
+	}
+	a.pillWidth = targetW
+	a.pill.SetSize(targetW, appui.PillHeight)
+}
+
 func (a *application) setFloatingPill(show bool) {
 	if !show {
+		if a.pillSaveTimer != nil {
+			a.pillSaveTimer.Stop()
+			a.pillSaveTimer = nil
+		}
+		a.pillReady = false
 		if a.pill != nil {
 			a.pill.Close()
 			a.pill = nil
 		}
 		return
 	}
+	st := a.store.ViewState()
 	if a.pill != nil {
+		a.pill.SetAlwaysOnTop(st.Prefs.PillAlwaysOnTop)
+		a.syncPillSize()
 		a.pill.Show()
 		return
 	}
+	pillW := appui.PillTargetWidth(st)
+	a.pillWidth = pillW
+	a.pillReady = false
 	w := mygo.NewWindow(mygo.WindowOptions{
 		Title:             "Claude Usage Pill",
-		Width:             220,
-		Height:            38,
+		Width:             pillW,
+		Height:            appui.PillHeight,
 		Frameless:         true,
 		Transparent:       true,
-		AlwaysOnTop:       true,
+		AlwaysOnTop:       st.Prefs.PillAlwaysOnTop,
 		SkipTaskbar:       true,
 		DisableResize:     true,
 		DisableMinimize:   true,
@@ -190,16 +317,32 @@ func (a *application) setFloatingPill(show bool) {
 		DisableFullScreen: true,
 		Content:           ui.View(a.pillModel.View),
 	})
-	// Position near bottom-right above taskbar
-	disp := mygo.Screen.PrimaryDisplay()
-	wa := disp.WorkArea
-	if wa.Width > 0 && wa.Height > 0 {
-		w.SetPosition(wa.X+wa.Width-236, wa.Y+wa.Height-52)
+	x, y := a.defaultPillPosition(pillW)
+	if st.Prefs.PillPosX != nil && st.Prefs.PillPosY != nil &&
+		isPillPositionVisible(*st.Prefs.PillPosX, *st.Prefs.PillPosY, pillW, appui.PillHeight) {
+		x, y = *st.Prefs.PillPosX, *st.Prefs.PillPosY
 	}
+	w.SetPosition(x, y)
+	w.OnMove(func() {
+		a.scheduleSavePillPos()
+	})
 	w.OnClosed(func() {
+		if a.pillSaveTimer != nil {
+			a.pillSaveTimer.Stop()
+			a.pillSaveTimer = nil
+		}
+		a.pillReady = false
 		a.pill = nil
 	})
 	a.pill = w
+	// Allow initial OS placement events to settle before recording user drags.
+	time.AfterFunc(300*time.Millisecond, func() {
+		mygo.RunOnMain(func() {
+			if a.pill == w {
+				a.pillReady = true
+			}
+		})
+	})
 }
 
 func (a *application) chooseClaudeDir() {
@@ -254,11 +397,19 @@ func (a *application) ready() {
 		ChooseClaudeDir:    a.chooseClaudeDir,
 		ChooseDir:          a.chooseDataDir,
 		ToggleFloatingPill: a.setFloatingPill,
+		SetPillAlwaysOnTop: a.setPillAlwaysOnTop,
+		SyncPillSize:       a.syncPillSize,
 		SyncTray:           a.updateTray,
 		GetOpenAtLogin:     mygo.App.OpenAtLogin,
 		SetOpenAtLogin:     mygo.App.SetOpenAtLogin,
 	})
-	a.pillModel = appui.NewFloatingPillModel(a.store, a.togglePanel)
+	a.pillModel = appui.NewFloatingPillModel(a.store, appui.PillActions{
+		OnOpenPanel:    a.togglePanel,
+		SetAlwaysOnTop: a.setPillAlwaysOnTop,
+		ResetPosition:  a.resetPillPosition,
+		HidePill:       func() { a.setFloatingPill(false) },
+		StartDrag:      a.startPillDrag,
+	})
 
 	var err error
 	a.tray, err = mygo.NewTray(mygo.TrayOptions{
@@ -278,11 +429,11 @@ func (a *application) ready() {
 		}
 		st := a.store.ViewState()
 		zh := st.Prefs.IsChinese()
-		openLbl, refLbl, pillLbl, setLbl, quitLbl := "打开面板", "立即刷新", "显示桌面悬浮条", "设置…", "退出"
+		openLbl, refLbl, pillLbl, pillTopLbl, setLbl, quitLbl := "打开面板", "立即刷新", "显示桌面悬浮条", "悬浮条始终置顶", "设置…", "退出"
 		if !zh {
-			openLbl, refLbl, pillLbl, setLbl, quitLbl = "Open Panel", "Refresh Now", "Show Floating Bar", "Settings…", "Quit"
+			openLbl, refLbl, pillLbl, pillTopLbl, setLbl, quitLbl = "Open Panel", "Refresh Now", "Show Floating Bar", "Keep Floating Bar on Top", "Settings…", "Quit"
 		}
-		menu := mygo.NewMenu([]*mygo.MenuItem{
+		items := []*mygo.MenuItem{
 			{Label: openLbl, Click: func(*mygo.MenuItem, *mygo.Window) { a.openPanel() }},
 			{Label: refLbl, Click: func(*mygo.MenuItem, *mygo.Window) { a.store.RefreshNow() }},
 			mygo.Separator(),
@@ -295,10 +446,24 @@ func (a *application) ready() {
 					a.setFloatingPill(item.Checked)
 				},
 			},
-			{Label: setLbl, Click: func(*mygo.MenuItem, *mygo.Window) { a.openSettings() }},
+		}
+		if st.Prefs.ShowFloatingPill {
+			items = append(items, &mygo.MenuItem{
+				Label:   pillTopLbl,
+				Type:    mygo.MenuItemCheckbox,
+				Checked: st.Prefs.PillAlwaysOnTop,
+				Click: func(item *mygo.MenuItem, _ *mygo.Window) {
+					a.store.UpdatePrefs(func(p *core.Preferences) { p.PillAlwaysOnTop = item.Checked })
+					a.setPillAlwaysOnTop(item.Checked)
+				},
+			})
+		}
+		items = append(items,
+			&mygo.MenuItem{Label: setLbl, Click: func(*mygo.MenuItem, *mygo.Window) { a.openSettings() }},
 			mygo.Separator(),
-			{Label: quitLbl, Role: mygo.RoleQuit},
-		})
+			&mygo.MenuItem{Label: quitLbl, Role: mygo.RoleQuit},
+		)
+		menu := mygo.NewMenu(items)
 		a.tray.SetMenu(menu)
 		defer a.tray.SetMenu(nil)
 		a.tray.PopUpMenu()

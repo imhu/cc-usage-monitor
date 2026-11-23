@@ -56,7 +56,7 @@ func TestPopoverAndSettingsRender(t *testing.T) {
 	if err := st.Click("菜单栏"); err != nil {
 		t.Fatalf("click Menubar tab failed: %v", err)
 	}
-	if !st.HasText("显示数值") {
+	if !st.HasText("显示数值") || !st.HasText("悬浮条始终置顶") {
 		t.Errorf("settings Menubar tab missing expected text; got: %q", st.Texts())
 	}
 	saveSnap("settings-menubar.png", st)
@@ -78,8 +78,9 @@ func TestPopoverAndSettingsRender(t *testing.T) {
 	saveSnap("settings-data.png", st)
 
 	// Test Floating Pill
-	pill := NewFloatingPillModel(store, nil)
-	pt := ui.NewTesterWith(pill.View, 220, 38, ui.TesterOptions{Dark: true})
+	pill := NewFloatingPillModel(store, PillActions{})
+	pw := PillTargetWidth(store.ViewState())
+	pt := ui.NewTesterWith(pill.View, pw, PillHeight, ui.TesterOptions{Dark: true})
 	if !pt.HasText("8%") || !pt.HasText("10%") {
 		t.Errorf("floating pill missing expected metrics; got: %q", pt.Texts())
 	}
@@ -129,5 +130,47 @@ func TestSpeedHelpersMatchOriginal(t *testing.T) {
 	}
 	if tip := speedSummaryTooltip(nil, nil, nil, false, false, true); tip != "" {
 		t.Fatalf("expected empty tooltip when no replies in last hour, got: %q", tip)
+	}
+}
+
+func TestFloatingPillClickVsDrag(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+	store := service.NewStore(nil)
+	store.SetDemoState()
+
+	opened := 0
+	dragCalls := 0
+	dragDX, dragDY := 0, 0
+	pill := NewFloatingPillModel(store, PillActions{
+		OnOpenPanel: func() { opened++ },
+		StartDrag: func(dx, dy int) {
+			dragCalls++
+			dragDX, dragDY = dx, dy
+		},
+	})
+	pw := PillTargetWidth(store.ViewState())
+	pt := ui.NewTesterWith(pill.View, pw, PillHeight, ui.TesterOptions{Dark: true})
+
+	// 1. Single-click anywhere on the pill opens the main panel.
+	pt.ClickAt(float32(pw/2), float32(PillHeight/2))
+	if opened != 1 || dragCalls != 0 {
+		t.Fatalf("expected single-click to open panel once without drag, got opened=%d dragCalls=%d", opened, dragCalls)
+	}
+
+	// 2. Press + move >= 4px hands off to native StartDrag and must NOT open the panel on release.
+	pt.Press(float32(pw/2), float32(PillHeight/2))
+	pt.Move(float32(pw/2)+10, float32(PillHeight/2)+5)
+	pt.Release(float32(pw/2)+10, float32(PillHeight/2)+5)
+	if dragCalls != 1 || dragDX != 10 || dragDY != 5 {
+		t.Fatalf("expected single StartDrag(10, 5), got calls=%d (%d, %d)", dragCalls, dragDX, dragDY)
+	}
+	if opened != 1 {
+		t.Fatalf("expected drag release not to open panel, got opened=%d", opened)
+	}
+
+	// 3. Subsequent click still opens the panel cleanly.
+	pt.ClickAt(float32(pw/2), float32(PillHeight/2))
+	if opened != 2 {
+		t.Fatalf("expected click after drag to open panel, got opened=%d", opened)
 	}
 }

@@ -60,6 +60,9 @@ type Preferences struct {
 	IconStyle          IconStyle `json:"iconStyle"`
 	ClawdAnimation     bool      `json:"clawdAnimation"`
 	ShowFloatingPill   bool      `json:"showFloatingPill"`
+	PillAlwaysOnTop    bool      `json:"pillAlwaysOnTop"`
+	PillPosX           *int      `json:"pillPosX,omitempty"`
+	PillPosY           *int      `json:"pillPosY,omitempty"`
 	PillShowFiveHour   bool      `json:"pillShowFiveHour"`
 	PillShowWeek       bool      `json:"pillShowWeek"`
 	PillShowScoped     bool      `json:"pillShowScoped"`
@@ -105,6 +108,7 @@ func DefaultPreferences() Preferences {
 		IconStyle:           IconStyleClawd,
 		ClawdAnimation:      true,
 		ShowFloatingPill:    false,
+		PillAlwaysOnTop:     true,
 		PillShowFiveHour:    true,
 		PillShowWeek:        true,
 		PillShowTodayCost:   true,

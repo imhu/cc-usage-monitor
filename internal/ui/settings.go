@@ -28,6 +28,8 @@ type SettingsActions struct {
 	ChooseClaudeDir    func()
 	ChooseDir          func()
 	ToggleFloatingPill func(show bool)
+	SetPillAlwaysOnTop func(on bool)
+	SyncPillSize       func()
 	SyncTray           func()
 	GetOpenAtLogin     func() bool
 	SetOpenAtLogin     func(bool) error
@@ -325,12 +327,25 @@ func (m *SettingsModel) renderMenuBarTab(c *ui.Context, st service.ViewState, zh
 	Hairline(c)
 
 	settingsRow(c, tr(zh, "桌面 Mini 悬浮条（Windows 专属）", "Floating Mini Bar (Windows)"),
-		tr(zh, "还原 macOS 菜单栏常驻多列数值体验，可拖拽到屏幕顶部或任务栏上方，点击展开主面板。",
-			"Always-on-top compact strip replicating macOS menu bar multi-column metrics."), func() {
+		tr(zh, "还原 macOS 菜单栏常驻多列数值体验。单击打开主面板，按住左键可拖动位置，右键可快速置顶或隐藏。",
+			"Compact strip replicating macOS menu bar metrics. Click to open panel, hold left button to drag, right-click for menu."), func() {
 			TerracottaSwitch(c, "sw-pill", st.Prefs.ShowFloatingPill, func(on bool) {
 				m.Store.UpdatePrefs(func(p *core.Preferences) { p.ShowFloatingPill = on })
 				if m.Actions.ToggleFloatingPill != nil {
 					m.Actions.ToggleFloatingPill(on)
+				}
+			})
+		})
+
+	Hairline(c)
+
+	settingsRow(c, tr(zh, "悬浮条始终置顶", "Keep floating bar on top"),
+		tr(zh, "开启后悬浮条始终显示在所有窗口最前面，关闭后可被其他窗口遮挡。",
+			"Keeps the floating bar above all other windows when enabled."), func() {
+			TerracottaSwitch(c, "sw-pill-top", st.Prefs.PillAlwaysOnTop, func(on bool) {
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.PillAlwaysOnTop = on })
+				if m.Actions.SetPillAlwaysOnTop != nil {
+					m.Actions.SetPillAlwaysOnTop(on)
 				}
 			})
 		})
@@ -380,6 +395,9 @@ func (m *SettingsModel) renderMenuBarTab(c *ui.Context, st service.ViewState, zh
 				}
 				if box.Clicked() {
 					m.Store.UpdatePrefs(func(p *core.Preferences) { item.set(p, !item.on) })
+					if m.Actions.SyncPillSize != nil {
+						m.Actions.SyncPillSize()
+					}
 				}
 				op := float32(0.35)
 				if item.on {

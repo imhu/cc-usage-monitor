@@ -11,18 +11,72 @@ import (
 	"ccmonitor/internal/service"
 )
 
-// FloatingPillModel renders the optional Windows always-on-top compact strip
-// replicating the macOS menu bar item in hero.png (Clawd + shield + multi-column metrics).
-type FloatingPillModel struct {
-	Store       *service.Store
-	OnOpenPanel func()
+const PillHeight = 38
+
+type PillActions struct {
+	OnOpenPanel    func()
+	SetAlwaysOnTop func(bool)
+	ResetPosition  func()
+	HidePill       func()
+	StartDrag      func(dx, dy int)
 }
 
-func NewFloatingPillModel(store *service.Store, onOpenPanel func()) *FloatingPillModel {
+// FloatingPillModel renders the optional Windows compact desktop strip
+// replicating the macOS menu bar item (Clawd + shield + multi-column metrics).
+// Single-click anywhere opens the main panel; holding left mouse button and
+// moving >= 4px hands off to native OS window dragging; right-click opens menu.
+type FloatingPillModel struct {
+	Store   *service.Store
+	Actions PillActions
+
+	pressing  bool
+	dragMoved bool
+	dragAccX  float32
+	dragAccY  float32
+}
+
+func NewFloatingPillModel(store *service.Store, actions PillActions) *FloatingPillModel {
 	return &FloatingPillModel{
-		Store:       store,
-		OnOpenPanel: onOpenPanel,
+		Store:   store,
+		Actions: actions,
 	}
+}
+
+// PillTargetWidth estimates a clean window width (in DIPs) for the enabled metrics.
+func PillTargetWidth(st service.ViewState) int {
+	cols := 0
+	if st.Prefs.PillShowFiveHour {
+		cols++
+	}
+	if st.Prefs.PillShowWeek {
+		cols++
+	}
+	if st.Prefs.PillShowScoped && st.OfficialUsage != nil && len(st.OfficialUsage.Scoped) > 0 {
+		cols++
+	}
+	if st.Prefs.PillShowTodayCost {
+		cols++
+	}
+	if st.Prefs.PillShowWeekCost && st.Snapshot != nil && st.Snapshot.Week != nil {
+		cols++
+	}
+	if st.Prefs.PillShowMonthCost && st.Snapshot != nil {
+		cols++
+	}
+	if st.Prefs.PillShowSpeed {
+		cols++
+	}
+	if cols == 0 {
+		return 64
+	}
+	w := 48 + cols*46
+	if w < 120 {
+		return 120
+	}
+	if w > 460 {
+		return 460
+	}
+	return w
 }
 
 func (m *FloatingPillModel) View(c *ui.Context) {
@@ -45,9 +99,70 @@ func (m *FloatingPillModel) View(c *ui.Context) {
 	pill := ui.Row(c.Key("mini-pill")).Fill().Padding(4, 10).Gap(9).Radius(14).
 		Background(ui.RGBA(34, 34, 32, 0.94)).Border(1, ColorSurfaceBorder).
 		AlignItems(ui.Center).Cursor(ui.CursorPointer)
-	if pill.Clicked() && m.OnOpenPanel != nil {
-		m.OnOpenPanel()
+
+	// Calling Dragged() captures pointer-move deltas while left button is held.
+	dx, dy, hasDrag := pill.Dragged()
+	pressed := pill.Pressed()
+	clicked := pill.Clicked()
+
+	wasDragged := false
+	if pressed {
+		if !m.pressing {
+			m.pressing = true
+			m.dragMoved = false
+			m.dragAccX = 0
+			m.dragAccY = 0
+		}
+		if hasDrag && !m.dragMoved {
+			m.dragAccX += dx
+			m.dragAccY += dy
+			if math.Abs(float64(m.dragAccX)) >= 4 || math.Abs(float64(m.dragAccY)) >= 4 {
+				m.dragMoved = true
+				if m.Actions.StartDrag != nil {
+					m.Actions.StartDrag(int(math.Round(float64(m.dragAccX))), int(math.Round(float64(m.dragAccY))))
+				}
+			}
+		}
+	} else if m.pressing {
+		wasDragged = m.dragMoved
+		m.pressing = false
+		m.dragMoved = false
+		m.dragAccX = 0
+		m.dragAccY = 0
 	}
+
+	if clicked && !m.dragMoved && !wasDragged && m.Actions.OnOpenPanel != nil {
+		m.Actions.OnOpenPanel()
+	}
+
+	pill.ContextMenu(func(menu *ui.Menu) {
+		if menu.Item(tr(zh, "打开主面板", "Open Panel")).Chosen() && m.Actions.OnOpenPanel != nil {
+			m.Actions.OnOpenPanel()
+		}
+		if menu.Item(tr(zh, "始终置顶", "Always on top")).Checked(st.Prefs.PillAlwaysOnTop).Chosen() {
+			next := !st.Prefs.PillAlwaysOnTop
+			m.Store.UpdatePrefs(func(p *core.Preferences) { p.PillAlwaysOnTop = next })
+			if m.Actions.SetAlwaysOnTop != nil {
+				m.Actions.SetAlwaysOnTop(next)
+			}
+		}
+		if menu.Item(tr(zh, "重置位置", "Reset position")).Chosen() {
+			m.Store.UpdatePrefs(func(p *core.Preferences) {
+				p.PillPosX = nil
+				p.PillPosY = nil
+			})
+			if m.Actions.ResetPosition != nil {
+				m.Actions.ResetPosition()
+			}
+		}
+		menu.Separator()
+		if menu.Item(tr(zh, "隐藏悬浮条", "Hide floating bar")).Chosen() {
+			m.Store.UpdatePrefs(func(p *core.Preferences) { p.ShowFloatingPill = false })
+			if m.Actions.HidePill != nil {
+				m.Actions.HidePill()
+			}
+		}
+	})
 
 	pill.Children(func() {
 		col := ColorLive
