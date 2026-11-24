@@ -213,7 +213,8 @@ func (a *application) defaultPillPosition(width int) (int, int) {
 	disp := mygo.Screen.PrimaryDisplay()
 	wa := disp.WorkArea
 	if wa.Width > 0 && wa.Height > 0 {
-		return wa.X + wa.Width - width - 16, wa.Y + wa.Height - appui.PillHeight - 14
+		return wa.X + wa.Width - width - max(0, 16-appui.PillShadowPadX),
+			wa.Y + wa.Height - appui.PillHeight - max(0, 14-appui.PillShadowPadBottom)
 	}
 	return 100, 100
 }
@@ -309,11 +310,11 @@ func (a *application) resetPillPosition() {
 }
 
 func (a *application) setPillWidth(w int) {
-	if w < 44 {
-		w = 44
+	if w < appui.PillMinWidth {
+		w = appui.PillMinWidth
 	}
-	if w > 520 {
-		w = 520
+	if w > appui.PillMaxWidth {
+		w = appui.PillMaxWidth
 	}
 	mygo.RunOnMain(func() {
 		if a.pill == nil || w == a.pillWidth {
@@ -362,6 +363,7 @@ func (a *application) setFloatingPill(show bool) {
 		Width:             pillW,
 		Height:            appui.PillHeight,
 		Frameless:         true,
+		DisableShadow:     true,
 		Transparent:       true,
 		AlwaysOnTop:       st.Prefs.PillAlwaysOnTop,
 		SkipTaskbar:       true,
@@ -371,6 +373,7 @@ func (a *application) setFloatingPill(show bool) {
 		DisableFullScreen: true,
 		Content:           ui.View(a.pillModel.View),
 	})
+	platform.MakeBorderlessTransparent(w.NativeHandle())
 	x, y := a.defaultPillPosition(pillW)
 	if st.Prefs.PillPosX != nil && st.Prefs.PillPosY != nil &&
 		isPillPositionVisible(*st.Prefs.PillPosX, *st.Prefs.PillPosY, pillW, appui.PillHeight) {

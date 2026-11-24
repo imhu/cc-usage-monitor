@@ -12,7 +12,15 @@ import (
 	"ccmonitor/internal/service"
 )
 
-const PillHeight = 38
+const (
+	PillBodyHeight      = 38
+	PillShadowPadX      = 12
+	PillShadowPadTop    = 9
+	PillShadowPadBottom = 15
+	PillHeight          = PillBodyHeight + PillShadowPadTop + PillShadowPadBottom
+	PillMinWidth        = 44 + 2*PillShadowPadX
+	PillMaxWidth        = 520 + 2*PillShadowPadX
+)
 
 type PillActions struct {
 	OnOpenPanel       func()
@@ -87,7 +95,7 @@ func PillTargetWidth(st service.ViewState) int {
 		cols := buildAGPillColumns(st, money, zh)
 		const iconW = 16.0
 		if len(cols) == 0 {
-			return 44
+			return PillMinWidth
 		}
 		var w float64
 		if len(cols) == 1 {
@@ -100,7 +108,7 @@ func PillTargetWidth(st service.ViewState) int {
 				w += max(topW, valW)
 			}
 		}
-		return max(44, min(520, int(math.Ceil(w))))
+		return max(PillMinWidth, min(PillMaxWidth, int(math.Ceil(w))+2*PillShadowPadX))
 	}
 
 	cols := buildClaudePillColumns(st, now, money, zh)
@@ -109,7 +117,7 @@ func PillTargetWidth(st service.ViewState) int {
 		iconW = 15.0
 	}
 	if len(cols) == 0 {
-		return 44
+		return PillMinWidth
 	}
 	w := chromeW + iconW + gap*float64(len(cols))
 	for _, col := range cols {
@@ -117,14 +125,14 @@ func PillTargetWidth(st service.ViewState) int {
 		valW := estimatePillTextWidth(col.val, 11.0)
 		w += max(topW, valW)
 	}
-	return max(44, min(520, int(math.Ceil(w))))
+	return max(PillMinWidth, min(PillMaxWidth, int(math.Ceil(w))+2*PillShadowPadX))
 }
 
 func (m *FloatingPillModel) View(c *ui.Context) {
 	st := m.Store.ViewState()
 	provider := core.NormalizeProvider(st.Prefs.ActiveProvider)
 	ApplyThemeFor(c, provider)
-	c.Root().Background(ui.Transparent)
+	c.Root().Background(ui.Transparent).Padding(PillShadowPadTop, PillShadowPadX, PillShadowPadBottom, PillShadowPadX)
 
 	zh := st.Prefs.IsChinese()
 	now := time.Now()
@@ -140,6 +148,8 @@ func (m *FloatingPillModel) View(c *ui.Context) {
 
 	pill := ui.Row(c.Key("mini-pill")).Fill().Padding(4, 10).Radius(14).
 		Background(ui.RGBA(34, 34, 32, 0.94)).Border(1, ColorSurfaceBorder).
+		Shadow(0, 3, 10, 0, ui.RGBA(0, 0, 0, 0.30)).
+		Shadow(0, 1, 2, 0, ui.RGBA(0, 0, 0, 0.20)).
 		Center().Cursor(ui.CursorPointer)
 
 	// Calling Dragged() captures pointer-move deltas while left button is held.
@@ -270,12 +280,12 @@ func (m *FloatingPillModel) View(c *ui.Context) {
 				m.lastContentSig = sig
 				c.After(16 * time.Millisecond)
 			} else {
-				wantW := int(math.Ceil(float64(b.W))) + 24
-				if wantW < 44 {
-					wantW = 44
+				wantW := int(math.Ceil(float64(b.W))) + 24 + 2*PillShadowPadX
+				if wantW < PillMinWidth {
+					wantW = PillMinWidth
 				}
-				if wantW > 520 {
-					wantW = 520
+				if wantW > PillMaxWidth {
+					wantW = PillMaxWidth
 				}
 				if wantW != m.lastContentW {
 					m.lastContentW = wantW
