@@ -27,11 +27,13 @@ type PopoverModel struct {
 	Actions PopoverActions
 
 	// Ephemeral UI hover & disclosure state (main thread only)
-	procExpanded bool
-	hoveredBar   map[string]bool
-	hoveredDay   int
-	hoveredAge   float64
-	hoveredReply uint64
+	procExpanded          bool
+	providerMenuOpen      bool
+	suppressProviderClick bool
+	hoveredBar            map[string]bool
+	hoveredDay            int
+	hoveredAge            float64
+	hoveredReply          uint64
 
 	// Antigravity ephemeral UI state
 	agProcExpanded  bool
@@ -57,6 +59,8 @@ func NewPopoverModel(store *service.Store, actions PopoverActions) *PopoverModel
 
 // ResetHover clears ephemeral hover state when the popover closes or hides.
 func (m *PopoverModel) ResetHover() {
+	m.providerMenuOpen = false
+	m.suppressProviderClick = false
 	m.hoveredAge = -1
 	m.hoveredReply = 0
 	m.hoveredDay = -1
@@ -73,6 +77,8 @@ func (m *PopoverModel) ResetHover() {
 
 func (m *PopoverModel) switchProvider(p core.ProviderKind) {
 	norm := core.NormalizeProvider(p)
+	m.providerMenuOpen = false
+	m.suppressProviderClick = false
 	cur := core.NormalizeProvider(m.Store.ViewState().Prefs.ActiveProvider)
 	if cur == norm {
 		return
@@ -138,15 +144,12 @@ func (m *PopoverModel) View(c *ui.Context) {
 	}
 
 	root.Children(func() {
-		// 1. Header: brand logo + title + PlanBadge (pinned at top)
+		// 1. Header: brand logo + dropdown title + PlanBadge (pinned at top)
 		if provider == core.ProviderAntigravity {
-			m.renderAGHeader(c, st, zh)
+			m.renderAGHeader(c, st, now, zh)
 		} else {
-			m.renderHeader(c, st, zh)
+			m.renderHeader(c, st, now, zh)
 		}
-
-		// 1.5 Compact Provider Switcher (Claude <-> Antigravity)
-		m.renderProviderSwitcher(c, provider, zh)
 
 		// Scrollable middle body: expands to natural height via FitContent when
 		// the screen has room, and scrolls smoothly if content exceeds WorkArea.
@@ -177,50 +180,112 @@ func (m *PopoverModel) View(c *ui.Context) {
 	})
 }
 
-func (m *PopoverModel) renderProviderSwitcher(c *ui.Context, active core.ProviderKind, zh bool) {
-	wrap := ui.Row(c.Key("provider-sw")).FillWidth().Margin(0, 0, 8, 0).Padding(2).Gap(2).Radius(9).Background(ColorPillBg)
-	wrap.Children(func() {
-		renderTab := func(key string, p core.ProviderKind, label, tip string, drawIcon func(ui.Color)) {
-			isSel := active == p
-			tab := ui.Row(c.Key(key)).Grow(1).Height(24).Padding(0, 8).Radius(7).Center().Gap(5).Cursor(ui.CursorPointer)
-			if isSel {
-				tab.Background(ColorPillSel)
-			} else if tab.Hovered() {
-				tab.Background(ColorHover)
+func (m *PopoverModel) renderProviderTrigger(c *ui.Context, st service.ViewState, now time.Time, zh bool) {
+	active := core.NormalizeProvider(st.Prefs.ActiveProvider)
+	trigger := ui.Row(c.Key("provider-trigger")).Height(24).Padding(0, 6).Margin(0, 0, 0, -6).
+		Radius(7).Gap(6).AlignItems(ui.Center).Cursor(ui.CursorPointer)
+	hov := trigger.Hovered()
+	if m.providerMenuOpen {
+		trigger.Background(ColorPillSel)
+	} else if hov {
+		trigger.Background(ColorHover)
+	}
+
+	if trigger.Clicked() {
+		if m.suppressProviderClick {
+			m.suppressProviderClick = false
+		} else {
+			m.providerMenuOpen = !m.providerMenuOpen
+		}
+	} else if !trigger.Pressed() {
+		m.suppressProviderClick = false
+	}
+
+	trigger.Tooltip(tr(zh, "切换用量面板 (Ctrl+1 / Ctrl+2)", "Switch usage panel (Ctrl+1 / Ctrl+2)"))
+	trigger.Children(func() {
+		if active == core.ProviderAntigravity {
+			AntigravityLogo(c, 15, 0)
+			ui.Text(c, tr(zh, "Antigravity 用量", "Antigravity usage")).FontSize(13).FontWeight(600).TextColor(ColorText).SingleLine()
+		} else {
+			ClaudeLogo(c, 15, ColorAccent)
+			ui.Text(c, tr(zh, "Claude 用量", "Claude usage")).FontSize(13).FontWeight(600).TextColor(ColorText).SingleLine()
+		}
+		chevCol := ColorTertiary
+		if hov || m.providerMenuOpen {
+			chevCol = ColorSecondary
+		}
+		ui.Icon(c, IconChevDn).FontSize(9.5).TextColor(chevCol)
+	})
+
+	pop := ui.PopoverBase(c.Key("provider-pop"), trigger, &m.providerMenuOpen, func(panel ui.Element) {
+		panel.Width(212).Margin(4, 0, 0, 0).Padding(4).Radius(10).
+			Background(ui.Hex("#2E2E2C")).Border(1, ui.RGBA(255, 255, 255, 0.14))
+
+		claudePct, claudeCol := "–", ColorTertiary
+		if st.OfficialUsage != nil {
+			eff := st.OfficialUsage.EffectiveAt(now)
+			if eff.FiveHour != nil {
+				claudePct = fmt.Sprintf("%d%%", eff.FiveHour.Percent())
+				claudeCol = LevelColor(eff.FiveHour.Fraction())
 			}
-			if tab.Clicked() && !isSel {
-				m.switchProvider(p)
-			}
-			tab.Tooltip(tip)
-			tab.Children(func() {
-				col := ColorSecondary
-				weight := 400
-				if isSel {
-					col = ColorText
-					weight = 500
-				}
-				drawIcon(col)
-				ui.Text(c, label).FontSize(11.5).FontWeight(weight).TextColor(col).SingleLine()
-			})
 		}
 
-		renderTab("prov-claude", core.ProviderClaude, "Claude", tr(zh, "切换到 Claude 用量 (Ctrl+1)", "Switch to Claude usage (Ctrl+1)"), func(col ui.Color) {
-			ic := ColorTertiary
-			if active == core.ProviderClaude {
-				ic = ColorAccent
+		agPct, agCol := "--", ColorTertiary
+		if b := st.AG.OfficialReport.PrimaryFiveHour; b != nil {
+			agPct = fmt.Sprintf("%d%%", b.UsedPercentInt())
+			agCol = AGLevelColor(b.UsedFraction, b.IsOverPace())
+		}
+
+		ui.Column(c).FillWidth().Gap(2).Children(func() {
+			renderItem := func(key string, p core.ProviderKind, label, pctStr string, pctCol, checkCol ui.Color, drawLogo func()) {
+				isSel := active == p
+				item := ui.Row(c.Key(key)).FillWidth().Height(30).Padding(0, 8).Radius(7).Gap(8).
+					AlignItems(ui.Center).Cursor(ui.CursorPointer)
+				if isSel {
+					item.Background(ColorPillBg)
+				}
+				if item.Hovered() {
+					item.Background(ColorHover)
+				}
+				if item.Clicked() {
+					m.switchProvider(p)
+				}
+				item.Children(func() {
+					drawLogo()
+					txtCol := ColorSecondary
+					weight := 400
+					if isSel {
+						txtCol = ColorText
+						weight = 500
+					}
+					ui.Text(c, label).FontSize(12.5).FontWeight(weight).TextColor(txtCol).SingleLine()
+					ui.Spacer(c)
+					ui.Text(c, pctStr).FontSize(11.5).FontWeight(500).TextColor(pctCol).FontFeatures("tnum").SingleLine()
+					ui.Row(c).Size(14, 14).Center().Children(func() {
+						if isSel {
+							ui.Icon(c, IconCheck).FontSize(12).TextColor(checkCol)
+						}
+					})
+				})
 			}
-			ClaudeLogo(c, 11, ic)
-		})
-		renderTab("prov-ag", core.ProviderAntigravity, "Antigravity", tr(zh, "切换到 Antigravity 用量 (Ctrl+2)", "Switch to Antigravity usage (Ctrl+2)"), func(col ui.Color) {
-			AntigravityLogo(c, 11, 0)
+
+			renderItem("pdrop-claude", core.ProviderClaude, "Claude", claudePct, claudeCol, ColorAccent, func() {
+				ClaudeLogo(c, 13, ColorAccent)
+			})
+			renderItem("pdrop-ag", core.ProviderAntigravity, "Antigravity", agPct, agCol, ColorAGAccent, func() {
+				AntigravityLogo(c, 13, 0)
+			})
 		})
 	})
+
+	if pop.Dismissed() && trigger.Pressed() {
+		m.suppressProviderClick = true
+	}
 }
 
-func (m *PopoverModel) renderHeader(c *ui.Context, st service.ViewState, zh bool) {
-	ui.Row(c).FillWidth().Height(22).Margin(0, 0, 10, 0).Gap(8).AlignItems(ui.Center).Children(func() {
-		ClaudeLogo(c, 15, ColorAccent)
-		ui.Text(c, tr(zh, "Claude 用量", "Claude usage")).FontSize(13).FontWeight(600).TextColor(ColorText).SingleLine()
+func (m *PopoverModel) renderHeader(c *ui.Context, st service.ViewState, now time.Time, zh bool) {
+	ui.Row(c).FillWidth().Height(24).Margin(0, 0, 10, 0).Gap(8).AlignItems(ui.Center).Children(func() {
+		m.renderProviderTrigger(c, st, now, zh)
 		ui.Spacer(c)
 
 		if st.DetectedPlan != core.PlanNone {

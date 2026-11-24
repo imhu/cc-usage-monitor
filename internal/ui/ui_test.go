@@ -191,9 +191,42 @@ func TestAntigravityPopoverSwitchAndRender(t *testing.T) {
 		t.Fatalf("expected initial Claude view, got: %q", tt.Texts())
 	}
 
-	// Switch to Antigravity via UI switcher tab
+	snapDir := os.Getenv("CCMONITOR_SNAPSHOT_DIR")
+	saveSnap := func(name string, tester *ui.Tester) {
+		if snapDir == "" {
+			return
+		}
+		_ = os.MkdirAll(snapDir, 0o755)
+		if img := tester.Image(); img != nil {
+			if f, err := os.Create(filepath.Join(snapDir, name)); err == nil {
+				_ = png.Encode(f, img)
+				f.Close()
+			}
+		}
+	}
+
+	// Open header dropdown menu, verify Antigravity item with live 5h%, then close by clicking anchor again
+	if err := tt.Click("Claude 用量"); err != nil {
+		t.Fatalf("click Claude header trigger failed: %v", err)
+	}
+	if !tt.HasText("Antigravity") || !tt.HasText("42%") {
+		t.Fatalf("expected dropdown menu with Antigravity (42%%), got: %q", tt.Texts())
+	}
+	saveSnap("popover-dropdown.png", tt)
+
+	if err := tt.Click("Claude 用量"); err != nil {
+		t.Fatalf("re-click Claude header trigger failed: %v", err)
+	}
+	if tt.HasText("Antigravity") {
+		t.Fatalf("expected dropdown menu to close on second trigger click, still got: %q", tt.Texts())
+	}
+
+	// Open dropdown and click Antigravity to switch view
+	if err := tt.Click("Claude 用量"); err != nil {
+		t.Fatalf("click Claude header trigger failed: %v", err)
+	}
 	if err := tt.Click("Antigravity"); err != nil {
-		t.Fatalf("click Antigravity switcher failed: %v", err)
+		t.Fatalf("click Antigravity dropdown item failed: %v", err)
 	}
 	if changedCount != 1 {
 		t.Fatalf("expected OnProviderChanged=1, got %d", changedCount)
@@ -209,19 +242,6 @@ func TestAntigravityPopoverSwitchAndRender(t *testing.T) {
 		}
 	}
 
-	snapDir := os.Getenv("CCMONITOR_SNAPSHOT_DIR")
-	saveSnap := func(name string, tester *ui.Tester) {
-		if snapDir == "" {
-			return
-		}
-		_ = os.MkdirAll(snapDir, 0o755)
-		if img := tester.Image(); img != nil {
-			if f, err := os.Create(filepath.Join(snapDir, name)); err == nil {
-				_ = png.Encode(f, img)
-				f.Close()
-			}
-		}
-	}
 	saveSnap("popover-ag.png", tt)
 
 	// Antigravity Floating Pill renders cleanly
@@ -245,9 +265,12 @@ func TestAntigravityPopoverSwitchAndRender(t *testing.T) {
 		}
 	}
 
-	// Switch back to Claude cleanly
+	// Switch back to Claude cleanly via header dropdown
+	if err := tt.Click("Antigravity 用量"); err != nil {
+		t.Fatalf("click Antigravity header trigger failed: %v", err)
+	}
 	if err := tt.Click("Claude"); err != nil {
-		t.Fatalf("click Claude switcher failed: %v", err)
+		t.Fatalf("click Claude dropdown item failed: %v", err)
 	}
 	if !tt.HasText("Claude 用量") || changedCount != 2 {
 		t.Fatalf("expected switch back to Claude view, changedCount=%d", changedCount)

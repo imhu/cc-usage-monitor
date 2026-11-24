@@ -13,12 +13,11 @@ import (
 	"ccmonitor/internal/service"
 )
 
-func (m *PopoverModel) renderAGHeader(c *ui.Context, st service.ViewState, zh bool) {
+func (m *PopoverModel) renderAGHeader(c *ui.Context, st service.ViewState, now time.Time, zh bool) {
 	off := st.AG.OfficialReport
 	local := st.AG.LocalReport
-	ui.Row(c).FillWidth().Height(22).Margin(0, 0, 8, 0).Gap(8).AlignItems(ui.Center).Children(func() {
-		AntigravityLogo(c, 15, 0)
-		ui.Text(c, tr(zh, "Antigravity 用量", "Antigravity usage")).FontSize(13).FontWeight(600).TextColor(ColorText).SingleLine()
+	ui.Row(c).FillWidth().Height(24).Margin(0, 0, 10, 0).Gap(8).AlignItems(ui.Center).Children(func() {
+		m.renderProviderTrigger(c, st, now, zh)
 		ui.Spacer(c)
 
 		if off.PlanTier != "" {

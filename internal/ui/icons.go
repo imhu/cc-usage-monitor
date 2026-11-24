@@ -33,6 +33,7 @@ var (
 	IconFolder  = wrapIconSVG(`<path d="M3.5 7.4c0-1.3 1-2.4 2.4-2.4h3.5c.6 0 1.2.3 1.6.7l1.2 1.4h5.9c1.3 0 2.4 1.1 2.4 2.4v7.7c0 1.3-1.1 2.4-2.4 2.4H5.9c-1.3 0-2.4-1.1-2.4-2.4Z"/><path d="M3.5 10.4h17"/>`)
 	IconChevDn  = wrapIconSVG(`<path d="m6.5 9.5 5.5 5.5 5.5-5.5"/>`)
 	IconChevRt  = wrapIconSVG(`<path d="m9.5 6.5 5.5 5.5-5.5 5.5"/>`)
+	IconCheck   = wrapIconSVG(`<path d="m5 12.5 4.5 4.5L19 7.5"/>`)
 	IconGlobe   = wrapIconSVG(`<circle cx="12" cy="12" r="8.6"/><path d="M3.6 12h16.8"/><path d="M12 3.4c2.2 2.3 3.4 5.2 3.4 8.6s-1.2 6.3-3.4 8.6c-2.2-2.3-3.4-5.2-3.4-8.6S9.8 5.7 12 3.4Z"/>`)
 	IconShield  = wrapIconSVG(`<path d="M12 3.2 5 6.2v5.4c0 4.5 3 8 7 9.2 4-1.2 7-4.7 7-9.2V6.2Z"/><path d="m9.2 12.2 2 2 3.8-4.2"/>`)
 )
