@@ -30,10 +30,16 @@ func AggregateAGUsage(records []AGTranscriptRecord, conversationCount int, now t
 		monthStartForRecords = monthBoundsStart
 	}
 
-	var todayRecs, fiveHourRecs, weekRecs, monthRecs []AGTranscriptRecord
+	var todayRecs, fiveHourRecs, weekRecs, monthRecs, allValidRecs []AGTranscriptRecord
+	var earliest *time.Time
 	for _, r := range records {
 		if r.Timestamp.After(now) {
 			continue
+		}
+		allValidRecs = append(allValidRecs, r)
+		if earliest == nil || r.Timestamp.Before(*earliest) {
+			t := r.Timestamp
+			earliest = &t
 		}
 		if !r.Timestamp.Before(todayStart) {
 			todayRecs = append(todayRecs, r)
@@ -50,11 +56,13 @@ func AggregateAGUsage(records []AGTranscriptRecord, conversationCount int, now t
 	}
 
 	return AGLocalUsageReport{
-		Today:             summarizeAGRecords(todayRecs),
-		FiveHour:          summarizeAGRecords(fiveHourRecs),
-		Week:              summarizeAGRecords(weekRecs),
-		Month:             summarizeAGRecords(monthRecs),
-		WeekPeriod:        &weekPeriod,
+		Today:              summarizeAGRecords(todayRecs),
+		FiveHour:           summarizeAGRecords(fiveHourRecs),
+		Week:               summarizeAGRecords(weekRecs),
+		Month:              summarizeAGRecords(monthRecs),
+		AllTime:            summarizeAGRecords(allValidRecs),
+		EarliestRecordDate: earliest,
+		WeekPeriod:         &weekPeriod,
 		MonthPeriod:       monthPeriod,
 		OutputSpeed:       EstimateAGOutputSpeed(records, now),
 		ByModelMonth:      summarizeAGByModel(monthRecs),

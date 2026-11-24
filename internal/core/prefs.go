@@ -78,6 +78,8 @@ type Preferences struct {
 	AGCollapsedSpend     bool        `json:"agCollapsedSpend"`
 	AGAlertEnabled       bool        `json:"agAlertEnabled"`
 	AGBillingReminders   bool        `json:"agBillingReminders"`
+	AGSavedFullWeekCostUSD float64   `json:"agSavedFullWeekCostUsd,omitempty"`
+	AGSavedFullWeekTokens  int64     `json:"agSavedFullWeekTokens,omitempty"`
 
 	// Menubar / Tray & Floating Pill tab
 	IconStyle          IconStyle `json:"iconStyle"`

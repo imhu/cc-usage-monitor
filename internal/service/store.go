@@ -1598,18 +1598,21 @@ func (s *Store) UpdatePrefs(fn func(*core.Preferences)) {
 	} else if claudeDirChanged || s.officialState == OfficialDisabled {
 		s.officialState = OfficialConnecting
 	}
+	started := s.ctx != nil
 	s.recomputeSnapshotLocked(time.Now())
 	_ = core.SavePreferences(s.prefsPath, s.prefs)
 	s.mu.Unlock()
 	s.notify()
 
-	if agWatchChanged {
-		go s.startAGWatchers()
-	}
-	if agToggledOn {
-		go s.RefreshAntigravity(true)
-	} else if agRefreshNeeded {
-		go s.RefreshAntigravity(false)
+	if started {
+		if agWatchChanged {
+			go s.startAGWatchers()
+		}
+		if agToggledOn {
+			go s.RefreshAntigravity(true)
+		} else if agRefreshNeeded {
+			go s.RefreshAntigravity(false)
+		}
 	}
 
 	if proxyChanged {

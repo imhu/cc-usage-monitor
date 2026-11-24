@@ -122,10 +122,10 @@ func (s *AGSilentSyncer) Sync(ctx context.Context, agyPath, snapshotPath string,
 		}
 		if parsed := core.LoadAGSnapshot(probePath); parsed != nil {
 			latest = parsed
-			if parsed.AgentState == "authenticating" && len(parsed.Quota) == 0 {
+			if parsed.AgentState == "authenticating" && len(parsed.Quota) == 0 && strings.TrimSpace(parsed.Email) == "" {
 				if firstAuthAt.IsZero() {
 					firstAuthAt = time.Now()
-				} else if time.Since(firstAuthAt) >= 3*time.Second {
+				} else if time.Since(firstAuthAt) >= 5*time.Second {
 					sawAuthRequired = true
 					break
 				}

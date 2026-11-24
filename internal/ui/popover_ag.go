@@ -3,6 +3,7 @@ package appui
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -212,35 +213,16 @@ func (m *PopoverModel) renderAGLimitsSection(c *ui.Context, st service.ViewState
 			return
 		}
 
-		if st.Prefs.LimitsDisplay == core.DisplayCompact {
-			ui.Column(c).FillWidth().Gap(8).Children(func() {
-				for _, b := range off.Buckets {
-					var mark *float64
-					if b.SafeLineFraction != nil && !b.IsResetElapsed {
-						v := *b.SafeLineFraction
-						mark = &v
-					}
-					valCol := AGLevelColor(b.UsedFraction, b.IsOverPace())
-					if b.IsResetElapsed {
-						valCol = ColorAGSafeGreen
-					}
-					ui.Row(c.Key("ag-cl-"+b.BucketID)).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
-						ui.Text(c, core.AGBucketShortName(b.BucketID, b.WindowKind, zh)).Width(68).FontSize(12).TextColor(ColorText).SingleLine()
-						ui.Box(c).Grow(1).Children(func() {
-							ThinBar(c, "ag-cbar-"+b.BucketID, b.UsedFraction, AGLevelColor(b.UsedFraction, false), mark, b.IsOverPace(), nil)
-						})
-						ui.Text(c, fmt.Sprintf("%d%%", b.UsedPercentInt())).Width(34).TextAlign(ui.End).
-							FontSize(12).FontWeight(500).TextColor(valCol).FontFeatures("tnum").SingleLine()
-					})
+		groups := groupAGQuotaBuckets(off.Buckets, zh)
+		isCompact := st.Prefs.LimitsDisplay == core.DisplayCompact
+		ui.Column(c).FillWidth().Gap(10).Children(func() {
+			for idx, grp := range groups {
+				if idx > 0 {
+					Hairline(c)
 				}
-			})
-		} else {
-			ui.Column(c).FillWidth().Gap(9).Children(func() {
-				for _, b := range off.Buckets {
-					m.renderAGLimitRowDetailed(c, b, st.Prefs, zh)
-				}
-			})
-		}
+				m.renderAGQuotaGroup(c, grp, isCompact, st.Prefs, zh)
+			}
+		})
 
 		if needsLogin {
 			EmptyNote(c, IconTerm, tr(zh, "agy CLI 登录已失效", "agy CLI sign-in required"),
@@ -253,7 +235,200 @@ func (m *PopoverModel) renderAGLimitsSection(c *ui.Context, st service.ViewState
 	})
 }
 
-func (m *PopoverModel) renderAGLimitRowDetailed(c *ui.Context, b core.AGQuotaBucketEval, prefs core.Preferences, zh bool) {
+type agQuotaGroup struct {
+	ID        string
+	Title     string
+	Accent    ui.Color
+	IsPrimary bool
+	Buckets   []core.AGQuotaBucketEval
+}
+
+func (g agQuotaGroup) isAllUnused() bool {
+	for _, b := range g.Buckets {
+		if b.UsedPercentInt() != 0 || b.IsResetElapsed {
+			return false
+		}
+	}
+	return len(g.Buckets) > 0
+}
+
+func agGroupKey(bucketID string) string {
+	lower := strings.ToLower(bucketID)
+	switch {
+	case strings.Contains(lower, "gemini"):
+		return "gemini"
+	case strings.Contains(lower, "3p") || strings.Contains(lower, "third"):
+		return "3p"
+	case strings.Contains(lower, "claude"):
+		return "claude"
+	case strings.Contains(lower, "gpt"):
+		return "gpt"
+	default:
+		k := strings.ReplaceAll(lower, "-5h", "")
+		k = strings.ReplaceAll(k, "-weekly", "")
+		return strings.TrimSpace(k)
+	}
+}
+
+func groupAGQuotaBuckets(buckets []core.AGQuotaBucketEval, zh bool) []agQuotaGroup {
+	byKey := map[string][]core.AGQuotaBucketEval{}
+	for _, b := range buckets {
+		k := agGroupKey(b.BucketID)
+		byKey[k] = append(byKey[k], b)
+	}
+	orderRank := func(k string) int {
+		switch k {
+		case "gemini":
+			return 0
+		case "3p":
+			return 1
+		default:
+			return 2
+		}
+	}
+	keys := make([]string, 0, len(byKey))
+	for k := range byKey {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		ri, rj := orderRank(keys[i]), orderRank(keys[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return keys[i] < keys[j]
+	})
+
+	winRank := func(k core.AGQuotaWindowKind) int {
+		switch k {
+		case core.AGWindowFiveHour:
+			return 0
+		case core.AGWindowWeekly:
+			return 1
+		default:
+			return 2
+		}
+	}
+
+	groups := make([]agQuotaGroup, 0, len(keys))
+	for _, k := range keys {
+		list := byKey[k]
+		sort.Slice(list, func(i, j int) bool {
+			wi, wj := winRank(list[i].WindowKind), winRank(list[j].WindowKind)
+			if wi != wj {
+				return wi < wj
+			}
+			return list[i].BucketID < list[j].BucketID
+		})
+		var title string
+		accent := ColorSecondary
+		switch k {
+		case "gemini":
+			title = "Gemini"
+			accent = ColorAGAccent
+		case "3p":
+			title = tr(zh, "第三方模型", "Third-Party")
+			accent = ui.Hex("#C4B5FD")
+		default:
+			if k != "" {
+				title = strings.ToUpper(k[:1]) + k[1:]
+			} else {
+				title = k
+			}
+		}
+		groups = append(groups, agQuotaGroup{
+			ID:        k,
+			Title:     title,
+			Accent:    accent,
+			IsPrimary: k == "gemini",
+			Buckets:   list,
+		})
+	}
+	return groups
+}
+
+func agQuotaRowTitle(b core.AGQuotaBucketEval, zh bool) string {
+	switch b.WindowKind {
+	case core.AGWindowFiveHour:
+		return tr(zh, "5 小时", "5-hour")
+	case core.AGWindowWeekly:
+		return tr(zh, "本周", "Weekly")
+	default:
+		return core.AGBucketDisplayName(b.BucketID, b.WindowKind, zh)
+	}
+}
+
+func (m *PopoverModel) renderAGQuotaGroup(c *ui.Context, g agQuotaGroup, isCompact bool, prefs core.Preferences, zh bool) {
+	canAutoCollapse := !g.IsPrimary && g.isAllUnused()
+	expanded := !canAutoCollapse || m.agExpandedQuotaGroups[g.ID]
+
+	ui.Column(c.Key("ag-grp-"+g.ID)).FillWidth().Gap(8).Children(func() {
+		if canAutoCollapse {
+			hdr := ui.Row(c.Key("ag-qgrp-"+g.ID)).FillWidth().Height(20).AlignItems(ui.Center).Gap(6).Cursor(ui.CursorPointer)
+			if hdr.Clicked() {
+				if m.agExpandedQuotaGroups == nil {
+					m.agExpandedQuotaGroups = map[string]bool{}
+				}
+				m.agExpandedQuotaGroups[g.ID] = !m.agExpandedQuotaGroups[g.ID]
+			}
+			hdr.Children(func() {
+				ui.Text(c, g.Title).FontSize(11).FontWeight(500).TextColor(g.Accent).SingleLine()
+				if !expanded {
+					ui.Text(c, tr(zh, "本周期未使用", "Not used yet")).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
+				}
+				ui.Spacer(c)
+				if !expanded {
+					ui.Text(c, "0%").FontSize(10.5).FontWeight(500).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
+					ui.Icon(c, IconChevRt).FontSize(9).TextColor(ColorTertiary)
+				} else {
+					ui.Text(c, tr(zh, "收起", "Hide")).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
+					ui.Icon(c, IconChevDn).FontSize(9).TextColor(ColorTertiary)
+				}
+			})
+		} else {
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
+				ui.Text(c, g.Title).FontSize(11).FontWeight(500).TextColor(g.Accent).SingleLine()
+				ui.Spacer(c)
+			})
+		}
+
+		if !expanded {
+			return
+		}
+
+		gap := float32(9)
+		if isCompact {
+			gap = 8
+		}
+		ui.Column(c).FillWidth().Gap(gap).Children(func() {
+			for _, b := range g.Buckets {
+				rowTitle := agQuotaRowTitle(b, zh)
+				if isCompact {
+					var mark *float64
+					if b.SafeLineFraction != nil && !b.IsResetElapsed {
+						v := *b.SafeLineFraction
+						mark = &v
+					}
+					valCol := AGLevelColor(b.UsedFraction, b.IsOverPace())
+					if b.IsResetElapsed {
+						valCol = ColorAGSafeGreen
+					}
+					ui.Row(c.Key("ag-cl-"+b.BucketID)).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
+						ui.Text(c, rowTitle).Width(52).FontSize(12).TextColor(ColorText).SingleLine()
+						ui.Box(c).Grow(1).Children(func() {
+							ThinBar(c, "ag-cbar-"+b.BucketID, b.UsedFraction, AGLevelColor(b.UsedFraction, false), mark, b.IsOverPace(), nil)
+						})
+						ui.Text(c, fmt.Sprintf("%d%%", b.UsedPercentInt())).Width(34).TextAlign(ui.End).
+							FontSize(12).FontWeight(500).TextColor(valCol).FontFeatures("tnum").SingleLine()
+					})
+				} else {
+					m.renderAGLimitRowDetailed(c, b, rowTitle, prefs, zh)
+				}
+			}
+		})
+	})
+}
+
+func (m *PopoverModel) renderAGLimitRowDetailed(c *ui.Context, b core.AGQuotaBucketEval, title string, prefs core.Preferences, zh bool) {
 	valCol := AGLevelColor(b.UsedFraction, b.IsOverPace())
 	if b.IsResetElapsed {
 		valCol = ColorAGSafeGreen
@@ -264,7 +439,6 @@ func (m *PopoverModel) renderAGLimitRowDetailed(c *ui.Context, b core.AGQuotaBuc
 		mark = &v
 	}
 	pointing := m.agHoveredBucket[b.BucketID]
-	title := core.AGBucketDisplayName(b.BucketID, b.WindowKind, zh)
 
 	ui.Column(c.Key("ag-lr-"+b.BucketID)).FillWidth().Gap(3).Children(func() {
 		ui.Row(c).FillWidth().AlignItems(ui.Baseline).Children(func() {
@@ -278,15 +452,19 @@ func (m *PopoverModel) renderAGLimitRowDetailed(c *ui.Context, b core.AGQuotaBuc
 		m.agHoveredBucket[b.BucketID] = pointing
 
 		ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
-			if pointing && mark != nil {
-				markStr := core.FormatSafePercent(*mark)
-				if b.IsOverPace() {
-					ui.Text(c, tr(zh, "安全线 "+markStr+" · 已超速", "Safe line "+markStr+" · Over pace")).
+			if safePct := b.SafeLinePercentInt(); pointing && safePct != nil && !b.IsResetElapsed {
+				if b.IsPaceSettling {
+					ui.Text(c, tr(zh, fmt.Sprintf("安全线 %d%% · 刚开启周期", *safePct),
+						fmt.Sprintf("Safe line %d%% · Settling", *safePct))).
+						FontSize(10.5).TextColor(ColorSecondary).FontFeatures("tnum").SingleLine()
+				} else if b.IsOverPace() {
+					ui.Text(c, tr(zh, fmt.Sprintf("安全线 %d%% · 已超速", *safePct),
+						fmt.Sprintf("Safe line %d%% · Over pace", *safePct))).
 						FontSize(10.5).TextColor(ColorCritical).FontFeatures("tnum").SingleLine()
 				} else {
-					headroom := max(0.0, *mark-b.UsedFraction)
-					ui.Text(c, tr(zh, "安全线 "+markStr+" · 安全余量 "+core.FormatSafePercent(headroom),
-						"Safe line "+markStr+" · Headroom "+core.FormatSafePercent(headroom))).
+					headroomPct := max(0, *safePct-b.UsedPercentInt())
+					ui.Text(c, tr(zh, fmt.Sprintf("安全线 %d%% · 安全余量 %d%%", *safePct, headroomPct),
+						fmt.Sprintf("Safe line %d%% · Headroom %d%%", *safePct, headroomPct))).
 						FontSize(10.5).TextColor(ColorSecondary).FontFeatures("tnum").SingleLine()
 				}
 			} else if b.IsResetElapsed {
@@ -535,45 +713,91 @@ func (m *PopoverModel) renderAGSpendSection(c *ui.Context, st service.ViewState,
 			})
 		})
 
-		// Projection based on official weekly usage fraction
+		// 3-tier Spend Projection:
+		// 1) Current week official ratio (>= 10% usage),
+		// 2) Borrowed full-week basis from a previous >= 10% week,
+		// 3) Fallback to current-period daily run-rate.
 		var projCost *float64
-		if span != core.SpanDay && off.PrimaryWeekly != nil && !off.PrimaryWeekly.IsResetElapsed &&
-			off.PrimaryWeekly.UsedFraction >= 0.01 && local.Week.EstimatedCostUSD > 0 {
-			fullWeek := local.Week.EstimatedCostUSD / off.PrimaryWeekly.UsedFraction
-			v := fullWeek
-			if span == core.SpanMonth {
-				days := 30.0
-				if local.MonthPeriod != nil && local.MonthPeriod.TotalDays > 0 {
-					days = float64(local.MonthPeriod.TotalDays)
-				}
-				v = fullWeek * (days / 7.0)
+		var projTokens int64
+		projIsRunRate := false
+		if span != core.SpanDay {
+			monthDays := 30.0
+			if local.MonthPeriod != nil && local.MonthPeriod.TotalDays > 0 {
+				monthDays = float64(local.MonthPeriod.TotalDays)
 			}
-			projCost = &v
+			weeksInMonth := monthDays / 7.0
+			if off.PrimaryWeekly != nil && !off.PrimaryWeekly.IsResetElapsed &&
+				off.PrimaryWeekly.UsedFraction >= 0.10 && local.Week.EstimatedCostUSD > 0 {
+				fullWeekCost := local.Week.EstimatedCostUSD / off.PrimaryWeekly.UsedFraction
+				fullWeekTok := float64(local.Week.TotalTokens()) / off.PrimaryWeekly.UsedFraction
+				if span == core.SpanMonth {
+					v := fullWeekCost * weeksInMonth
+					projCost = &v
+					projTokens = int64(fullWeekTok * weeksInMonth)
+				} else {
+					v := fullWeekCost
+					projCost = &v
+					projTokens = int64(fullWeekTok)
+				}
+			} else if st.Prefs.AGSavedFullWeekCostUSD > 0 {
+				fullWeekCost := st.Prefs.AGSavedFullWeekCostUSD
+				fullWeekTok := float64(st.Prefs.AGSavedFullWeekTokens)
+				if span == core.SpanMonth {
+					v := fullWeekCost * weeksInMonth
+					projCost = &v
+					projTokens = int64(fullWeekTok * weeksInMonth)
+				} else {
+					v := fullWeekCost
+					projCost = &v
+					projTokens = int64(fullWeekTok)
+				}
+			} else if period != nil && period.CurrentDay >= 1 && summary.EstimatedCostUSD > 0 {
+				scale := float64(period.TotalDays) / float64(period.CurrentDay)
+				v := summary.EstimatedCostUSD * scale
+				projCost = &v
+				projTokens = int64(float64(summary.TotalTokens()) * scale)
+				projIsRunRate = true
+			}
 		}
 
 		// Big amount + projected + 14-day bars
 		ui.Row(c).FillWidth().AlignItems(ui.End).Gap(8).Children(func() {
 			ui.Column(c).Grow(1).Gap(4).Children(func() {
-				amtRow := ui.Row(c.Key("ag-spend-amt")).AlignItems(ui.Baseline).Gap(6).Cursor(ui.CursorPointer)
-				if amtRow.Clicked() {
-					m.Store.UpdatePrefs(func(pr *core.Preferences) {
-						idx := 0
-						for i, cur := range core.AllCurrencies {
-							if cur == pr.Currency {
-								idx = i
-								break
+				ui.Row(c).AlignItems(ui.Baseline).Gap(6).Children(func() {
+					amtBtn := ui.Row(c.Key("ag-spend-amt")).AlignItems(ui.Baseline).Cursor(ui.CursorPointer)
+					if amtBtn.Clicked() {
+						m.Store.UpdatePrefs(func(pr *core.Preferences) {
+							idx := 0
+							for i, cur := range core.AllCurrencies {
+								if cur == pr.Currency {
+									idx = i
+									break
+								}
 							}
-						}
-						pr.Currency = core.AllCurrencies[(idx+1)%len(core.AllCurrencies)]
+							pr.Currency = core.AllCurrencies[(idx+1)%len(core.AllCurrencies)]
+						})
+					}
+					amtBtn.Tooltip(tr(zh, "API 等价花费估算（按公开单价折算本地对话日志）。点击金额切换货币。",
+						"API-equivalent spend estimate from local logs. Click amount to cycle currency."))
+					amtBtn.Children(func() {
+						ui.Text(c, money.Format(summary.EstimatedCostUSD)).FontSize(26).FontWeight(600).LetterSpacing(-0.4).TextColor(ColorText).FontFeatures("tnum").SingleLine()
 					})
-				}
-				amtRow.Tooltip(tr(zh, "API 等价花费估算（按公开单价折算本地对话日志）。点击金额切换货币。",
-					"API-equivalent spend estimate from local logs. Click amount to cycle currency."))
-				amtRow.Children(func() {
-					ui.Text(c, money.Format(summary.EstimatedCostUSD)).FontSize(26).FontWeight(600).LetterSpacing(-0.4).TextColor(ColorText).FontFeatures("tnum").SingleLine()
+
 					if projCost != nil {
+						projTip := tr(zh,
+							fmt.Sprintf("满额预计用量：%s · ~%s tokens\n按官方周限额已用比例推算用满 100%% 时的大致总量，仅供体感参考。",
+								money.Whole(*projCost), core.FormatMagnitude(projTokens, zh)),
+							fmt.Sprintf("Projected full-limit usage: %s · ~%s tokens\nExtrapolated from official weekly limit percentage assuming 100%% usage.",
+								money.Whole(*projCost), core.FormatMagnitude(projTokens, zh)))
+						if projIsRunRate {
+							projTip = tr(zh,
+								fmt.Sprintf("按当前节奏预计：%s · ~%s tokens\n本周额度尚不足 10%%，暂按本周期日均消耗推算；达到 10%% 后自动切换为官方配额满额推算。",
+									money.Whole(*projCost), core.FormatMagnitude(projTokens, zh)),
+								fmt.Sprintf("Projected at current pace: %s · ~%s tokens\nWeekly usage is under 10%%; extrapolated from current daily pace until 10%% is reached.",
+									money.Whole(*projCost), core.FormatMagnitude(projTokens, zh)))
+						}
 						ui.Text(c, tr(zh, "预计 "+money.Whole(*projCost), "→ "+money.Whole(*projCost))).
-							FontSize(12).FontWeight(500).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
+							FontSize(12).FontWeight(500).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine().Tooltip(projTip)
 					}
 				})
 

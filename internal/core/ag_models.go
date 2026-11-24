@@ -137,11 +137,13 @@ func (s AGSpeedSnapshot) DisplayTokPerSec() *float64 {
 }
 
 type AGLocalUsageReport struct {
-	Today             AGUsageWindowSummary
-	FiveHour          AGUsageWindowSummary
-	Week              AGUsageWindowSummary
-	Month             AGUsageWindowSummary
-	WeekPeriod        *AGBillingPeriodInfo
+	Today              AGUsageWindowSummary
+	FiveHour           AGUsageWindowSummary
+	Week               AGUsageWindowSummary
+	Month              AGUsageWindowSummary
+	AllTime            AGUsageWindowSummary
+	EarliestRecordDate *time.Time
+	WeekPeriod         *AGBillingPeriodInfo
 	MonthPeriod       *AGBillingPeriodInfo
 	OutputSpeed       AGSpeedSnapshot
 	ByModelMonth      []AGModelUsageSummary
@@ -302,6 +304,7 @@ type AGQuotaBucketEval struct {
 	UsedFraction        float64
 	RemainingFraction   float64
 	SafeLineFraction    *float64
+	IsPaceSettling      bool
 	ResetTime           *time.Time
 	RemainingUntilReset *time.Duration
 	IsResetElapsed      bool
@@ -319,11 +322,37 @@ func (b AGQuotaBucketEval) UsedPercentInt() int {
 	return int(math.Floor(clamped*100.0 + 1e-9))
 }
 
+func (b AGQuotaBucketEval) RemainingPercentInt() int {
+	rem := 100 - b.UsedPercentInt()
+	if rem < 0 {
+		return 0
+	}
+	return rem
+}
+
+func (b AGQuotaBucketEval) SafeLinePercentInt() *int {
+	if b.SafeLineFraction == nil {
+		return nil
+	}
+	clamped := *b.SafeLineFraction
+	if math.IsNaN(clamped) || clamped < 0 {
+		clamped = 0
+	} else if clamped > 1 {
+		clamped = 1
+	}
+	v := int(math.Floor(clamped*100.0 + 1e-9))
+	return &v
+}
+
 func (b AGQuotaBucketEval) IsOverPace() bool {
-	if b.SafeLineFraction == nil || b.IsResetElapsed {
+	if b.IsPaceSettling || b.IsResetElapsed {
 		return false
 	}
-	return b.UsedFraction > *b.SafeLineFraction+1e-9
+	safePct := b.SafeLinePercentInt()
+	if safePct == nil {
+		return false
+	}
+	return b.UsedPercentInt() > *safePct
 }
 
 type AGOfficialQuotaReport struct {

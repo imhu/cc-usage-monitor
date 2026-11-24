@@ -183,6 +183,48 @@ func TestAGQuotaEvaluationAndResetZero(t *testing.T) {
 	if decoded.CapturedTime() == nil || decoded.CapturedTime().Unix() != 1763899200 {
 		t.Fatalf("expected unix ms decoded to 1763899200, got %+v", decoded.CapturedTime())
 	}
+
+	// Inactive bucket with Unix epoch 1970-01-01 must NOT be marked reset elapsed
+	rSecZero := 0
+	remOne := 1.0
+	inactiveSnap := &AGStatusLineSnapshot{
+		Quota: map[string]AGStatusLineQuotaBucket{
+			"gemini-5h": {RemainingFraction: &remOne, ResetTime: "1970-01-01T00:00:00Z", ResetInSeconds: &rSecZero},
+		},
+		CapturedAt: &AGFlexibleTime{T: &now},
+	}
+	inactiveRep := EvaluateAGQuota(inactiveSnap, now)
+	if inactiveRep.PrimaryFiveHour == nil || inactiveRep.PrimaryFiveHour.ResetTime != nil ||
+		inactiveRep.PrimaryFiveHour.IsResetElapsed || inactiveRep.PrimaryFiveHour.RemainingPercentInt() != 100 {
+		t.Fatalf("unexpected inactive bucket eval: %+v", inactiveRep.PrimaryFiveHour)
+	}
+
+	// Integer percentage self-consistency: 40.2% vs safe 40.1% -> both 40% => not over pace
+	safe40 := 0.401
+	bSelf := AGQuotaBucketEval{UsedFraction: 0.402, SafeLineFraction: &safe40}
+	if bSelf.UsedPercentInt() != 40 || *bSelf.SafeLinePercentInt() != 40 || bSelf.IsOverPace() {
+		t.Fatalf("expected 40%% vs 40%% not over pace, got used=%d safe=%d over=%v",
+			bSelf.UsedPercentInt(), *bSelf.SafeLinePercentInt(), bSelf.IsOverPace())
+	}
+
+	// 5-hour settling buffer: first 10% (30 min) does not trigger over-pace warning
+	remSettling := 0.985
+	rSecSettling := 17940
+	settlingSnap := &AGStatusLineSnapshot{
+		Quota: map[string]AGStatusLineQuotaBucket{
+			"gemini-5h": {
+				RemainingFraction: &remSettling,
+				ResetTime:         now.Add(5*time.Hour - time.Minute).UTC().Format(time.RFC3339),
+				ResetInSeconds:    &rSecSettling,
+			},
+		},
+		CapturedAt: &AGFlexibleTime{T: &now},
+	}
+	settlingRep := EvaluateAGQuota(settlingSnap, now)
+	if settlingRep.PrimaryFiveHour == nil || settlingRep.PrimaryFiveHour.UsedPercentInt() != 1 ||
+		!settlingRep.PrimaryFiveHour.IsPaceSettling || settlingRep.PrimaryFiveHour.IsOverPace() {
+		t.Fatalf("expected 1%% in settling window not over pace, got %+v", settlingRep.PrimaryFiveHour)
+	}
 }
 
 func TestAGAggregatorAndSpeedEstimation(t *testing.T) {
@@ -203,6 +245,9 @@ func TestAGAggregatorAndSpeedEstimation(t *testing.T) {
 	}
 	if report.Week.RequestCount != 4 || len(report.DailyTrend) != 14 {
 		t.Fatalf("expected 4 weekly reqs & 14-day trend, got %d / %d", report.Week.RequestCount, len(report.DailyTrend))
+	}
+	if report.AllTime.RequestCount != 4 || report.AllTime.TotalTokens() < report.Week.TotalTokens() || report.EarliestRecordDate == nil {
+		t.Fatalf("unexpected AllTime summary: %+v earliest=%v", report.AllTime, report.EarliestRecordDate)
 	}
 	if report.MonthPeriod == nil {
 		t.Fatal("expected MonthPeriod when billingDay=15")

@@ -36,24 +36,26 @@ type PopoverModel struct {
 	hoveredReply          uint64
 
 	// Antigravity ephemeral UI state
-	agProcExpanded  bool
-	agHoveredBucket map[string]bool
-	agHoveredBar    int
-	agHoveredSpark  int
-	agShowDotChart  bool
-	agHoveredDotID  int
+	agProcExpanded        bool
+	agHoveredBucket       map[string]bool
+	agExpandedQuotaGroups map[string]bool
+	agHoveredBar          int
+	agHoveredSpark        int
+	agShowDotChart        bool
+	agHoveredDotID        int
 }
 
 func NewPopoverModel(store *service.Store, actions PopoverActions) *PopoverModel {
 	return &PopoverModel{
-		Store:           store,
-		Actions:         actions,
-		hoveredBar:      map[string]bool{},
-		hoveredDay:      -1,
-		hoveredAge:      -1,
-		agHoveredBucket: map[string]bool{},
-		agHoveredBar:    -1,
-		agHoveredSpark:  -1,
+		Store:                 store,
+		Actions:               actions,
+		hoveredBar:            map[string]bool{},
+		hoveredDay:            -1,
+		hoveredAge:            -1,
+		agHoveredBucket:       map[string]bool{},
+		agExpandedQuotaGroups: map[string]bool{},
+		agHoveredBar:          -1,
+		agHoveredSpark:        -1,
 	}
 }
 
@@ -72,6 +74,9 @@ func (m *PopoverModel) ResetHover() {
 	m.agHoveredDotID = 0
 	for k := range m.agHoveredBucket {
 		delete(m.agHoveredBucket, k)
+	}
+	for k := range m.agExpandedQuotaGroups {
+		delete(m.agExpandedQuotaGroups, k)
 	}
 }
 

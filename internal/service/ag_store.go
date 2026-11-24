@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -183,6 +184,18 @@ func (s *Store) RefreshAntigravity(forceSync bool) {
 	s.agCLIPath = cliPath
 	s.agOfficial = official
 	s.agLocal = local
+	if official.PrimaryWeekly != nil &&
+		!official.PrimaryWeekly.IsResetElapsed &&
+		official.PrimaryWeekly.UsedFraction >= 0.10 &&
+		local.Week.EstimatedCostUSD > 0 {
+		fullCost := local.Week.EstimatedCostUSD / official.PrimaryWeekly.UsedFraction
+		fullToks := int64(float64(local.Week.TotalTokens()) / official.PrimaryWeekly.UsedFraction)
+		if math.Abs(s.prefs.AGSavedFullWeekCostUSD-fullCost) > 0.01 || s.prefs.AGSavedFullWeekTokens != fullToks {
+			s.prefs.AGSavedFullWeekCostUSD = fullCost
+			s.prefs.AGSavedFullWeekTokens = fullToks
+			_ = core.SavePreferences(s.prefsPath, s.prefs)
+		}
+	}
 	s.agProcs = procs
 	s.agRefreshing = false
 	if official.AgentState == "authenticating" && len(official.Buckets) == 0 {

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
@@ -8,34 +9,56 @@ import (
 	"time"
 )
 
+const (
+	FXEndpoint        = "https://api.frankfurter.app/latest?from=USD"
+	FXRefreshInterval = time.Hour
+)
+
 type CurrencyUnit string
 
 const (
 	CurrencyUSD CurrencyUnit = "USD"
 	CurrencyCNY CurrencyUnit = "CNY"
-	CurrencyEUR CurrencyUnit = "EUR"
 	CurrencyJPY CurrencyUnit = "JPY"
 	CurrencyGBP CurrencyUnit = "GBP"
+	CurrencyEUR CurrencyUnit = "EUR"
 	CurrencyHKD CurrencyUnit = "HKD"
+	CurrencySGD CurrencyUnit = "SGD"
+	CurrencyAUD CurrencyUnit = "AUD"
+	CurrencyCAD CurrencyUnit = "CAD"
+	CurrencyCHF CurrencyUnit = "CHF"
+	CurrencyKRW CurrencyUnit = "KRW"
 	CurrencyTWD CurrencyUnit = "TWD"
 )
 
 var AllCurrencies = []CurrencyUnit{
-	CurrencyUSD, CurrencyCNY, CurrencyEUR, CurrencyJPY, CurrencyGBP, CurrencyHKD, CurrencyTWD,
+	CurrencyUSD, CurrencyCNY, CurrencyJPY, CurrencyGBP, CurrencyEUR,
+	CurrencyHKD, CurrencySGD, CurrencyAUD, CurrencyCAD, CurrencyCHF,
+	CurrencyKRW, CurrencyTWD,
 }
 
 func (u CurrencyUnit) Symbol() string {
 	switch u {
 	case CurrencyCNY:
 		return "¥"
-	case CurrencyEUR:
-		return "€"
 	case CurrencyJPY:
-		return "¥"
+		return "JP¥"
 	case CurrencyGBP:
 		return "£"
+	case CurrencyEUR:
+		return "€"
 	case CurrencyHKD:
 		return "HK$"
+	case CurrencySGD:
+		return "S$"
+	case CurrencyAUD:
+		return "A$"
+	case CurrencyCAD:
+		return "C$"
+	case CurrencyCHF:
+		return "CHF "
+	case CurrencyKRW:
+		return "₩"
 	case CurrencyTWD:
 		return "NT$"
 	default:
@@ -46,15 +69,25 @@ func (u CurrencyUnit) Symbol() string {
 func (u CurrencyUnit) DefaultRate() float64 {
 	switch u {
 	case CurrencyCNY:
-		return 7.25
+		return 7.1
+	case CurrencyJPY:
+		return 149.0
+	case CurrencyGBP:
+		return 0.78
 	case CurrencyEUR:
 		return 0.92
-	case CurrencyJPY:
-		return 154.0
-	case CurrencyGBP:
-		return 0.79
 	case CurrencyHKD:
-		return 7.78
+		return 7.8
+	case CurrencySGD:
+		return 1.33
+	case CurrencyAUD:
+		return 1.52
+	case CurrencyCAD:
+		return 1.38
+	case CurrencyCHF:
+		return 0.88
+	case CurrencyKRW:
+		return 1380.0
 	case CurrencyTWD:
 		return 32.5
 	default:
@@ -64,11 +97,36 @@ func (u CurrencyUnit) DefaultRate() float64 {
 
 func (u CurrencyUnit) FractionDigits() int {
 	switch u {
-	case CurrencyJPY, CurrencyTWD:
+	case CurrencyJPY, CurrencyKRW, CurrencyTWD:
 		return 0
 	default:
 		return 2
 	}
+}
+
+// ParseFrankfurterRates decodes a Frankfurter API response (`?from=USD`) into a per-USD rate table.
+func ParseFrankfurterRates(data []byte) (map[string]float64, error) {
+	var raw struct {
+		Base  string             `json:"base"`
+		Rates map[string]float64 `json:"rates"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	if raw.Base != "USD" {
+		return nil, fmt.Errorf("unexpected FX base currency: %q", raw.Base)
+	}
+	out := make(map[string]float64, len(raw.Rates)+1)
+	for code, r := range raw.Rates {
+		if !math.IsNaN(r) && !math.IsInf(r, 0) && r > 0 {
+			out[strings.ToUpper(code)] = r
+		}
+	}
+	if _, ok := out["EUR"]; !ok {
+		return nil, fmt.Errorf("missing EUR rate in FX payload")
+	}
+	out["USD"] = 1.0
+	return out, nil
 }
 
 type MoneyFormat struct {
@@ -77,10 +135,20 @@ type MoneyFormat struct {
 }
 
 func NewMoneyFormat(unit CurrencyUnit) MoneyFormat {
+	return NewMoneyFormatWithRates(unit, nil)
+}
+
+func NewMoneyFormatWithRates(unit CurrencyUnit, perUSD map[string]float64) MoneyFormat {
 	if unit == "" {
 		unit = CurrencyUSD
 	}
-	return MoneyFormat{Unit: unit, Rate: unit.DefaultRate()}
+	rate := unit.DefaultRate()
+	if unit == CurrencyUSD {
+		rate = 1.0
+	} else if r, ok := perUSD[string(unit)]; ok && !math.IsNaN(r) && !math.IsInf(r, 0) && r > 0 {
+		rate = r
+	}
+	return MoneyFormat{Unit: unit, Rate: rate}
 }
 
 func (m MoneyFormat) Convert(usd float64) float64 {
@@ -91,21 +159,30 @@ func (m MoneyFormat) Convert(usd float64) float64 {
 	return usd * r
 }
 
-func (m MoneyFormat) Format(usd float64) string {
-	v := m.Convert(usd)
-	digits := m.Unit.FractionDigits()
-	if math.Abs(v) >= 1000 && digits > 0 {
-		digits = 2
+func (m MoneyFormat) FractionDigitsFor(usd float64) int {
+	if m.Unit.FractionDigits() == 0 {
+		return 0
 	}
-	return m.formatValue(v, digits)
+	if math.Abs(m.Convert(usd)) >= 10_000 {
+		return 0
+	}
+	return 2
+}
+
+func (m MoneyFormat) Format(usd float64) string {
+	return m.formatValue(m.Convert(usd), m.FractionDigitsFor(usd))
+}
+
+func (m MoneyFormat) FormatDigits(usd float64, digits int) string {
+	if m.Unit.FractionDigits() == 0 {
+		digits = 0
+	}
+	return m.formatValue(m.Convert(usd), digits)
 }
 
 func (m MoneyFormat) Whole(usd float64) string {
 	v := m.Convert(usd)
 	if m.Unit.FractionDigits() == 0 || math.Abs(v) >= 100 {
-		return m.formatValue(math.Round(v), 0)
-	}
-	if math.Abs(v) >= 10 {
 		return m.formatValue(math.Round(v), 0)
 	}
 	return m.formatValue(v, 2)
@@ -120,15 +197,11 @@ func (m MoneyFormat) Compact(usd float64) string {
 	}
 	switch {
 	case abs >= 1_000_000:
-		return fmt.Sprintf("%s%s%.1fM", sign, m.Unit.Symbol(), abs/1_000_000)
+		return sign + m.Unit.Symbol() + trimDecimal(fmt.Sprintf("%.2f", abs/1_000_000)) + "M"
 	case abs >= 10_000:
-		return fmt.Sprintf("%s%s%.1fk", sign, m.Unit.Symbol(), abs/1_000)
-	case abs >= 100:
-		return fmt.Sprintf("%s%s%s", sign, m.Unit.Symbol(), FormatGrouped(int64(math.Round(abs))))
-	case m.Unit.FractionDigits() == 0:
-		return fmt.Sprintf("%s%s%d", sign, m.Unit.Symbol(), int64(math.Round(abs)))
+		return sign + m.Unit.Symbol() + trimDecimal(fmt.Sprintf("%.1f", abs/1_000)) + "k"
 	default:
-		return fmt.Sprintf("%s%s%.2f", sign, m.Unit.Symbol(), abs)
+		return m.Whole(usd)
 	}
 }
 
@@ -149,7 +222,7 @@ func (m MoneyFormat) formatValue(v float64, digits int) string {
 
 // Split apportions total USD across costs so displayed strings sum to Format(total).
 func (m MoneyFormat) Split(total float64, costs []float64) []string {
-	digits := m.Unit.FractionDigits()
+	digits := m.FractionDigitsFor(total)
 	scale := math.Pow10(digits)
 	totalUnits := int(math.Round(m.Convert(total) * scale))
 	quotas := make([]float64, len(costs))

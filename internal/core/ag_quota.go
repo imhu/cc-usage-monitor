@@ -76,7 +76,7 @@ func EvaluateAGQuota(snap *AGStatusLineSnapshot, now time.Time) AGOfficialQuotaR
 			effUsed = 0.0
 		}
 
-		safeLine := ComputeAGSafeLine(kind, resetDate, now, isElapsed)
+		safeLine, settling := ComputeAGSafeLine(kind, resetDate, now, isElapsed)
 		disabled := raw.Disabled != nil && *raw.Disabled
 
 		buckets = append(buckets, AGQuotaBucketEval{
@@ -87,6 +87,7 @@ func EvaluateAGQuota(snap *AGStatusLineSnapshot, now time.Time) AGOfficialQuotaR
 			UsedFraction:        effUsed,
 			RemainingFraction:   effRem,
 			SafeLineFraction:    safeLine,
+			IsPaceSettling:      settling,
 			ResetTime:           resetDate,
 			RemainingUntilReset: remUntil,
 			IsResetElapsed:      isElapsed,
@@ -179,30 +180,35 @@ func ClassifyAGWindow(bucketID string, resetInSec *int) AGQuotaWindowKind {
 	return AGWindowOther
 }
 
-func ComputeAGSafeLine(kind AGQuotaWindowKind, resetDate *time.Time, now time.Time, isResetElapsed bool) *float64 {
+// AGFiveHourSettlingShare treats the first 10% (30 min) of a 5-hour window as settling
+// so initial bursts do not trigger false over-pace warnings (matching claude-usage-monitor).
+const AGFiveHourSettlingShare = 0.1
+
+func ComputeAGSafeLine(kind AGQuotaWindowKind, resetDate *time.Time, now time.Time, isResetElapsed bool) (*float64, bool) {
 	if isResetElapsed || resetDate == nil {
-		return nil
+		return nil, false
 	}
 	dur := kind.Duration()
 	if dur <= 0 {
-		return nil
+		return nil, false
 	}
 	windowStart := resetDate.Add(-dur)
 	elapsed := now.Sub(windowStart).Seconds()
 	if elapsed < 0 {
 		z := 0.0
-		return &z
+		return &z, kind == AGWindowFiveHour
 	}
 	switch kind {
 	case AGWindowFiveHour:
 		v := clamp01(elapsed / dur.Seconds())
-		return &v
+		settling := elapsed < dur.Seconds()*AGFiveHourSettlingShare
+		return &v, settling
 	case AGWindowWeekly:
 		dayIndex := math.Min(7.0, math.Floor(elapsed/86400.0)+1.0)
 		v := clamp01(dayIndex / 7.0)
-		return &v
+		return &v, false
 	default:
-		return nil
+		return nil, false
 	}
 }
 
@@ -214,7 +220,7 @@ func AGBucketDisplayName(bucketID string, kind AGQuotaWindowKind, zh bool) strin
 		group = "Gemini"
 	case strings.Contains(lower, "3p") || strings.Contains(lower, "third"):
 		if zh {
-			group = "第三方模型 (3P)"
+			group = "第三方模型"
 		} else {
 			group = "Third-Party"
 		}
@@ -279,12 +285,15 @@ func AGBucketShortName(bucketID string, kind AGQuotaWindowKind, zh bool) string 
 }
 
 func resolveAGResetTime(raw AGStatusLineQuotaBucket, capturedAt time.Time) *time.Time {
+	// Antigravity uses Unix epoch ("1970-01-01T00:00:00Z") with reset_in_seconds = 0
+	// for inactive/unused quota buckets (e.g. 3P models not used yet in the cycle).
+	const minValidResetUnix int64 = 946684800 // 2000-01-01T00:00:00Z
 	if raw.ResetTime != "" {
-		if t, ok := ParseAGISO8601(raw.ResetTime); ok {
+		if t, ok := ParseAGISO8601(raw.ResetTime); ok && t.Unix() >= minValidResetUnix {
 			return &t
 		}
 	}
-	if raw.ResetInSeconds != nil {
+	if raw.ResetInSeconds != nil && *raw.ResetInSeconds > 0 {
 		t := capturedAt.Add(time.Duration(*raw.ResetInSeconds) * time.Second)
 		return &t
 	}

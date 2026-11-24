@@ -232,8 +232,8 @@ func TestAntigravityPopoverSwitchAndRender(t *testing.T) {
 		t.Fatalf("expected OnProviderChanged=1, got %d", changedCount)
 	}
 	for _, want := range []string{
-		"Antigravity 用量", "ULTRA", "美国", "美区", core.MaskIP("162.141.213.48"), "活跃进程", "用量限额",
-		"Gemini 5小时", "42%", "Gemini 每周", "31%",
+		"Antigravity 用量", "Ultra", "美国", "美区", core.MaskIP("162.141.213.48"), "活跃进程", "用量限额",
+		"Gemini", "5 小时", "42%", "本周", "31%", "第三方模型", "本周期未使用", "0%",
 		"输出速度", "~68", "本期消耗", "$186.20", "83.4%",
 		"Gemini 4 Neon", "Claude Sonnet 4.5", "设置…", "立即刷新", "退出",
 	} {
@@ -243,6 +243,20 @@ func TestAntigravityPopoverSwitchAndRender(t *testing.T) {
 	}
 
 	saveSnap("popover-ag.png", tt)
+
+	// Unused Third-Party group expands on click and collapses back on "收起"
+	if err := tt.Click("第三方模型"); err != nil {
+		t.Fatalf("click unused Third-Party group failed: %v", err)
+	}
+	if !tt.HasText("收起") {
+		t.Fatalf("expected expanded Third-Party group with 收起, got: %q", tt.Texts())
+	}
+	if err := tt.Click("收起"); err != nil {
+		t.Fatalf("click collapse 收起 failed: %v", err)
+	}
+	if !tt.HasText("本周期未使用") {
+		t.Fatalf("expected collapsed Third-Party group with 本周期未使用, got: %q", tt.Texts())
+	}
 
 	// Antigravity Floating Pill renders cleanly
 	pill := NewFloatingPillModel(store, PillActions{})
@@ -276,7 +290,7 @@ func TestAntigravityPopoverSwitchAndRender(t *testing.T) {
 		t.Fatalf("expected switch back to Claude view, changedCount=%d", changedCount)
 	}
 
-	// Test Settings Menubar Antigravity preview tab
+	// Test Settings Menubar Antigravity preview tab + Data All-time card
 	set := NewSettingsModel(store, SettingsActions{})
 	st := ui.NewTesterWith(set.View, 540, 620, ui.TesterOptions{Dark: true})
 	if err := st.Click("菜单栏"); err != nil {
@@ -291,4 +305,15 @@ func TestAntigravityPopoverSwitchAndRender(t *testing.T) {
 		}
 	}
 	saveSnap("settings-menubar-ag.png", st)
+
+	if err := st.Click("数据"); err != nil {
+		t.Fatalf("click Data tab failed: %v", err)
+	}
+	for _, want := range []string{"累计 API 等效用量", "$1,284.60"} {
+		if !st.HasText(want) {
+			t.Errorf("settings Data tab missing all-time usage text %q; got: %q", want, st.Texts())
+		}
+	}
+	stTall := ui.NewTesterWith(set.View, 540, 1060, ui.TesterOptions{Dark: true})
+	saveSnap("settings-data-ag.png", stTall)
 }

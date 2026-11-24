@@ -142,7 +142,7 @@ func (s *Store) SetDemoState() {
 func (s *Store) setDemoAntigravityLocked(now time.Time) {
 	rem5h := 0.58
 	remWk := 0.69
-	rem3p := 0.82
+	remFull := 1.0
 	agReset5h := now.Add(2*time.Hour + 18*time.Minute)
 	agResetWk := now.Add(4 * 24 * time.Hour)
 	ctxIn := int64(280_000)
@@ -165,7 +165,8 @@ func (s *Store) setDemoAntigravityLocked(now time.Time) {
 		Quota: map[string]core.AGStatusLineQuotaBucket{
 			"gemini-5h":     {RemainingFraction: &rem5h, ResetTime: agReset5h.UTC().Format(time.RFC3339)},
 			"gemini-weekly": {RemainingFraction: &remWk, ResetTime: agResetWk.UTC().Format(time.RFC3339)},
-			"3p-5h":         {RemainingFraction: &rem3p, ResetTime: agReset5h.UTC().Format(time.RFC3339)},
+			"3p-5h":         {RemainingFraction: &remFull, ResetTime: "1970-01-01T00:00:00Z"},
+			"3p-weekly":     {RemainingFraction: &remFull, ResetTime: "1970-01-01T00:00:00Z"},
 		},
 		AgentState: "idle",
 		PlanTier:   "Ultra",
@@ -268,6 +269,7 @@ func (s *Store) setDemoAntigravityLocked(now time.Time) {
 	weekStart := agResetWk.Add(-7 * 24 * time.Hour)
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
 	monthEnd := monthStart.AddDate(0, 1, 0).Add(-time.Second)
+	earliest := now.AddDate(0, -1, -12)
 
 	s.agLocal = core.AGLocalUsageReport{
 		Today: core.AGUsageWindowSummary{
@@ -286,6 +288,11 @@ func (s *Store) setDemoAntigravityLocked(now time.Time) {
 			UncachedInputTokens: 54_000_000, CacheReadTokens: 290_000_000, OutputTokens: 12_500_000,
 			RequestCount: 2340, EstimatedCostUSD: 712.50, CacheSavingsUSD: 584.20,
 		},
+		AllTime: core.AGUsageWindowSummary{
+			UncachedInputTokens: 96_400_000, CacheReadTokens: 520_000_000, OutputTokens: 22_800_000,
+			RequestCount: 4210, EstimatedCostUSD: 1284.60, CacheSavingsUSD: 1042.10,
+		},
+		EarliestRecordDate: &earliest,
 		WeekPeriod: &core.AGBillingPeriodInfo{
 			Start: weekStart, End: agResetWk.Add(-time.Second), CurrentDay: 4, TotalDays: 7, RemainingDays: 4,
 		},

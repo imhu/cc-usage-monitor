@@ -47,7 +47,7 @@ func TestStoreAntigravityRefreshAndSwitchProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	snapJSON := `{"plan_tier":"Pro","email":"ag@example.com","quota":{"gemini-5h":{"remaining_fraction":0.6,"reset_in_seconds":3600}},"_captured_at":"` + now.Format(time.RFC3339) + `"}`
+	snapJSON := `{"plan_tier":"Pro","email":"ag@example.com","quota":{"gemini-5h":{"remaining_fraction":0.6,"reset_in_seconds":3600},"gemini-weekly":{"remaining_fraction":0.6,"reset_in_seconds":345600}},"_captured_at":"` + now.Format(time.RFC3339) + `"}`
 	if err := os.WriteFile(filepath.Join(cliDir, "usage-monitor-snapshot.json"), []byte(snapJSON), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -79,6 +79,10 @@ func TestStoreAntigravityRefreshAndSwitchProvider(t *testing.T) {
 	}
 	if st.AG.LocalReport.Today.RequestCount != 1 || st.AG.LocalReport.Today.CacheReadTokens != 400000 {
 		t.Fatalf("expected AG local record parsed, got %+v", st.AG.LocalReport.Today)
+	}
+	if st.Prefs.AGSavedFullWeekCostUSD <= 0 || st.Prefs.AGSavedFullWeekTokens <= 0 {
+		t.Fatalf("expected persisted full-week basis when weekly >= 10%%, got cost=%v tokens=%d",
+			st.Prefs.AGSavedFullWeekCostUSD, st.Prefs.AGSavedFullWeekTokens)
 	}
 
 	s.InstallAGBridge()

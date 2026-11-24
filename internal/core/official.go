@@ -205,9 +205,9 @@ func (p PlanKind) Title() string {
 	case PlanPro:
 		return "Pro"
 	case PlanMax5x:
-		return "Max 5×"
+		return "Max"
 	case PlanMax20x:
-		return "Max 20×"
+		return "Ultra"
 	case PlanUltra:
 		return "Ultra"
 	case PlanTeam:
@@ -317,6 +317,12 @@ type SubscriptionTerm struct {
 
 func (t SubscriptionTerm) IsEnding() bool {
 	return t.DaysLeft <= 3
+}
+
+// JustStarted reports whether the current billing period began less than 24 hours ago.
+func (t SubscriptionTerm) JustStarted(now time.Time) bool {
+	d := now.Sub(t.Start)
+	return d >= 0 && d < 24*time.Hour
 }
 
 func ComputeSubscriptionTerm(anchorDay int, hour, minute, second int, now time.Time) *SubscriptionTerm {

@@ -554,37 +554,44 @@ func AccentSwitch(c *ui.Context, key string, on bool, accent ui.Color, onToggle 
 }
 
 func AGPlanTag(c *ui.Context, rawTier string) {
-	lower := strings.ToLower(strings.TrimSpace(rawTier))
+	trimmed := strings.TrimSpace(rawTier)
+	lower := strings.ToLower(trimmed)
 	if lower == "" {
 		return
 	}
 	var label string
 	var fill, stroke, text ui.Color
+	isUltra := false
 	switch {
 	case strings.Contains(lower, "ultra"):
-		label = "ULTRA"
-		fill = ColorAGAccent
-		text = ui.Hex("#0A1930")
+		label = "Ultra"
+		isUltra = true
+		text = ui.Hex("#FFFFFF")
 	case strings.Contains(lower, "max"):
-		label = "MAX"
+		label = "Max"
 		fill = ColorAGAccent.Alpha(0.22)
-		text = ui.Hex("#89B4FF")
+		text = ui.Hex("#93C5FD")
 	case strings.Contains(lower, "pro"):
-		label = "PRO"
+		label = "Pro"
 		fill = ui.Transparent
-		stroke = ColorAGAccent.Alpha(0.65)
-		text = ui.Hex("#89B4FF")
+		stroke = ColorAGAccent.Alpha(0.55)
+		text = ui.Hex("#93C5FD")
 	default:
-		label = strings.ToUpper(strings.TrimSpace(rawTier))
-		fill = ui.RGBA(255, 255, 255, 0.08)
+		label = strings.ToUpper(trimmed[:1]) + trimmed[1:]
+		fill = ui.RGBA(255, 255, 255, 0.10)
 		text = ColorSecondary
 	}
-	box := ui.Row(c).Height(16).Padding(0, 6).Radius(8).Center().Background(fill)
+	box := ui.Row(c).Height(18).Padding(0, 7).Radius(9).Center()
+	if isUltra {
+		box.Gradient(ui.Hex("#3B82F6"), ui.Hex("#6366F1"), 135)
+	} else {
+		box.Background(fill)
+	}
 	if stroke.A > 0 {
 		box.Border(1, stroke)
 	}
 	box.Children(func() {
-		ui.Text(c, label).FontSize(9.5).FontWeight(600).LetterSpacing(0.8).TextColor(text).SingleLine()
+		ui.Text(c, label).FontSize(10.5).FontWeight(600).LetterSpacing(0.2).TextColor(text).SingleLine()
 	})
 }
 

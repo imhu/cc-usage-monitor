@@ -1065,6 +1065,62 @@ func (m *SettingsModel) renderDataTab(c *ui.Context, st service.ViewState, zh bo
 
 	settingsGroupTitle(c, tr(zh, "Antigravity 数据源", "Antigravity data"))
 
+	{
+		all := st.AG.LocalReport.AllTime
+		money := core.NewMoneyFormat(st.Prefs.Currency)
+		sinceText := ""
+		if st.AG.LocalReport.EarliestRecordDate != nil {
+			dt := st.AG.LocalReport.EarliestRecordDate.Local()
+			if zh {
+				sinceText = "自 " + dt.Format("2006年1月2日") + " 起"
+			} else {
+				sinceText = "Since " + dt.Format("Jan 2, 2006")
+			}
+		}
+		statCol := func(label, val string) {
+			ui.Column(c).Grow(1).Gap(2).Children(func() {
+				ui.Text(c, label).FontSize(10).TextColor(ColorTertiary).SingleLine()
+				ui.Text(c, val).FontSize(12).FontWeight(500).TextColor(ColorText).FontFeatures("tnum").SingleLine()
+			})
+		}
+
+		ui.Column(c).FillWidth().Padding(14).Gap(10).Radius(10).Margin(0, 0, 8, 0).
+			Background(ColorPillBg).Border(1, ColorSurfaceBorder).Children(func() {
+			ui.Row(c).FillWidth().AlignItems(ui.Baseline).Children(func() {
+				ui.Text(c, tr(zh, "累计 API 等效用量", "All-time API-equivalent usage")).
+					FontSize(12.5).FontWeight(500).TextColor(ColorText).SingleLine()
+				ui.Spacer(c)
+				if sinceText != "" {
+					ui.Text(c, sinceText).FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
+				}
+			})
+
+			ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Baseline).Children(func() {
+				ui.Text(c, money.Format(all.EstimatedCostUSD)).
+					FontSize(22).FontWeight(600).TextColor(ColorText).FontFeatures("tnum").SingleLine()
+				if all.CacheSavingsUSD > 0 {
+					ui.Text(c, tr(zh, "缓存累计省 "+money.Format(all.CacheSavingsUSD), "Saved "+money.Format(all.CacheSavingsUSD))).
+						FontSize(11).TextColor(ColorAGSafeGreen).FontFeatures("tnum").SingleLine()
+				}
+			})
+
+			ui.Row(c).FillWidth().Gap(12).Children(func() {
+				statCol(tr(zh, "总 Tokens", "Tokens"), core.FormatMagnitude(all.TotalTokens(), zh))
+				statCol(tr(zh, "请求", "Requests"), core.FormatGrouped(int64(all.RequestCount)))
+				statCol(tr(zh, "会话", "Sessions"), fmt.Sprintf("%d", st.AG.LocalReport.ConversationCount))
+				statCol(tr(zh, "缓存命中", "Cache hit"), fmt.Sprintf("%.1f%%", all.CacheHitRate()*100))
+			})
+
+			Hairline(c)
+
+			ui.Row(c).FillWidth().Gap(12).Children(func() {
+				statCol(tr(zh, "新增输入", "Input"), core.FormatMagnitude(all.UncachedInputTokens, zh))
+				statCol(tr(zh, "输出", "Output"), core.FormatMagnitude(all.OutputTokens, zh))
+				statCol(tr(zh, "缓存读取", "Cache read"), core.FormatMagnitude(all.CacheReadTokens, zh))
+			})
+		})
+	}
+
 	ui.Column(c).FillWidth().Gap(8).Children(func() {
 		ui.Text(c, tr(zh, "自定义 Antigravity brain 目录", "Custom Antigravity brain directory")).FontSize(13).FontWeight(500).TextColor(ColorText)
 		ui.Text(c, tr(zh, "留空使用默认位置（~/.gemini/antigravity/brain），读取其中会话的 transcript.jsonl。",
