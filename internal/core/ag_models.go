@@ -16,6 +16,11 @@ type AGTranscriptRecord struct {
 	CacheReadTokens int64
 	OutputTokens    int64
 	ConversationID  string
+	StepIndex       int
+	HasStepIndex    bool
+	TTFTMs          int64
+	DurationMs      int64
+	DecodeMs        int64
 }
 
 func (r AGTranscriptRecord) TotalInputTokens() int64 {
@@ -116,6 +121,10 @@ type AGSpeedSample struct {
 	TokensPerSec     float64
 	OutputTokens     int64
 	ModelDisplayName string
+	TTFTMs           int64
+	DurationMs       int64
+	DecodeMs         int64
+	IsExact          bool
 }
 
 type AGSpeedSnapshot struct {
@@ -127,6 +136,8 @@ type AGSpeedSnapshot struct {
 	Samples            []AGSpeedSample
 	IsRecentlyActive   bool
 	LastResponseAgeSec *float64
+	MedianTTFTMs       *int64
+	IsExact            bool
 }
 
 func (s AGSpeedSnapshot) DisplayTokPerSec() *float64 {
@@ -134,6 +145,15 @@ func (s AGSpeedSnapshot) DisplayTokPerSec() *float64 {
 		return s.Recent5mTokPerSec
 	}
 	return s.Recent1hTokPerSec
+}
+
+type AGContextEstimate struct {
+	UsedTokens        int64
+	ContextWindowSize int64
+	UsedPercentage    float64
+	Model             string
+	ConversationID    string
+	Timestamp         time.Time
 }
 
 type AGLocalUsageReport struct {
@@ -144,15 +164,16 @@ type AGLocalUsageReport struct {
 	AllTime            AGUsageWindowSummary
 	EarliestRecordDate *time.Time
 	WeekPeriod         *AGBillingPeriodInfo
-	MonthPeriod       *AGBillingPeriodInfo
-	OutputSpeed       AGSpeedSnapshot
-	ByModelMonth      []AGModelUsageSummary
-	ByModelWeek       []AGModelUsageSummary
-	ByModelToday      []AGModelUsageSummary
-	DailyTrend        []AGDailyUsagePoint
-	ConversationCount int
-	TotalRecords      int
-	UpdatedAt         time.Time
+	MonthPeriod        *AGBillingPeriodInfo
+	OutputSpeed        AGSpeedSnapshot
+	LatestContext      *AGContextEstimate
+	ByModelMonth       []AGModelUsageSummary
+	ByModelWeek        []AGModelUsageSummary
+	ByModelToday       []AGModelUsageSummary
+	DailyTrend         []AGDailyUsagePoint
+	ConversationCount  int
+	TotalRecords       int
+	UpdatedAt          time.Time
 }
 
 func (r AGLocalUsageReport) SummaryFor(span CostSpan) AGUsageWindowSummary {
@@ -373,4 +394,39 @@ type AGOfficialQuotaReport struct {
 
 func (r AGOfficialQuotaReport) HasSnapshot() bool {
 	return r.SnapshotCapturedAt != nil
+}
+
+// ResolveAGContextWindow returns the active Antigravity context usage, preferring
+// non-zero official statusLine context and falling back to the latest active
+// local transcript turn when the background probe only returned an empty 0% state.
+func ResolveAGContextWindow(off AGOfficialQuotaReport, local AGLocalUsageReport) (usedPct float64, usedTokens, ctxSize int64, ok bool) {
+	if cw := off.ContextWindow; cw != nil {
+		if cw.UsedPercentage != nil {
+			usedPct = *cw.UsedPercentage
+		}
+		if cw.TotalInputTokens != nil && *cw.TotalInputTokens > 0 {
+			usedTokens += *cw.TotalInputTokens
+		}
+		if cw.TotalOutputTokens != nil && *cw.TotalOutputTokens > 0 {
+			usedTokens += *cw.TotalOutputTokens
+		}
+		if cw.ContextWindowSize != nil && *cw.ContextWindowSize > 0 {
+			ctxSize = *cw.ContextWindowSize
+		}
+		if usedTokens > 0 || usedPct > 0 {
+			if ctxSize <= 0 {
+				ctxSize = AGContextWindowSizeFor(off.ActiveModelName)
+			}
+			if usedPct <= 0 && usedTokens > 0 && ctxSize > 0 {
+				usedPct = float64(usedTokens) / float64(ctxSize) * 100.0
+			}
+			usedPct = max(0, min(100, usedPct))
+			return usedPct, usedTokens, ctxSize, true
+		}
+	}
+	if lc := local.LatestContext; lc != nil && lc.UsedTokens > 0 && lc.ContextWindowSize > 0 {
+		pct := max(0, min(100, lc.UsedPercentage))
+		return pct, lc.UsedTokens, lc.ContextWindowSize, true
+	}
+	return 0, 0, 0, false
 }

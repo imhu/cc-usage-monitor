@@ -32,11 +32,19 @@ func AggregateAGUsage(records []AGTranscriptRecord, conversationCount int, now t
 
 	var todayRecs, fiveHourRecs, weekRecs, monthRecs, allValidRecs []AGTranscriptRecord
 	var earliest *time.Time
+	ctxCutoff := now.Add(-6 * time.Hour)
+	var latestCtxRec *AGTranscriptRecord
 	for _, r := range records {
 		if r.Timestamp.After(now) {
 			continue
 		}
 		allValidRecs = append(allValidRecs, r)
+		if r.TotalInputTokens() > 0 && !r.Timestamp.Before(ctxCutoff) {
+			if latestCtxRec == nil || !r.Timestamp.Before(latestCtxRec.Timestamp) {
+				recCopy := r
+				latestCtxRec = &recCopy
+			}
+		}
 		if earliest == nil || r.Timestamp.Before(*earliest) {
 			t := r.Timestamp
 			earliest = &t
@@ -55,6 +63,23 @@ func AggregateAGUsage(records []AGTranscriptRecord, conversationCount int, now t
 		}
 	}
 
+	var latestContext *AGContextEstimate
+	if latestCtxRec != nil {
+		usedTokens := latestCtxRec.TotalTokens()
+		winSize := AGContextWindowSizeFor(latestCtxRec.Model)
+		if usedTokens > 0 && winSize > 0 {
+			pct := math.Min(100, math.Max(0, float64(usedTokens)/float64(winSize)*100.0))
+			latestContext = &AGContextEstimate{
+				UsedTokens:        usedTokens,
+				ContextWindowSize: winSize,
+				UsedPercentage:    pct,
+				Model:             latestCtxRec.Model,
+				ConversationID:    latestCtxRec.ConversationID,
+				Timestamp:         latestCtxRec.Timestamp,
+			}
+		}
+	}
+
 	return AGLocalUsageReport{
 		Today:              summarizeAGRecords(todayRecs),
 		FiveHour:           summarizeAGRecords(fiveHourRecs),
@@ -63,17 +88,26 @@ func AggregateAGUsage(records []AGTranscriptRecord, conversationCount int, now t
 		AllTime:            summarizeAGRecords(allValidRecs),
 		EarliestRecordDate: earliest,
 		WeekPeriod:         &weekPeriod,
-		MonthPeriod:       monthPeriod,
-		OutputSpeed:       EstimateAGOutputSpeed(records, now),
-		ByModelMonth:      summarizeAGByModel(monthRecs),
-		ByModelWeek:       summarizeAGByModel(weekRecs),
-		ByModelToday:      summarizeAGByModel(todayRecs),
-		DailyTrend:        buildAGDailyTrend(records, now, 14),
-		ConversationCount: conversationCount,
-		TotalRecords:      len(records),
-		UpdatedAt:         now,
+		MonthPeriod:        monthPeriod,
+		OutputSpeed:        EstimateAGOutputSpeed(records, now),
+		LatestContext:      latestContext,
+		ByModelMonth:       summarizeAGByModel(monthRecs),
+		ByModelWeek:        summarizeAGByModel(weekRecs),
+		ByModelToday:       summarizeAGByModel(todayRecs),
+		DailyTrend:         buildAGDailyTrend(records, now, 14),
+		ConversationCount:  conversationCount,
+		TotalRecords:       len(records),
+		UpdatedAt:          now,
 	}
 }
+
+const (
+	agMinDecodeMs    = int64(100)
+	agMaxDecodeSpeed = 10000.0
+	agHeldWindowMs   = int64(1000)
+	agHeldShare      = int64(4)
+	agMinRankTokens  = int64(50)
+)
 
 func EstimateAGOutputSpeed(records []AGTranscriptRecord, now time.Time) AGSpeedSnapshot {
 	oneHourAgo := now.Add(-time.Hour)
@@ -96,34 +130,73 @@ func EstimateAGOutputSpeed(records []AGTranscriptRecord, now time.Time) AGSpeedS
 	lastAge := math.Max(0, now.Sub(latest.Timestamp).Seconds())
 	isActive := lastAge <= 60.0
 
-	byConv := map[string][]AGTranscriptRecord{}
-	for _, r := range recent {
-		byConv[r.ConversationID] = append(byConv[r.ConversationID], r)
-	}
-
+	// Pass 1: Prefer exact DB decode timings (excluding TTFT) with burst filtering.
 	var samples []AGSpeedSample
-	for _, convRecs := range byConv {
-		sort.Slice(convRecs, func(i, j int) bool {
-			return convRecs[i].Timestamp.Before(convRecs[j].Timestamp)
-		})
-		for i, rec := range convRecs {
-			var dt float64
-			if i > 0 {
-				dt = rec.Timestamp.Sub(convRecs[i-1].Timestamp).Seconds()
-			} else {
-				dt = math.Max(3.0, float64(rec.OutputTokens)/45.0)
-			}
-			if dt < 2.0 || dt > 90.0 {
+	for _, rec := range recent {
+		switch {
+		case rec.DecodeMs >= agMinDecodeMs:
+			rate := float64(rec.OutputTokens) * 1000.0 / float64(rec.DecodeMs)
+			if rate > agMaxDecodeSpeed || (rec.DecodeMs < agHeldWindowMs && rec.TTFTMs > agHeldShare*rec.DecodeMs) {
 				continue
 			}
-			rawSpeed := float64(rec.OutputTokens) / dt
-			clamped := math.Max(5.0, math.Min(220.0, rawSpeed))
 			samples = append(samples, AGSpeedSample{
 				Timestamp:        rec.Timestamp,
-				TokensPerSec:     clamped,
+				TokensPerSec:     rate,
 				OutputTokens:     rec.OutputTokens,
 				ModelDisplayName: AGModelDisplayName(rec.Model),
+				TTFTMs:           rec.TTFTMs,
+				DurationMs:       rec.DurationMs,
+				DecodeMs:         rec.DecodeMs,
+				IsExact:          true,
 			})
+		case rec.OutputTokens >= 1000 && rec.DurationMs >= 1000:
+			rate := float64(rec.OutputTokens) * 1000.0 / float64(rec.DurationMs)
+			if rate > agMaxDecodeSpeed {
+				continue
+			}
+			samples = append(samples, AGSpeedSample{
+				Timestamp:        rec.Timestamp,
+				TokensPerSec:     rate,
+				OutputTokens:     rec.OutputTokens,
+				ModelDisplayName: AGModelDisplayName(rec.Model),
+				TTFTMs:           rec.TTFTMs,
+				DurationMs:       rec.DurationMs,
+				DecodeMs:         rec.DurationMs,
+				IsExact:          true,
+			})
+		}
+	}
+
+	isExact := len(samples) > 0
+	if !isExact {
+		// Pass 2: Fallback to adjacent transcript turn gaps when DB step timings are unavailable.
+		byConv := map[string][]AGTranscriptRecord{}
+		for _, r := range recent {
+			byConv[r.ConversationID] = append(byConv[r.ConversationID], r)
+		}
+		for _, convRecs := range byConv {
+			sort.Slice(convRecs, func(i, j int) bool {
+				return convRecs[i].Timestamp.Before(convRecs[j].Timestamp)
+			})
+			for i, rec := range convRecs {
+				var dt float64
+				if i > 0 {
+					dt = rec.Timestamp.Sub(convRecs[i-1].Timestamp).Seconds()
+				} else {
+					dt = math.Max(3.0, float64(rec.OutputTokens)/45.0)
+				}
+				if dt < 2.0 || dt > 90.0 {
+					continue
+				}
+				rawSpeed := float64(rec.OutputTokens) / dt
+				clamped := math.Max(5.0, math.Min(220.0, rawSpeed))
+				samples = append(samples, AGSpeedSample{
+					Timestamp:        rec.Timestamp,
+					TokensPerSec:     clamped,
+					OutputTokens:     rec.OutputTokens,
+					ModelDisplayName: AGModelDisplayName(rec.Model),
+				})
+			}
 		}
 	}
 
@@ -134,24 +207,30 @@ func EstimateAGOutputSpeed(records []AGTranscriptRecord, now time.Time) AGSpeedS
 		samples[i].ID = i + 1
 	}
 
-	var sum5m, sum1h float64
-	var cnt5m int
+	var samples5m []AGSpeedSample
 	for _, s := range samples {
-		sum1h += s.TokensPerSec
 		if !s.Timestamp.Before(fiveMinAgo) {
-			sum5m += s.TokensPerSec
-			cnt5m++
+			samples5m = append(samples5m, s)
 		}
 	}
 
 	var avg5m, avg1h *float64
-	if cnt5m > 0 {
-		v := sum5m / float64(cnt5m)
+	if r5m := pickAGRankRates(samples5m); len(r5m) > 0 {
+		v := medianFloat64(r5m)
 		avg5m = &v
 	}
-	if len(samples) > 0 {
-		v := sum1h / float64(len(samples))
+	if r1h := pickAGRankRates(samples); len(r1h) > 0 {
+		v := medianFloat64(r1h)
 		avg1h = &v
+	}
+
+	var medianTTFT *int64
+	if ttfts := collectAGPositiveTTFTs(samples5m); len(ttfts) > 0 {
+		v := medianInt64(ttfts)
+		medianTTFT = &v
+	} else if ttfts := collectAGPositiveTTFTs(samples); len(ttfts) > 0 {
+		v := medianInt64(ttfts)
+		medianTTFT = &v
 	}
 
 	sparkStart := 0
@@ -172,7 +251,40 @@ func EstimateAGOutputSpeed(records []AGTranscriptRecord, now time.Time) AGSpeedS
 		Samples:            samples,
 		IsRecentlyActive:   isActive,
 		LastResponseAgeSec: &lastAge,
+		MedianTTFTMs:       medianTTFT,
+		IsExact:            isExact,
 	}
+}
+
+func pickAGRankRates(samples []AGSpeedSample) []float64 {
+	if len(samples) == 0 {
+		return nil
+	}
+	ranked := make([]float64, 0, len(samples))
+	all := make([]float64, 0, len(samples))
+	for _, s := range samples {
+		if s.TokensPerSec <= 0 {
+			continue
+		}
+		all = append(all, s.TokensPerSec)
+		if s.OutputTokens >= agMinRankTokens {
+			ranked = append(ranked, s.TokensPerSec)
+		}
+	}
+	if len(ranked) > 0 {
+		return ranked
+	}
+	return all
+}
+
+func collectAGPositiveTTFTs(samples []AGSpeedSample) []int64 {
+	var out []int64
+	for _, s := range samples {
+		if s.TTFTMs > 0 {
+			out = append(out, s.TTFTMs)
+		}
+	}
+	return out
 }
 
 func resolveAGBillingMonthBounds(now time.Time, billingDay int, clockRef *time.Time) (start, end time.Time, ok bool) {

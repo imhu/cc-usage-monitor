@@ -37,6 +37,7 @@ func ParseAGISO8601(s string) (time.Time, bool) {
 }
 
 type rawAGTranscriptLine struct {
+	StepIndex       *int   `json:"step_index"`
 	CreatedAt       string `json:"created_at"`
 	Model           string `json:"model"`
 	InputTokens     *int64 `json:"input_tokens"`
@@ -73,6 +74,13 @@ func ParseAGTranscriptLine(line []byte, conversationID, fallbackModel string) (A
 		outTok = *raw.OutputTokens
 	}
 
+	var stepIdx int
+	var hasStep bool
+	if raw.StepIndex != nil && *raw.StepIndex >= 0 {
+		stepIdx = *raw.StepIndex
+		hasStep = true
+	}
+
 	return AGTranscriptRecord{
 		Timestamp:       ts,
 		Model:           resolved,
@@ -80,6 +88,8 @@ func ParseAGTranscriptLine(line []byte, conversationID, fallbackModel string) (A
 		CacheReadTokens: cacheTok,
 		OutputTokens:    outTok,
 		ConversationID:  conversationID,
+		StepIndex:       stepIdx,
+		HasStepIndex:    hasStep,
 	}, true
 }
 
@@ -147,17 +157,27 @@ type agFileCursor struct {
 	lastKnownModel string
 }
 
+type agTimingCacheEntry struct {
+	dbSize  int64
+	dbMod   time.Time
+	walSize int64
+	walMod  time.Time
+	timings map[int]AGStepTiming
+}
+
 // AGTranscriptIndex incrementally indexes ~/.gemini/antigravity/brain/<id>/.system_generated/logs/transcript.jsonl.
 type AGTranscriptIndex struct {
-	mu       sync.Mutex
-	brainDir string
-	cursors  map[string]*agFileCursor
+	mu          sync.Mutex
+	brainDir    string
+	cursors     map[string]*agFileCursor
+	timingCache map[string]*agTimingCacheEntry
 }
 
 func NewAGTranscriptIndex(brainDir string) *AGTranscriptIndex {
 	return &AGTranscriptIndex{
-		brainDir: brainDir,
-		cursors:  map[string]*agFileCursor{},
+		brainDir:    brainDir,
+		cursors:     map[string]*agFileCursor{},
+		timingCache: map[string]*agTimingCacheEntry{},
 	}
 }
 
@@ -165,6 +185,7 @@ func (idx *AGTranscriptIndex) Reset() {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	idx.cursors = map[string]*agFileCursor{}
+	idx.timingCache = map[string]*agTimingCacheEntry{}
 }
 
 func (idx *AGTranscriptIndex) SetBrainDir(brainDir string) {
@@ -173,6 +194,7 @@ func (idx *AGTranscriptIndex) SetBrainDir(brainDir string) {
 	if !strings.EqualFold(idx.brainDir, brainDir) {
 		idx.brainDir = brainDir
 		idx.cursors = map[string]*agFileCursor{}
+		idx.timingCache = map[string]*agTimingCacheEntry{}
 	}
 }
 
@@ -182,16 +204,24 @@ func (idx *AGTranscriptIndex) Refresh() (records []AGTranscriptRecord, conversat
 
 	if idx.brainDir == "" {
 		idx.cursors = map[string]*agFileCursor{}
+		idx.timingCache = map[string]*agTimingCacheEntry{}
 		return nil, 0
 	}
 	entries, err := os.ReadDir(idx.brainDir)
 	if err != nil {
 		idx.cursors = map[string]*agFileCursor{}
+		idx.timingCache = map[string]*agTimingCacheEntry{}
 		return nil, 0
 	}
 
+	if idx.timingCache == nil {
+		idx.timingCache = map[string]*agTimingCacheEntry{}
+	}
+	convDir := filepath.Join(filepath.Dir(idx.brainDir), "conversations")
+	recentCutoff := time.Now().Add(-2 * time.Hour)
 	activePaths := make(map[string]bool, len(entries))
 	convIDs := make(map[string]bool, len(entries))
+	recentConvs := make(map[string]bool)
 
 	for _, ent := range entries {
 		name := ent.Name()
@@ -238,7 +268,25 @@ func (idx *AGTranscriptIndex) Refresh() (records []AGTranscriptRecord, conversat
 
 		if len(cur.records) > 0 {
 			convIDs[name] = true
-			records = append(records, cur.records...)
+			var timings map[int]AGStepTiming
+			if agHasRecentRecord(cur.records, recentCutoff) {
+				recentConvs[name] = true
+				timings = idx.stepTimingsForLocked(convDir, name)
+			}
+			if len(timings) > 0 {
+				for _, rec := range cur.records {
+					if rec.HasStepIndex {
+						if tm, found := timings[rec.StepIndex]; found {
+							rec.TTFTMs = tm.TTFTMs
+							rec.DurationMs = tm.DurationMs
+							rec.DecodeMs = tm.DecodeMs
+						}
+					}
+					records = append(records, rec)
+				}
+			} else {
+				records = append(records, cur.records...)
+			}
 		}
 	}
 
@@ -247,8 +295,61 @@ func (idx *AGTranscriptIndex) Refresh() (records []AGTranscriptRecord, conversat
 			delete(idx.cursors, path)
 		}
 	}
+	for convID := range idx.timingCache {
+		if !recentConvs[convID] {
+			delete(idx.timingCache, convID)
+		}
+	}
 
 	return records, len(convIDs)
+}
+
+func agHasRecentRecord(recs []AGTranscriptRecord, cutoff time.Time) bool {
+	for i := len(recs) - 1; i >= 0; i-- {
+		if !recs[i].Timestamp.Before(cutoff) {
+			return true
+		}
+	}
+	return false
+}
+
+func (idx *AGTranscriptIndex) stepTimingsForLocked(convDir, convID string) map[int]AGStepTiming {
+	if convDir == "" || convID == "" {
+		return nil
+	}
+	dbPath := filepath.Join(convDir, convID+".db")
+	dbInfo, err := os.Stat(dbPath)
+	if err != nil || dbInfo.IsDir() {
+		return nil
+	}
+	var walSize int64
+	var walMod time.Time
+	if walInfo, err := os.Stat(dbPath + "-wal"); err == nil && !walInfo.IsDir() {
+		walSize = walInfo.Size()
+		walMod = walInfo.ModTime()
+	}
+
+	if cached, ok := idx.timingCache[convID]; ok &&
+		cached.dbSize == dbInfo.Size() && cached.dbMod.Equal(dbInfo.ModTime()) &&
+		cached.walSize == walSize && cached.walMod.Equal(walMod) {
+		return cached.timings
+	}
+
+	timings, err := ReadAGConversationStepTimings(dbPath)
+	if err != nil {
+		if cached, ok := idx.timingCache[convID]; ok {
+			return cached.timings
+		}
+		return nil
+	}
+	idx.timingCache[convID] = &agTimingCacheEntry{
+		dbSize:  dbInfo.Size(),
+		dbMod:   dbInfo.ModTime(),
+		walSize: walSize,
+		walMod:  walMod,
+		timings: timings,
+	}
+	return timings
 }
 
 func readAGTranscriptSlice(path string, offset int64, conversationID string, lastKnownModel *string) ([]AGTranscriptRecord, int64) {

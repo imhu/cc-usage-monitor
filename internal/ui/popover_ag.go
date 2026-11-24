@@ -484,33 +484,21 @@ func (m *PopoverModel) renderAGLimitRowDetailed(c *ui.Context, b core.AGQuotaBuc
 
 func (m *PopoverModel) renderAGSpeedSection(c *ui.Context, st service.ViewState, now time.Time, zh bool) {
 	speed := st.AG.LocalReport.OutputSpeed
-	ctxWin := st.AG.OfficialReport.ContextWindow
-	usedPct := 0.0
-	var usedTokens, ctxSize int64
-	if ctxWin != nil {
-		if ctxWin.UsedPercentage != nil {
-			usedPct = max(0, min(100, *ctxWin.UsedPercentage))
-		}
-		if ctxWin.TotalInputTokens != nil {
-			usedTokens += *ctxWin.TotalInputTokens
-		}
-		if ctxWin.TotalOutputTokens != nil {
-			usedTokens += *ctxWin.TotalOutputTokens
-		}
-		if ctxWin.ContextWindowSize != nil {
-			ctxSize = *ctxWin.ContextWindowSize
-		}
-	}
-	hasActiveCtx := ctxWin != nil && (usedTokens > 0 || usedPct > 0) && ctxSize > 0
+	usedPct, usedTokens, ctxSize, hasActiveCtx := core.ResolveAGContextWindow(st.AG.OfficialReport, st.AG.LocalReport)
+	hasActiveCtx = hasActiveCtx && ctxSize > 0
 	collapsed := st.Prefs.AGCollapsedSpeed
 
 	ui.Column(c).FillWidth().Padding(12, 0).Gap(8).Children(func() {
 		SectionHeader(c, "ag-sec-speed", tr(zh, "输出速度", "Output speed"), collapsed, func() {
 			m.Store.UpdatePrefs(func(p *core.Preferences) { p.AGCollapsedSpeed = !p.AGCollapsedSpeed })
 		}, func() {
+			speedPrefix := "~"
+			if speed.IsExact {
+				speedPrefix = ""
+			}
 			if collapsed {
 				if tok := speed.DisplayTokPerSec(); tok != nil {
-					ui.Text(c, fmt.Sprintf("~%d tok/s", int(math.Round(*tok)))).FontSize(10.5).FontWeight(500).
+					ui.Text(c, fmt.Sprintf("%s%d tok/s", speedPrefix, int(math.Round(*tok)))).FontSize(10.5).FontWeight(500).
 						TextColor(ColorSecondary).FontFeatures("tnum").SingleLine()
 				} else {
 					ui.Text(c, tr(zh, "最近 1 小时没有回复", "No replies in 1h")).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
@@ -540,6 +528,15 @@ func (m *PopoverModel) renderAGSpeedSection(c *ui.Context, st service.ViewState,
 			return
 		}
 
+		speedPrefix := "~"
+		speedTip := tr(zh, "基于本地对话间隔近似估算。点击右侧图表可切换折线图与 1 小时散点图。",
+			"Estimated from local transcript intervals. Click chart to toggle sparkline / 1h dot plot.")
+		if speed.IsExact {
+			speedPrefix = ""
+			speedTip = tr(zh, "基于 Antigravity 会话步骤时间线计算的纯解码输出速度（已扣除首字延迟，取中位数）。点击右侧图表可切换折线图与 1 小时散点图。",
+				"Exact decode speed excluding TTFT (median) from Antigravity step timings. Click chart to toggle sparkline / 1h dot plot.")
+		}
+
 		recentSpark := speed.Samples
 		if len(recentSpark) > 18 {
 			recentSpark = recentSpark[len(recentSpark)-18:]
@@ -548,23 +545,33 @@ func (m *PopoverModel) renderAGSpeedSection(c *ui.Context, st service.ViewState,
 		ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(10).Children(func() {
 			ui.Column(c).Grow(1).Gap(2).Children(func() {
 				ui.Row(c).AlignItems(ui.Baseline).Gap(3).
-					Tooltip(tr(zh, "基于本地对话间隔近似估算。点击右侧图表可切换折线图与 1 小时散点图。",
-						"Estimated from local transcript intervals. Click chart to toggle sparkline / 1h dot plot.")).
+					Tooltip(speedTip).
 					Children(func() {
-						ui.Text(c, fmt.Sprintf("~%d", int(math.Round(*tokPtr)))).
+						ui.Text(c, fmt.Sprintf("%s%d", speedPrefix, int(math.Round(*tokPtr)))).
 							FontSize(25).FontWeight(600).LetterSpacing(-0.4).TextColor(ColorText).FontFeatures("tnum").SingleLine()
 						ui.Text(c, "tok/s").FontSize(11.5).TextColor(ColorSecondary).SingleLine()
 					})
 
 				if m.agHoveredSpark >= 0 && m.agHoveredSpark < len(recentSpark) {
 					hs := recentSpark[m.agHoveredSpark]
-					ui.Text(c, fmt.Sprintf("%s · ~%d tok/s · %s",
-						hs.Timestamp.Local().Format("15:04"), int(math.Round(hs.TokensPerSec)), core.FormatMagnitude(hs.OutputTokens, zh))).
+					p := "~"
+					if hs.IsExact {
+						p = ""
+					}
+					meta := fmt.Sprintf("%s · %s%d tok/s · %s",
+						hs.Timestamp.Local().Format("15:04"), p, int(math.Round(hs.TokensPerSec)), core.FormatMagnitude(hs.OutputTokens, zh))
+					if hs.TTFTMs > 0 {
+						meta += fmt.Sprintf(" · %s %.1fs", tr(zh, "首字", "TTFT"), float64(hs.TTFTMs)/1000.0)
+					}
+					ui.Text(c, meta).
 						FontSize(10.5).TextColor(ColorSecondary).FontFeatures("tnum").SingleLine()
 				} else {
 					winLbl := tr(zh, "近 1 小时", "Last 1 hr")
 					if speed.Recent5mTokPerSec != nil {
 						winLbl = tr(zh, "近 5 分钟", "Last 5 min")
+					}
+					if speed.MedianTTFTMs != nil && *speed.MedianTTFTMs > 0 {
+						winLbl += fmt.Sprintf(" · %s %.1fs", tr(zh, "首字", "TTFT"), float64(*speed.MedianTTFTMs)/1000.0)
 					}
 					if speed.LatestModelName != "" {
 						winLbl += " · " + speed.LatestModelName
@@ -581,7 +588,7 @@ func (m *PopoverModel) renderAGSpeedSection(c *ui.Context, st service.ViewState,
 				}
 				btn.Children(func() {
 					if speed.Recent1hTokPerSec != nil {
-						ui.Text(c, fmt.Sprintf("~%d tok/s", int(math.Round(*speed.Recent1hTokPerSec)))).
+						ui.Text(c, fmt.Sprintf("%s%d tok/s", speedPrefix, int(math.Round(*speed.Recent1hTokPerSec)))).
 							FontSize(12).FontWeight(500).TextColor(ColorSecondary).FontFeatures("tnum").SingleLine()
 					}
 					ui.Text(c, tr(zh, fmt.Sprintf("近 1 小时 · %d 次", speed.Recent1hReplyCount), fmt.Sprintf("Last 1h · %d", speed.Recent1hReplyCount))).
@@ -611,9 +618,18 @@ func (m *PopoverModel) renderAGSpeedSection(c *ui.Context, st service.ViewState,
 					}
 				}
 				if hovDot != nil {
-					ui.Text(c, fmt.Sprintf("%s · ~%d tok/s · %s tokens · %s",
-						hovDot.Timestamp.Local().Format("15:04"), int(math.Round(hovDot.TokensPerSec)),
-						core.FormatMagnitude(hovDot.OutputTokens, zh), hovDot.ModelDisplayName)).
+					p := "~"
+					if hovDot.IsExact {
+						p = ""
+					}
+					meta := fmt.Sprintf("%s · %s%d tok/s · %s tokens",
+						hovDot.Timestamp.Local().Format("15:04"), p, int(math.Round(hovDot.TokensPerSec)),
+						core.FormatMagnitude(hovDot.OutputTokens, zh))
+					if hovDot.TTFTMs > 0 {
+						meta += fmt.Sprintf(" · %s %.1fs", tr(zh, "首字", "TTFT"), float64(hovDot.TTFTMs)/1000.0)
+					}
+					meta += " · " + hovDot.ModelDisplayName
+					ui.Text(c, meta).
 						FontSize(10).TextColor(ColorSecondary).FontFeatures("tnum").SingleLine()
 				} else {
 					ui.Row(c).FillWidth().Children(func() {

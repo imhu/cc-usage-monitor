@@ -171,3 +171,37 @@ func TestAGCaptureScriptViaGoCmdExec(t *testing.T) {
 		t.Fatalf("unexpected captured snapshot: %+v", snap)
 	}
 }
+
+func TestMergeAGSnapshotsPreservesRealContextOverEmptyProbe(t *testing.T) {
+	prevPct := 34.0
+	prevIn := int64(340000)
+	prevSize := int64(1_048_576)
+	prev := &core.AGStatusLineSnapshot{
+		PlanTier: "Google AI Pro",
+		ContextWindow: &core.AGStatusLineContextWindow{
+			TotalInputTokens:  &prevIn,
+			ContextWindowSize: &prevSize,
+			UsedPercentage:    &prevPct,
+		},
+	}
+
+	zeroPct := 0.0
+	zeroTok := int64(0)
+	captured := &core.AGStatusLineSnapshot{
+		AgentState: "initializing",
+		ContextWindow: &core.AGStatusLineContextWindow{
+			TotalInputTokens:  &zeroTok,
+			TotalOutputTokens: &zeroTok,
+			ContextWindowSize: &prevSize,
+			UsedPercentage:    &zeroPct,
+		},
+	}
+
+	merged := mergeAGSnapshots(captured, prev, time.Date(2026, 11, 24, 14, 30, 0, 0, time.UTC))
+	if merged.ContextWindow == nil || merged.ContextWindow.UsedPercentage == nil || *merged.ContextWindow.UsedPercentage != 34.0 {
+		t.Fatalf("expected prev ContextWindow (34%%) preserved, got %+v", merged.ContextWindow)
+	}
+	if merged.PlanTier != "Google AI Pro" {
+		t.Fatalf("expected PlanTier preserved, got %q", merged.PlanTier)
+	}
+}

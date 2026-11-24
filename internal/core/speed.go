@@ -2,6 +2,7 @@ package core
 
 import (
 	"math"
+	"slices"
 	"sort"
 )
 
@@ -10,6 +11,26 @@ const (
 	SpeedSpanWindow   = 3600.0 // 1 hour
 	SpeedPendingLimit = 600.0  // 10 min
 )
+
+func medianFloat64(xs []float64) float64 {
+	n := len(xs)
+	if n == 0 {
+		return 0
+	}
+	cp := slices.Clone(xs)
+	slices.Sort(cp)
+	return (cp[(n-1)/2] + cp[n/2]) / 2.0
+}
+
+func medianInt64(xs []int64) int64 {
+	n := len(xs)
+	if n == 0 {
+		return 0
+	}
+	cp := slices.Clone(xs)
+	slices.Sort(cp)
+	return (cp[(n-1)/2] + cp[n/2]) / 2
+}
 
 type TimedRequest struct {
 	ID          uint64
@@ -126,12 +147,16 @@ func (l SpeedLog) Models(now float64) []ModelSpeed {
 }
 
 type SpeedRate struct {
-	Output   int
-	Duration float64
-	Count    int
+	Output     int
+	Duration   float64
+	Count      int
+	MedianRate float64
 }
 
 func (r SpeedRate) TokensPerSecond() float64 {
+	if r.MedianRate > 0 {
+		return r.MedianRate
+	}
 	if r.Duration <= 0 {
 		return 0
 	}
@@ -142,17 +167,38 @@ func ComputeSpeedRate(requests []TimedRequest, from, to float64) *SpeedRate {
 	out := 0
 	dur := 0.0
 	cnt := 0
+	var allRates, rankRates []float64
 	i := firstRequestAfter(requests, from)
 	for i < len(requests) && requests[i].End <= to {
-		out += requests[i].Output
-		dur += requests[i].Duration()
+		req := requests[i]
+		out += req.Output
+		d := req.Duration()
+		dur += d
 		cnt++
+		if d >= 0.1 {
+			rate := float64(req.Output) / d
+			if rate > 0 && rate <= 10000 {
+				allRates = append(allRates, rate)
+				if req.Output >= 100 {
+					rankRates = append(rankRates, rate)
+				}
+			}
+		}
 		i++
 	}
 	if cnt == 0 || dur <= 0 {
 		return nil
 	}
-	return &SpeedRate{Output: out, Duration: dur, Count: cnt}
+	chosen := rankRates
+	if len(chosen) == 0 {
+		chosen = allRates
+	}
+	return &SpeedRate{
+		Output:     out,
+		Duration:   dur,
+		Count:      cnt,
+		MedianRate: medianFloat64(chosen),
+	}
 }
 
 type TrendPoint struct {

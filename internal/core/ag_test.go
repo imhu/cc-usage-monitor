@@ -1,7 +1,10 @@
 package core
 
 import (
+	"database/sql"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -345,5 +348,235 @@ func TestAGBridgeInstallerDirectAndChained(t *testing.T) {
 	sl, _ := restored2["statusLine"].(map[string]any)
 	if sl["command"] != `C:\tools\custom.cmd` || sl["stack_with_default"] != false {
 		t.Fatalf("expected original statusLine restored, got %+v", sl)
+	}
+}
+
+func TestAGContextWindowSizeAndFallbackResolution(t *testing.T) {
+	if got := AGContextWindowSizeFor("gemini-4-neon-high"); got != 1_048_576 {
+		t.Fatalf("gemini window = %d, want 1048576", got)
+	}
+	if got := AGContextWindowSizeFor("claude-sonnet-4-5"); got != 200_000 {
+		t.Fatalf("claude 200k window = %d, want 200000", got)
+	}
+	if got := AGContextWindowSizeFor("claude-sonnet-4-6-1m"); got != 1_000_000 {
+		t.Fatalf("claude 1m window = %d, want 1000000", got)
+	}
+	if got := AGContextWindowSizeFor("gpt-5"); got != 400_000 {
+		t.Fatalf("gpt-5 window = %d, want 400000", got)
+	}
+	if got := AGContextWindowSizeFor("gpt-4o-mini"); got != 128_000 {
+		t.Fatalf("gpt-4o window = %d, want 128000", got)
+	}
+
+	now := time.Date(2026, 11, 24, 14, 0, 0, 0, time.UTC)
+
+	stale := AggregateAGUsage([]AGTranscriptRecord{
+		{Timestamp: now.Add(-7 * time.Hour), Model: "gemini-4-neon-high", InputTokens: 5000, CacheReadTokens: 200000, OutputTokens: 500, ConversationID: "old"},
+	}, 1, now, nil, 0)
+	if stale.LatestContext != nil {
+		t.Fatalf("expected nil LatestContext for >6h stale turn, got %+v", stale.LatestContext)
+	}
+
+	active := AggregateAGUsage([]AGTranscriptRecord{
+		{Timestamp: now.Add(-20 * time.Minute), Model: "claude-sonnet-4-5", InputTokens: 1000, CacheReadTokens: 49000, OutputTokens: 0, ConversationID: "c1"},
+		{Timestamp: now.Add(-2 * time.Minute), Model: "gemini-4-neon-high", InputTokens: 2802, CacheReadTokens: 290350, OutputTokens: 1021, ConversationID: "c2"},
+	}, 2, now, nil, 0)
+	if active.LatestContext == nil || active.LatestContext.ConversationID != "c2" || active.LatestContext.UsedTokens != 294173 {
+		t.Fatalf("unexpected LatestContext: %+v", active.LatestContext)
+	}
+	if math.Abs(active.LatestContext.UsedPercentage-(294173.0/1048576.0*100.0)) > 1e-6 {
+		t.Fatalf("unexpected UsedPercentage: %v", active.LatestContext.UsedPercentage)
+	}
+
+	zeroPct := 0.0
+	zeroTok := int64(0)
+	winSize := int64(1_048_576)
+	emptyOff := AGOfficialQuotaReport{
+		ContextWindow: &AGStatusLineContextWindow{
+			TotalInputTokens:  &zeroTok,
+			TotalOutputTokens: &zeroTok,
+			ContextWindowSize: &winSize,
+			UsedPercentage:    &zeroPct,
+		},
+	}
+	pct, used, size, ok := ResolveAGContextWindow(emptyOff, active)
+	if !ok || used != 294173 || size != 1_048_576 || math.Abs(pct-active.LatestContext.UsedPercentage) > 1e-6 {
+		t.Fatalf("expected fallback to local LatestContext, got ok=%v pct=%v used=%d size=%d", ok, pct, used, size)
+	}
+
+	offPct := 61.5
+	offIn := int64(600000)
+	offOut := int64(45000)
+	realOff := AGOfficialQuotaReport{
+		ContextWindow: &AGStatusLineContextWindow{
+			TotalInputTokens:  &offIn,
+			TotalOutputTokens: &offOut,
+			ContextWindowSize: &winSize,
+			UsedPercentage:    &offPct,
+		},
+	}
+	pct, used, size, ok = ResolveAGContextWindow(realOff, active)
+	if !ok || pct != 61.5 || used != 645000 || size != 1_048_576 {
+		t.Fatalf("expected official priority, got ok=%v pct=%v used=%d size=%d", ok, pct, used, size)
+	}
+
+	if pct, used, size, ok := ResolveAGContextWindow(emptyOff, stale); ok || pct != 0 || used != 0 || size != 0 {
+		t.Fatalf("expected ok=false when no active context, got ok=%v pct=%v used=%d size=%d", ok, pct, used, size)
+	}
+}
+
+func pbVarintField(num int, v uint64) []byte {
+	var buf [32]byte
+	n := binary.PutUvarint(buf[:], uint64(num<<3))
+	n += binary.PutUvarint(buf[n:], v)
+	return buf[:n]
+}
+
+func pbBytesField(num int, payload []byte) []byte {
+	var buf [32]byte
+	n := binary.PutUvarint(buf[:], uint64((num<<3)|2))
+	n += binary.PutUvarint(buf[n:], uint64(len(payload)))
+	out := make([]byte, 0, n+len(payload))
+	out = append(out, buf[:n]...)
+	out = append(out, payload...)
+	return out
+}
+
+func pbTimestampBlob(t time.Time) []byte {
+	if t.IsZero() {
+		return nil
+	}
+	var out []byte
+	out = append(out, pbVarintField(1, uint64(t.Unix()))...)
+	if ns := t.Nanosecond(); ns > 0 {
+		out = append(out, pbVarintField(2, uint64(ns))...)
+	}
+	return out
+}
+
+func cortexStepMetaBlob(start, first, end time.Time, respID string) []byte {
+	var out []byte
+	if !start.IsZero() {
+		out = append(out, pbBytesField(1, pbTimestampBlob(start))...)
+	}
+	if !first.IsZero() {
+		out = append(out, pbBytesField(6, pbTimestampBlob(first))...)
+	}
+	if !end.IsZero() {
+		out = append(out, pbBytesField(7, pbTimestampBlob(end))...)
+	}
+	if respID != "" {
+		out = append(out, pbBytesField(9, pbBytesField(11, []byte(respID)))...)
+	}
+	return out
+}
+
+func TestReadAGConversationStepTimingsAndExactOutputSpeed(t *testing.T) {
+	root := t.TempDir()
+	convID := "conv-exact-speed"
+	brainLogsDir := filepath.Join(root, "brain", convID, ".system_generated", "logs")
+	convDir := filepath.Join(root, "conversations")
+	if err := os.MkdirAll(brainLogsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(convDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(convDir, convID+".db")
+	db, err := sql.Open("sqlite", sqliteReadOnlyURI(dbPath))
+	_ = db
+	// Create writable DB first
+	wdb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wdb.Exec(`CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB)`); err != nil {
+		wdb.Close()
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	// Step 1 & 2 share response_id "resp-shared": step 1 had start & first content, step 2 finished decoding.
+	// Step 1: start = now-4m, first = now-4m+2s -> TTFT = 2000ms
+	// Step 2: start = now-4m+3s, end = now-4m+6s -> merged start = now-4m, first = now-4m+2s, end = now-4m+6s => TTFT=2000ms, Decode=4000ms, Output=400 => 100 tok/s
+	t1 := now.Add(-4 * time.Minute)
+	// Step 3: TTFT=1500ms, Decode=2000ms, Output=240 => 120 tok/s
+	t3 := now.Add(-3 * time.Minute)
+	// Step 4: TTFT=1500ms, Decode=2000ms, Output=280 => 140 tok/s
+	t4 := now.Add(-2 * time.Minute)
+	// Step 5 (held burst): TTFT=8000ms, Decode=200ms (<1000ms and 8000 > 4*200) -> MUST be filtered out!
+	t5 := now.Add(-90 * time.Second)
+	// Step 6 (stalled outlier): TTFT=1000ms, Decode=10000ms, Output=100 => 10 tok/s -> median stays robust against 10 tok/s!
+	t6 := now.Add(-60 * time.Second)
+	// Step 7 (short noise <50 tokens): TTFT=500ms, Decode=2000ms, Output=20 => 10 tok/s -> ignored in ranked median
+	t7 := now.Add(-30 * time.Second)
+
+	inserts := []struct {
+		idx  int
+		blob []byte
+	}{
+		{1, cortexStepMetaBlob(t1, t1.Add(2*time.Second), t1.Add(3*time.Second), "resp-shared")},
+		{2, cortexStepMetaBlob(t1.Add(3*time.Second), time.Time{}, t1.Add(6*time.Second), "resp-shared")},
+		{3, cortexStepMetaBlob(t3, t3.Add(1500*time.Millisecond), t3.Add(3500*time.Millisecond), "resp-3")},
+		{4, cortexStepMetaBlob(t4, t4.Add(1500*time.Millisecond), t4.Add(3500*time.Millisecond), "resp-4")},
+		{5, cortexStepMetaBlob(t5, t5.Add(8*time.Second), t5.Add(8200*time.Millisecond), "resp-5")},
+		{6, cortexStepMetaBlob(t6, t6.Add(1*time.Second), t6.Add(11*time.Second), "resp-6")},
+		{7, cortexStepMetaBlob(t7, t7.Add(500*time.Millisecond), t7.Add(2500*time.Millisecond), "resp-7")},
+	}
+	for _, ins := range inserts {
+		if _, err := wdb.Exec(`INSERT INTO steps (idx, metadata) VALUES (?, ?)`, ins.idx, ins.blob); err != nil {
+			wdb.Close()
+			t.Fatal(err)
+		}
+	}
+	wdb.Close()
+
+	timings, err := ReadAGConversationStepTimings(dbPath)
+	if err != nil {
+		t.Fatalf("ReadAGConversationStepTimings failed: %v", err)
+	}
+	tm2, ok := timings[2]
+	if !ok || tm2.TTFTMs != 2000 || tm2.DecodeMs != 4000 || tm2.DurationMs != 6000 {
+		t.Fatalf("expected merged step 2 TTFT=2000 Decode=4000 Duration=6000, got %+v (ok=%v)", tm2, ok)
+	}
+
+	transcript := "" +
+		fmt.Sprintf(`{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"%s","model":"gemini-4-neon-high","input_tokens":500,"cache_read_tokens":9500,"output_tokens":400}`+"\n", t1.Add(6*time.Second).Format(time.RFC3339)) +
+		fmt.Sprintf(`{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"%s","model":"gemini-4-neon-high","input_tokens":500,"cache_read_tokens":9500,"output_tokens":240}`+"\n", t3.Add(3500*time.Millisecond).Format(time.RFC3339)) +
+		fmt.Sprintf(`{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"%s","model":"gemini-4-neon-high","input_tokens":500,"cache_read_tokens":9500,"output_tokens":280}`+"\n", t4.Add(3500*time.Millisecond).Format(time.RFC3339)) +
+		fmt.Sprintf(`{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"%s","model":"gemini-4-neon-high","input_tokens":500,"cache_read_tokens":9500,"output_tokens":500}`+"\n", t5.Add(8200*time.Millisecond).Format(time.RFC3339)) +
+		fmt.Sprintf(`{"step_index":6,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"%s","model":"gemini-4-neon-high","input_tokens":500,"cache_read_tokens":9500,"output_tokens":100}`+"\n", t6.Add(11*time.Second).Format(time.RFC3339)) +
+		fmt.Sprintf(`{"step_index":7,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"%s","model":"gemini-4-neon-high","input_tokens":500,"cache_read_tokens":9500,"output_tokens":20}`+"\n", t7.Add(2500*time.Millisecond).Format(time.RFC3339))
+
+	if err := os.WriteFile(filepath.Join(brainLogsDir, "transcript.jsonl"), []byte(transcript), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	idx := NewAGTranscriptIndex(filepath.Join(root, "brain"))
+	recs, convCount := idx.Refresh()
+	if convCount != 1 || len(recs) != 6 {
+		t.Fatalf("expected 1 conv / 6 recs, got %d / %d", convCount, len(recs))
+	}
+	if recs[0].DecodeMs != 4000 || recs[0].TTFTMs != 2000 {
+		t.Fatalf("expected record 0 enriched with DB timing, got %+v", recs[0])
+	}
+
+	evalNow := t7.Add(5 * time.Second)
+	speed := EstimateAGOutputSpeed(recs, evalNow)
+	if !speed.IsExact {
+		t.Fatalf("expected IsExact=true, got %+v", speed)
+	}
+	// Step 5 filtered (held burst); remaining samples = steps {2, 3, 4, 6, 7};
+	// ranked (>=50 tokens) = {10, 100, 120, 140} -> median = (100+120)/2 = 110.0!
+	if speed.Recent5mTokPerSec == nil || math.Abs(*speed.Recent5mTokPerSec-110.0) > 1e-6 {
+		t.Fatalf("expected exact 5m median speed 110.0 tok/s, got %v (samples=%+v)", speed.Recent5mTokPerSec, speed.Samples)
+	}
+	if speed.Recent1hTokPerSec == nil || math.Abs(*speed.Recent1hTokPerSec-110.0) > 1e-6 {
+		t.Fatalf("expected exact 1h median speed 110.0 tok/s, got %v", speed.Recent1hTokPerSec)
+	}
+	// TTFTs for all 5 kept samples = {500, 1000, 1500, 1500, 2000} -> median = 1500ms!
+	if speed.MedianTTFTMs == nil || *speed.MedianTTFTMs != 1500 {
+		t.Fatalf("expected MedianTTFTMs=1500, got %v", speed.MedianTTFTMs)
 	}
 }

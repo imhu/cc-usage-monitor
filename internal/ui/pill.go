@@ -417,9 +417,8 @@ func buildAGPillColumns(st service.ViewState, money core.MoneyFormat, zh bool) [
 	}
 	if st.Prefs.AGPillShowContext {
 		lbl := tr(zh, "上下文", "CTX")
-		if off.ContextWindow != nil && off.ContextWindow.UsedPercentage != nil {
-			u := *off.ContextWindow.UsedPercentage
-			cols = append(cols, pillCol{lbl, fmt.Sprintf("%d%%", int(u)), AGLevelColor(u/100.0, false)})
+		if usedPct, _, _, ok := core.ResolveAGContextWindow(off, local); ok {
+			cols = append(cols, pillCol{lbl, fmt.Sprintf("%d%%", int(math.Round(usedPct))), AGLevelColor(usedPct/100.0, false)})
 		} else {
 			cols = append(cols, pillCol{lbl, "--", ColorSecondary})
 		}

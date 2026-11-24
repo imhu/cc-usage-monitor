@@ -103,3 +103,25 @@ func AGModelDisplayName(raw string) string {
 	}
 	return strings.Join(out, " ")
 }
+
+// AGContextWindowSizeFor returns the default context window size (in tokens) for a model family.
+func AGContextWindowSizeFor(model string) int64 {
+	norm := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.Contains(norm, "gemini"):
+		return 1_048_576
+	case strings.Contains(norm, "claude"):
+		if strings.Contains(norm, "1m") {
+			return 1_000_000
+		}
+		return 200_000
+	case strings.Contains(norm, "gpt-4.1"):
+		return 1_048_576
+	case strings.Contains(norm, "gpt-5"):
+		return 400_000
+	case strings.Contains(norm, "gpt-4o"):
+		return 128_000
+	default:
+		return 1_048_576
+	}
+}

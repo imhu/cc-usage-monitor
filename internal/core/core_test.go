@@ -617,3 +617,22 @@ func TestFrankfurterFXRatesAndMoneyFormatting(t *testing.T) {
 		t.Fatalf("expected $100, got %q", got)
 	}
 }
+
+func TestComputeSpeedRateMedianResistance(t *testing.T) {
+	now := 1000.0
+	requests := []TimedRequest{
+		{ID: 1, Model: "claude-opus-5-5", Start: 800, End: 900, Output: 100},  // stalled outlier: 1 tok/s
+		{ID: 2, Model: "claude-opus-5-5", Start: 910, End: 910.2, Output: 20}, // short reply: 100 tok/s, <100 tokens -> ignored in rank
+		{ID: 3, Model: "claude-opus-5-5", Start: 920, End: 930, Output: 800},  // 80 tok/s
+		{ID: 4, Model: "claude-opus-5-5", Start: 940, End: 950, Output: 900},  // 90 tok/s
+		{ID: 5, Model: "claude-opus-5-5", Start: 960, End: 970, Output: 1000}, // 100 tok/s
+	}
+	rate := ComputeSpeedRate(requests, now-300, now)
+	if rate == nil {
+		t.Fatal("expected non-nil SpeedRate")
+	}
+	// Weighted mean would be ~21.7 tok/s due to the 100s stalled outlier; median of {1, 80, 90, 100} is (80+90)/2 = 85.0!
+	if math.Abs(rate.TokensPerSecond()-85.0) > 1e-6 {
+		t.Fatalf("expected median speed 85.0 tok/s, got %v (rate=%+v)", rate.TokensPerSecond(), rate)
+	}
+}

@@ -204,7 +204,11 @@ func mergeAGSnapshots(captured, prev *core.AGStatusLineSnapshot, capturedAt time
 	} else if prev != nil {
 		merged.Version = prev.Version
 	}
-	if captured.ContextWindow != nil {
+	if agContextWindowHasUsage(captured.ContextWindow) {
+		merged.ContextWindow = captured.ContextWindow
+	} else if prev != nil && agContextWindowHasUsage(prev.ContextWindow) {
+		merged.ContextWindow = prev.ContextWindow
+	} else if captured.ContextWindow != nil {
 		merged.ContextWindow = captured.ContextWindow
 	} else if prev != nil {
 		merged.ContextWindow = prev.ContextWindow
@@ -225,6 +229,22 @@ func mergeAGSnapshots(captured, prev *core.AGStatusLineSnapshot, capturedAt time
 		merged.Cost = prev.Cost
 	}
 	return merged
+}
+
+func agContextWindowHasUsage(ctx *core.AGStatusLineContextWindow) bool {
+	if ctx == nil {
+		return false
+	}
+	if ctx.UsedPercentage != nil && *ctx.UsedPercentage > 0 {
+		return true
+	}
+	if ctx.TotalInputTokens != nil && *ctx.TotalInputTokens > 0 {
+		return true
+	}
+	if ctx.TotalOutputTokens != nil && *ctx.TotalOutputTokens > 0 {
+		return true
+	}
+	return false
 }
 
 // RunAGCaptureSnapshot reads statusLine JSON from stdin, stamps _captured_at,

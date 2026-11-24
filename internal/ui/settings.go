@@ -828,8 +828,8 @@ func (m *SettingsModel) renderAGMenuBarSettings(c *ui.Context, st service.ViewSt
 	}
 	vToday := money.Compact(local.Today.EstimatedCostUSD)
 	vCtx := "--"
-	if off.ContextWindow != nil && off.ContextWindow.UsedPercentage != nil {
-		vCtx = fmt.Sprintf("%d%%", int(*off.ContextWindow.UsedPercentage))
+	if usedPct, _, _, ok := core.ResolveAGContextWindow(off, local); ok {
+		vCtx = fmt.Sprintf("%d%%", int(math.Round(usedPct)))
 	}
 
 	ui.Column(c).FillWidth().Gap(8).Children(func() {
