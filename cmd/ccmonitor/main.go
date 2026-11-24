@@ -47,7 +47,6 @@ func (a *application) invalidateAll() {
 			a.settings.Invalidate()
 		}
 		if a.pill != nil {
-			a.syncPillSize()
 			a.pill.Invalidate()
 		}
 		a.updateTray()
@@ -309,16 +308,27 @@ func (a *application) resetPillPosition() {
 	a.pillReady = true
 }
 
+func (a *application) setPillWidth(w int) {
+	if w < 44 {
+		w = 44
+	}
+	if w > 520 {
+		w = 520
+	}
+	mygo.RunOnMain(func() {
+		if a.pill == nil || w == a.pillWidth {
+			return
+		}
+		a.pillWidth = w
+		a.pill.SetSize(w, appui.PillHeight)
+	})
+}
+
 func (a *application) syncPillSize() {
 	if a.pill == nil {
 		return
 	}
-	targetW := appui.PillTargetWidth(a.store.ViewState())
-	if targetW == a.pillWidth {
-		return
-	}
-	a.pillWidth = targetW
-	a.pill.SetSize(targetW, appui.PillHeight)
+	a.pill.Invalidate()
 }
 
 func (a *application) setFloatingPill(show bool) {
@@ -328,6 +338,9 @@ func (a *application) setFloatingPill(show bool) {
 			a.pillSaveTimer = nil
 		}
 		a.pillReady = false
+		if a.pillModel != nil {
+			a.pillModel.ResetMeasuredWidth()
+		}
 		if a.pill != nil {
 			a.pill.Close()
 			a.pill = nil
@@ -337,7 +350,7 @@ func (a *application) setFloatingPill(show bool) {
 	st := a.store.ViewState()
 	if a.pill != nil {
 		a.pill.SetAlwaysOnTop(st.Prefs.PillAlwaysOnTop)
-		a.syncPillSize()
+		a.pill.Invalidate()
 		a.pill.Show()
 		return
 	}
@@ -497,6 +510,7 @@ func (a *application) ready() {
 		HidePill:          func() { a.setFloatingPill(false) },
 		StartDrag:         a.startPillDrag,
 		OnProviderChanged: a.syncProviderState,
+		OnContentWidth:    a.setPillWidth,
 	})
 
 	var err error

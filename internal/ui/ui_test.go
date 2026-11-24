@@ -258,8 +258,11 @@ func TestAntigravityPopoverSwitchAndRender(t *testing.T) {
 		t.Fatalf("expected collapsed Third-Party group with 本周期未使用, got: %q", tt.Texts())
 	}
 
-	// Antigravity Floating Pill renders cleanly in both single-column and localized multi-column modes
-	pill := NewFloatingPillModel(store, PillActions{})
+	// Antigravity Floating Pill auto-sizes tightly in single-, 4-, and 5-column modes
+	reportedW := 0
+	pill := NewFloatingPillModel(store, PillActions{
+		OnContentWidth: func(w int) { reportedW = w },
+	})
 	pw := PillTargetWidth(store.ViewState())
 	pt := ui.NewTesterWith(pill.View, pw, PillHeight, ui.TesterOptions{Dark: true})
 	if !pt.HasText("42%") {
@@ -271,10 +274,28 @@ func TestAntigravityPopoverSwitchAndRender(t *testing.T) {
 		p.AGPillShowWeek = true
 		p.AGPillShowCache = true
 		p.AGPillShowTodayCost = true
+		p.AGPillShowContext = false
+	})
+	pw4 := PillTargetWidth(store.ViewState())
+	if pw4 <= pw || pw4 >= 210 {
+		t.Fatalf("expected compact 4-column width in (%d, 210), got %d", pw, pw4)
+	}
+
+	store.UpdatePrefs(func(p *core.Preferences) {
 		p.AGPillShowContext = true
 	})
-	pwAll := PillTargetWidth(store.ViewState())
-	ptAll := ui.NewTesterWith(pill.View, pwAll, PillHeight, ui.TesterOptions{Dark: true})
+	pw5 := PillTargetWidth(store.ViewState())
+	if pw5 <= pw4 {
+		t.Fatalf("expected 5-column width (%d) > 4-column width (%d)", pw5, pw4)
+	}
+
+	pill.ResetMeasuredWidth()
+	ptAll := ui.NewTesterWith(pill.View, pw5, PillHeight, ui.TesterOptions{Dark: true})
+	ptAll.Advance(20 * time.Millisecond)
+	if reportedW <= 0 || reportedW > 520 {
+		t.Fatalf("expected OnContentWidth measured width in (0, 520], got %d", reportedW)
+	}
+	ptAll.SetSize(reportedW, PillHeight)
 	for _, want := range []string{"5小时", "本周", "缓存", "今日", "上下文", "42%"} {
 		if !ptAll.HasText(want) {
 			t.Errorf("antigravity Chinese multi-column pill missing %q; got: %q", want, ptAll.Texts())
@@ -283,7 +304,7 @@ func TestAntigravityPopoverSwitchAndRender(t *testing.T) {
 	saveSnap("pill-ag.png", ptAll)
 
 	store.UpdatePrefs(func(p *core.Preferences) { p.Language = core.LangEN })
-	ptEn := ui.NewTesterWith(pill.View, pwAll, PillHeight, ui.TesterOptions{Dark: true})
+	ptEn := ui.NewTesterWith(pill.View, PillTargetWidth(store.ViewState()), PillHeight, ui.TesterOptions{Dark: true})
 	for _, want := range []string{"5H", "WEEK", "CACHE", "TODAY", "CTX", "42%"} {
 		if !ptEn.HasText(want) {
 			t.Errorf("antigravity English multi-column pill missing %q; got: %q", want, ptEn.Texts())
