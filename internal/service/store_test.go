@@ -3,6 +3,7 @@ package service
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -421,6 +422,113 @@ func TestStickySpeedDefaultAndCycle(t *testing.T) {
 	st = s.ViewState()
 	if active := st.ActiveSpeedModel(models); active == nil || active.ID() != "Haiku 4.5" {
 		t.Fatalf("expected CycleSpeedModel to advance from Opus 5.5 to Haiku 4.5, got %+v", active)
+	}
+}
+
+func TestExpiryRemindersAndDedup(t *testing.T) {
+	tmp := t.TempDir()
+	now := time.Date(2026, 11, 22, 10, 0, 0, 0, time.Local)
+
+	type toast struct{ title, body string }
+	var toasts []toast
+
+	s := &Store{
+		dataDir:   tmp,
+		prefsPath: filepath.Join(tmp, "prefs.json"),
+		indexPath: filepath.Join(tmp, "index.gob"),
+		statePath: filepath.Join(tmp, "state.json"),
+		prefs:     core.DefaultPreferences(),
+		index:     core.NewUsageIndex(),
+		pstate:    persistedState{Budget: core.NewRequestBudget(now)},
+		notifyToastFn: func(title, body string) {
+			toasts = append(toasts, toast{title: title, body: body})
+		},
+	}
+	s.prefs.BillingAnchorDay = 25 // 3 days left on Nov 22
+	s.prefs.ExpiryNotifications = false
+
+	// Disabled toggle must send nothing.
+	s.mu.Lock()
+	s.evaluateExpiryRemindersLocked(now)
+	s.mu.Unlock()
+	if len(toasts) != 0 {
+		t.Fatalf("expected 0 toasts when disabled, got %+v", toasts)
+	}
+
+	// Enable -> 3-day reminder fires once, not twice.
+	s.mu.Lock()
+	s.prefs.ExpiryNotifications = true
+	s.evaluateExpiryRemindersLocked(now)
+	s.evaluateExpiryRemindersLocked(now.Add(10 * time.Minute))
+	s.mu.Unlock()
+	if len(toasts) != 1 || !strings.Contains(toasts[0].body, "3 天") {
+		t.Fatalf("expected single 3-day reminder toast, got %+v", toasts)
+	}
+
+	// Advance to 1 day left (Nov 24) -> 1-day reminder fires once.
+	nov24 := time.Date(2026, 11, 24, 10, 0, 0, 0, time.Local)
+	s.mu.Lock()
+	s.evaluateExpiryRemindersLocked(nov24)
+	s.evaluateExpiryRemindersLocked(nov24.Add(time.Hour))
+	s.mu.Unlock()
+	if len(toasts) != 2 || !strings.Contains(toasts[1].body, "明天") {
+		t.Fatalf("expected single 1-day reminder toast, got %+v", toasts)
+	}
+
+	// Health payment_failed notifies once, resets when back to active, notifies again on next failure.
+	s.mu.Lock()
+	s.profile = &core.AccountProfile{SubscriptionStatus: "past_due"}
+	s.evaluateExpiryRemindersLocked(nov24)
+	s.evaluateExpiryRemindersLocked(nov24)
+	s.mu.Unlock()
+	if len(toasts) != 3 || !strings.Contains(toasts[2].title, "扣款失败") {
+		t.Fatalf("expected payment failed toast, got %+v", toasts)
+	}
+	s.mu.Lock()
+	s.profile.SubscriptionStatus = "active"
+	s.evaluateExpiryRemindersLocked(nov24)
+	s.profile.SubscriptionStatus = "past_due"
+	s.evaluateExpiryRemindersLocked(nov24)
+	s.mu.Unlock()
+	if len(toasts) != 4 {
+		t.Fatalf("expected re-notification after recovery, got %d toasts", len(toasts))
+	}
+
+	// Login expiring in 12h (< 24h) notifies once.
+	exp := nov24.Add(12 * time.Hour)
+	s.mu.Lock()
+	s.loginExpiresAt = &exp
+	s.evaluateExpiryRemindersLocked(nov24)
+	s.evaluateExpiryRemindersLocked(nov24.Add(15 * time.Minute))
+	s.mu.Unlock()
+	if len(toasts) != 5 || !strings.Contains(toasts[4].title, "登录即将过期") {
+		t.Fatalf("expected single login-expiring toast, got %+v", toasts)
+	}
+}
+
+func TestProfileIntervalDynamic1hVs6h(t *testing.T) {
+	s := &Store{prefs: core.DefaultPreferences()}
+	s.prefs.BillingAnchorDay = 25
+
+	// Mid-term, healthy -> 6h
+	mid := time.Date(2026, 11, 10, 12, 0, 0, 0, time.Local)
+	if got := s.profileIntervalLocked(mid); got != 6*time.Hour {
+		t.Fatalf("expected 6h mid-term interval, got %v", got)
+	}
+	// Ending (<= 3 days left) -> 1h
+	ending := time.Date(2026, 11, 23, 12, 0, 0, 0, time.Local)
+	if got := s.profileIntervalLocked(ending); got != time.Hour {
+		t.Fatalf("expected 1h ending interval, got %v", got)
+	}
+	// Just started (< 24h after renewal) -> 1h
+	justStarted := time.Date(2026, 11, 25, 10, 0, 0, 0, time.Local)
+	if got := s.profileIntervalLocked(justStarted); got != time.Hour {
+		t.Fatalf("expected 1h just-started interval, got %v", got)
+	}
+	// Troubled health -> 1h even mid-term
+	s.profile = &core.AccountProfile{SubscriptionStatus: "past_due"}
+	if got := s.profileIntervalLocked(mid); got != time.Hour {
+		t.Fatalf("expected 1h troubled-health interval, got %v", got)
 	}
 }
 

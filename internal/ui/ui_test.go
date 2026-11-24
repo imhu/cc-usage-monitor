@@ -317,3 +317,87 @@ func TestAntigravityPopoverSwitchAndRender(t *testing.T) {
 	stTall := ui.NewTesterWith(set.View, 540, 1060, ui.TesterOptions{Dark: true})
 	saveSnap("settings-data-ag.png", stTall)
 }
+
+func TestSpendMathRoundingTooltipsAndLiveSettings(t *testing.T) {
+	now := time.Date(2026, 11, 24, 14, 0, 0, 0, time.Local)
+	wStart := now.Add(-2 * 24 * time.Hour)
+	wEnd := wStart.Add(core.WeekWindow)
+	restartedAt := now.Add(-12 * time.Hour)
+
+	// Displayed projected estimate is $100 (from $100.40 fullWeek), spent is $30.25 ->
+	// exactRemaining must be $69.75 so 30.25 + 69.75 = 100.00!
+	snap := &core.UsageSnapshot{
+		WeeklyAllowance: &core.WeeklyAllowance{
+			Start:       wStart,
+			End:         wEnd,
+			Utilization: 50,
+			SyncedCost:  30.20, // Full = $60.40
+			Spent:       10.25,
+			RestartedAt: &restartedAt,
+			Forgiven:    40.00, // FullWeek = $100.40 -> Whole displays "$100"
+		},
+	}
+	period := &core.PeriodUsage{
+		Start:    wStart,
+		End:      wEnd,
+		Cost:     30.25,
+		DayIndex: 3,
+		DayCount: 7,
+	}
+
+	sm := spendMath{snap: snap, money: core.NewMoneyFormat(core.CurrencyUSD), now: now, zh: true}
+	if got := sm.projectedText(period); got != "$100" {
+		t.Fatalf("expected projected $100, got %q", got)
+	}
+	exact, ok := sm.exactRemaining(period)
+	if !ok || exact != "$69.75" {
+		t.Fatalf("expected exactRemaining $69.75 matching displayed $100 - $30.25, got %q (ok=%v)", exact, ok)
+	}
+	tip := sm.totalTooltip(period, core.SpanWeek, false)
+	if !strings.Contains(tip, "重置前已花的 $40.00") || !strings.Contains(tip, "$60.00") {
+		t.Fatalf("expected midweek reset split ($40.00 + $60.00 = $100) in totalTooltip, got: %q", tip)
+	}
+	paceTip := sm.paceTooltip(period, core.SpanWeek)
+	if !strings.Contains(paceTip, "中途重置了本周额度") || !strings.Contains(paceTip, "$69.75") {
+		t.Fatalf("expected midweek reset basis & exact remaining in paceTooltip, got: %q", paceTip)
+	}
+
+	// runsOutNote formatting
+	if got := runsOutNote(now.Add(2*time.Hour), now, true); !strings.Contains(got, "16:00 用完") {
+		t.Fatalf("expected same-day HH:mm runsOutNote, got %q", got)
+	}
+	if got := runsOutNote(now.Add(24*time.Hour), now, true); got != "明天用完" {
+		t.Fatalf("expected tomorrow runsOutNote, got %q", got)
+	}
+	if got := runsOutNote(now.Add(-time.Minute), now, true); got != "额度已用完" {
+		t.Fatalf("expected past runsOutNote, got %q", got)
+	}
+
+	// 429 status tooltip + Claude Code source
+	st429 := service.ViewState{
+		OfficialState:       service.OfficialFailed,
+		IsRateLimited:       true,
+		RetryWait:           4 * time.Minute,
+		UsageFromClaudeCode: true,
+		OfficialUsage: &core.OfficialUsage{
+			FetchedAt: now.Add(-5 * time.Minute),
+		},
+	}
+	statusTip := limitsStatusTooltip(st429, limitsStaleReason(st429, true), true)
+	if !strings.Contains(statusTip, "Claude Code 查到的") || !strings.Contains(statusTip, "共用") {
+		t.Fatalf("expected Claude Code source & 429 shared-allowance note, got: %q", statusTip)
+	}
+
+	// Settings > Menubar shows live "–" for speed when no 5m replies (never static "71")
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+	emptyStore := service.NewStore(nil)
+	set := NewSettingsModel(emptyStore, SettingsActions{})
+	set.ActiveTab = TabMenuBar
+	stUI := ui.NewTesterWith(set.View, 540, 620, ui.TesterOptions{Dark: true})
+	if stUI.HasText("71") {
+		t.Fatalf("settings Menubar tab must not show hardcoded 71 speed when no replies exist; got: %q", stUI.Texts())
+	}
+	if !stUI.HasText("–") {
+		t.Fatalf("settings Menubar tab should show live dash for speed with no 5m replies; got: %q", stUI.Texts())
+	}
+}

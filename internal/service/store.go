@@ -88,6 +88,7 @@ type ViewState struct {
 	HasCredentialsFile bool
 	HasProjectsDir     bool
 	DataRoots          []string
+	FXRates            map[string]float64
 
 	// Antigravity
 	AG AGViewState
@@ -121,6 +122,9 @@ type persistedState struct {
 	MidweekReset     *core.MidweekReset   `json:"midweekReset,omitempty"`
 	LastUsage        *core.OfficialUsage  `json:"lastUsage,omitempty"`
 	Profile          *core.AccountProfile `json:"profile,omitempty"`
+	ExpiryNotified   map[string]bool      `json:"expiryNotified,omitempty"`
+	FXPerUSD         map[string]float64   `json:"fxPerUSD,omitempty"`
+	FXFetchedAt      *time.Time           `json:"fxFetchedAt,omitempty"`
 }
 
 type Store struct {
@@ -172,7 +176,9 @@ type Store struct {
 
 	processes []platform.ClaudeTask
 
-	lastAlertPct int
+	lastAlertPct  int
+	fxInFlight    bool
+	notifyToastFn func(title, body string)
 
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -323,6 +329,7 @@ func (s *Store) resetOfficialAccountLocked() {
 	s.pstate.WeeklyReading = nil
 	s.pstate.EarlierAllowance = nil
 	s.pstate.MidweekReset = nil
+	s.pstate.ExpiryNotified = nil
 	s.pstate.ClaudeConfigDir = platform.ClaudeConfigDir(s.prefs.ClaudeConfigDir)
 	s.savePersistedStateLocked()
 }
@@ -360,6 +367,9 @@ func (s *Store) Start() {
 
 	// 5. Start Antigravity local scanner, watchers, and background CLI syncer
 	go s.startAG()
+
+	// 6. Refresh live FX rates (Frankfurter, hourly, independent of Anthropic)
+	go s.RefreshFXRatesIfStale()
 }
 
 func (s *Store) Stop() {
@@ -669,6 +679,10 @@ func (s *Store) runScheduler() {
 			if s.shouldProbeExit() {
 				s.CheckExit(false)
 			}
+			go s.RefreshFXRatesIfStale()
+			s.mu.Lock()
+			s.evaluateExpiryRemindersLocked(time.Now())
+			s.mu.Unlock()
 		case <-tick.C:
 			s.maybeAutoSync()
 		}
@@ -693,6 +707,7 @@ func (s *Store) maybeAutoSync() {
 }
 
 func (s *Store) OnPanelOpened() {
+	go s.RefreshFXRatesIfStale()
 	go func() {
 		s.mu.RLock()
 		activeProvider := core.NormalizeProvider(s.prefs.ActiveProvider)
@@ -1213,13 +1228,29 @@ func (s *Store) SyncOfficial(manual bool, fetchProfile bool) {
 		}
 		s.lastAlertPct = pct
 	}
+	s.evaluateExpiryRemindersLocked(doneNow)
 
-	// Fetch profile periodically (every 6h or on first sync)
-	needProfile := fetchProfile || s.profile == nil || s.profileCheckedAt == nil || time.Since(*s.profileCheckedAt) > 6*time.Hour
+	// Fetch profile periodically (1h near billing renewal or on subscription problem; 6h otherwise)
+	profInterval := s.profileIntervalLocked(doneNow)
+	needProfile := fetchProfile || s.profile == nil || s.profileCheckedAt == nil || doneNow.Sub(*s.profileCheckedAt) > profInterval
 	token := creds.AccessToken
 	if needProfile {
 		go s.fetchProfile(client, token, reqClaudeDir)
 	}
+}
+
+func (s *Store) sendToast(title, body string) {
+	s.mu.RLock()
+	fn := s.notifyToastFn
+	s.mu.RUnlock()
+	if fn != nil {
+		fn(title, body)
+		return
+	}
+	_ = mygo.NewNotification(mygo.NotificationOptions{
+		Title: title,
+		Body:  body,
+	}).Show()
 }
 
 func (s *Store) sendUsageNotification(pct int) {
@@ -1230,10 +1261,191 @@ func (s *Store) sendUsageNotification(pct int) {
 		title = "Claude Usage Alert"
 		body = fmt.Sprintf("5-hour limit reached %d%%", pct)
 	}
-	_ = mygo.NewNotification(mygo.NotificationOptions{
-		Title: title,
-		Body:  body,
-	}).Show()
+	s.sendToast(title, body)
+}
+
+func (s *Store) currentSubscriptionTermLocked(now time.Time) *core.SubscriptionTerm {
+	if s.prefs.BillingAnchorDay < 1 || s.prefs.BillingAnchorDay > 31 {
+		return nil
+	}
+	h, m, sec := 0, 0, 0
+	if s.pstate.WeeklyReset != nil {
+		loc := s.pstate.WeeklyReset.Local()
+		h, m, sec = loc.Hour(), loc.Minute(), loc.Second()
+	}
+	return core.ComputeSubscriptionTerm(s.prefs.BillingAnchorDay, h, m, sec, now)
+}
+
+// profileIntervalLocked matches UsageStore.swift: 1h near renewal/just started/troubled, 6h otherwise.
+func (s *Store) profileIntervalLocked(now time.Time) time.Duration {
+	term := s.currentSubscriptionTermLocked(now)
+	nearRenewal := term != nil && (term.IsEnding() || term.JustStarted(now))
+	troubled := false
+	if s.profile != nil {
+		h := s.profile.Health()
+		troubled = h != "" && h != core.HealthActive
+	}
+	if nearRenewal || troubled {
+		return time.Hour
+	}
+	return 6 * time.Hour
+}
+
+// evaluateExpiryRemindersLocked checks subscription countdown (3d & 1d), subscription health
+// problems, and Claude Code login expiry (< 24h), firing each reminder once per period/incident.
+func (s *Store) evaluateExpiryRemindersLocked(now time.Time) {
+	if !s.prefs.ExpiryNotifications {
+		return
+	}
+	zh := s.prefs.IsChinese()
+	if s.pstate.ExpiryNotified == nil {
+		s.pstate.ExpiryNotified = map[string]bool{}
+	}
+	dirty := false
+	fireOnce := func(key, title, body string) {
+		if s.pstate.ExpiryNotified[key] {
+			return
+		}
+		s.pstate.ExpiryNotified[key] = true
+		dirty = true
+		if s.notifyToastFn != nil {
+			s.notifyToastFn(title, body)
+		} else {
+			go s.sendToast(title, body)
+		}
+	}
+
+	// 1. Subscription health problems (payment failed, action required, inactive).
+	var health core.SubscriptionHealth
+	if s.profile != nil {
+		health = s.profile.Health()
+	}
+	switch health {
+	case core.HealthPaymentFailed:
+		if zh {
+			fireOnce("health-payment_failed", "Claude 订阅扣款失败", "续费没扣成功，请到 claude.ai 的「设置 › 账单」更新付款方式")
+		} else {
+			fireOnce("health-payment_failed", "Claude renewal payment failed", "Update your payment method in Settings > Billing on claude.ai.")
+		}
+	case core.HealthActionRequired:
+		if zh {
+			fireOnce("health-action_required", "Claude 续费付款待验证", "请到 claude.ai 的「设置 › 账单」完成付款验证")
+		} else {
+			fireOnce("health-action_required", "Claude payment needs confirming", "Finish confirming your renewal payment in Settings > Billing on claude.ai.")
+		}
+	case core.HealthInactive:
+		if zh {
+			fireOnce("health-inactive", "Claude 订阅已结束", "官方账号资料显示订阅已结束，可在 claude.ai 重新订阅")
+		} else {
+			fireOnce("health-inactive", "Claude subscription ended", "Your official account profile shows the subscription has ended.")
+		}
+	case core.HealthActive:
+		for _, k := range []string{"health-payment_failed", "health-action_required", "health-inactive"} {
+			if s.pstate.ExpiryNotified[k] {
+				delete(s.pstate.ExpiryNotified, k)
+				dirty = true
+			}
+		}
+	}
+
+	// 2. Billing period countdown (3 days and 1 day before end) when subscription is not troubled.
+	if health == "" || health == core.HealthActive {
+		if term := s.currentSubscriptionTermLocked(now); term != nil {
+			tag := term.End.UTC().Format("2006-01-02")
+			if term.DaysLeft <= 1 {
+				if zh {
+					body := "本期订阅将在明天到期"
+					if term.DaysLeft == 0 {
+						body = "本期订阅今天到期"
+					}
+					fireOnce("sub-1d-"+tag, "Claude 订阅即将到期", body)
+				} else {
+					body := "Your billing period ends tomorrow."
+					if term.DaysLeft == 0 {
+						body = "Your billing period ends today."
+					}
+					fireOnce("sub-1d-"+tag, "Claude subscription ending", body)
+				}
+			} else if term.DaysLeft <= 3 {
+				if zh {
+					fireOnce("sub-3d-"+tag, "Claude 订阅即将到期", fmt.Sprintf("本期订阅还剩 %d 天到期", term.DaysLeft))
+				} else {
+					fireOnce("sub-3d-"+tag, "Claude subscription ending", fmt.Sprintf("%d days left in your billing period.", term.DaysLeft))
+				}
+			}
+		}
+	}
+
+	// 3. Claude Code login expiry within 24 hours.
+	if s.loginExpiresAt != nil {
+		rem := s.loginExpiresAt.Sub(now)
+		if rem > 0 && rem <= 24*time.Hour {
+			tag := s.loginExpiresAt.UTC().Format("2006-01-02")
+			if zh {
+				fireOnce("login-"+tag, "Claude Code 登录即将过期", "登录有效期不足 1 天，请确认自动续期已开启或重新登录")
+			} else {
+				fireOnce("login-"+tag, "Claude Code login expiring", "Your Claude Code login expires in less than a day.")
+			}
+		}
+	}
+
+	if dirty {
+		s.savePersistedStateLocked()
+	}
+}
+
+// RefreshFXRatesIfStale fetches hourly USD exchange rates from Frankfurter (matching ExchangeRates.swift).
+func (s *Store) RefreshFXRatesIfStale() {
+	now := time.Now()
+	s.mu.Lock()
+	if s.fxInFlight {
+		s.mu.Unlock()
+		return
+	}
+	if s.pstate.FXFetchedAt != nil && now.Sub(*s.pstate.FXFetchedAt) < core.FXRefreshInterval && len(s.pstate.FXPerUSD) > 0 {
+		s.mu.Unlock()
+		return
+	}
+	s.fxInFlight = true
+	proxyRaw := s.effectiveProxyLocked()
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		s.fxInFlight = false
+		s.mu.Unlock()
+	}()
+
+	client := core.BuildHTTPClient(proxyRaw, "tcp4", 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, core.FXEndpoint, nil)
+	if err != nil {
+		return
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<18))
+	if err != nil {
+		return
+	}
+	rates, err := core.ParseFrankfurterRates(body)
+	if err != nil {
+		return
+	}
+	fetched := time.Now()
+	s.mu.Lock()
+	s.pstate.FXPerUSD = rates
+	s.pstate.FXFetchedAt = &fetched
+	s.savePersistedStateLocked()
+	s.mu.Unlock()
+	s.notify()
 }
 
 func (s *Store) fetchUsageAPI(client *http.Client, accessToken string) (*core.OfficialUsage, int, time.Duration, error) {
@@ -1316,6 +1528,7 @@ func (s *Store) fetchProfile(client *http.Client, accessToken string, reqClaudeD
 	s.profileCheckedAt = &now
 	s.pstate.Profile = prof
 	s.pstate.ClaudeConfigDir = reqClaudeDir
+	s.evaluateExpiryRemindersLocked(now)
 	s.savePersistedStateLocked()
 	s.mu.Unlock()
 	s.notify()
@@ -1599,7 +1812,9 @@ func (s *Store) UpdatePrefs(fn func(*core.Preferences)) {
 		s.officialState = OfficialConnecting
 	}
 	started := s.ctx != nil
-	s.recomputeSnapshotLocked(time.Now())
+	now := time.Now()
+	s.recomputeSnapshotLocked(now)
+	s.evaluateExpiryRemindersLocked(now)
 	_ = core.SavePreferences(s.prefsPath, s.prefs)
 	s.mu.Unlock()
 	s.notify()
@@ -1737,6 +1952,14 @@ func (s *Store) ViewState() ViewState {
 		retryWait = s.pstate.Budget.RetryWait(now)
 	}
 
+	var fxRates map[string]float64
+	if len(s.pstate.FXPerUSD) > 0 {
+		fxRates = make(map[string]float64, len(s.pstate.FXPerUSD))
+		for k, v := range s.pstate.FXPerUSD {
+			fxRates[k] = v
+		}
+	}
+
 	return ViewState{
 		Prefs:               s.prefs,
 		Phase:               s.phase,
@@ -1773,6 +1996,7 @@ func (s *Store) ViewState() ViewState {
 		HasCredentialsFile:  credErr == nil,
 		HasProjectsDir:      projErr == nil,
 		DataRoots:           platform.ClaudeProjectRoots(s.prefs.ClaudeConfigDir, s.prefs.CustomDataDir),
+		FXRates:             fxRates,
 		AG:                  s.agViewStateLocked(),
 	}
 }

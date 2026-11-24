@@ -550,3 +550,70 @@ func TestPillPreferencesPersistence(t *testing.T) {
 		t.Fatalf("unexpected reloaded pill prefs: %+v", p2)
 	}
 }
+
+func TestPlanKindTitlesAndSubscriptionJustStarted(t *testing.T) {
+	if PlanPro.Title() != "Pro" {
+		t.Fatalf("expected Pro, got %q", PlanPro.Title())
+	}
+	if PlanMax5x.Title() != "Max" {
+		t.Fatalf("expected Max for PlanMax5x, got %q", PlanMax5x.Title())
+	}
+	if PlanMax20x.Title() != "Ultra" {
+		t.Fatalf("expected Ultra for PlanMax20x, got %q", PlanMax20x.Title())
+	}
+	if PlanUltra.Title() != "Ultra" {
+		t.Fatalf("expected Ultra for PlanUltra, got %q", PlanUltra.Title())
+	}
+
+	start := time.Date(2026, 11, 20, 0, 0, 0, 0, time.Local)
+	term := SubscriptionTerm{Start: start, End: start.AddDate(0, 1, 0), DaysLeft: 30}
+	if !term.JustStarted(start.Add(12 * time.Hour)) {
+		t.Fatal("expected JustStarted=true within 24h of start")
+	}
+	if term.JustStarted(start.Add(25 * time.Hour)) {
+		t.Fatal("expected JustStarted=false after 24h")
+	}
+}
+
+func TestFrankfurterFXRatesAndMoneyFormatting(t *testing.T) {
+	rates, err := ParseFrankfurterRates([]byte(`{"amount":1.0,"base":"USD","date":"2026-11-24","rates":{"CNY":7.12,"JPY":152.5,"EUR":0.92,"BAD":-1}}`))
+	if err != nil {
+		t.Fatalf("ParseFrankfurterRates failed: %v", err)
+	}
+	if rates["USD"] != 1 || rates["CNY"] != 7.12 || rates["JPY"] != 152.5 {
+		t.Fatalf("unexpected parsed rates: %+v", rates)
+	}
+	if _, ok := rates["BAD"]; ok {
+		t.Fatal("non-positive rate must be ignored")
+	}
+	if _, err := ParseFrankfurterRates([]byte(`{"rates":{}}`)); err == nil {
+		t.Fatal("expected error on empty rates payload")
+	}
+
+	cny := NewMoneyFormatWithRates(CurrencyCNY, rates)
+	if got := cny.Format(10); got != "¥71.20" {
+		t.Fatalf("expected live CNY ¥71.20, got %q", got)
+	}
+	// Large values (>= 10000 in display currency) drop decimals cleanly.
+	if got := cny.Format(2000); got != "¥14,240" {
+		t.Fatalf("expected ¥14,240 without decimals, got %q", got)
+	}
+	// Fallback rate when currency not in map.
+	twd := NewMoneyFormatWithRates(CurrencyTWD, rates)
+	if twd.Rate != CurrencyTWD.DefaultRate() {
+		t.Fatalf("expected fallback TWD rate %v, got %v", CurrencyTWD.DefaultRate(), twd.Rate)
+	}
+	// JPY uses JP¥ and 0 decimal places.
+	jpy := NewMoneyFormatWithRates(CurrencyJPY, rates)
+	if got := jpy.Format(10); got != "JP¥1,525" {
+		t.Fatalf("expected JP¥1,525, got %q", got)
+	}
+	// Whole rounds >= 100 to integer, keeps 2 decimals below 100.
+	usd := NewMoneyFormatWithRates(CurrencyUSD, nil)
+	if got := usd.Whole(42.5); got != "$42.50" {
+		t.Fatalf("expected $42.50, got %q", got)
+	}
+	if got := usd.Whole(100.4); got != "$100" {
+		t.Fatalf("expected $100, got %q", got)
+	}
+}

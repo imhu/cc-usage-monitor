@@ -25,11 +25,11 @@ func PlanTag(c *ui.Context, plan core.PlanKind) {
 		fill = ui.Transparent
 		stroke = ColorAccent.Alpha(0.6)
 		text = ui.Hex("#E0896C")
-	case core.PlanMax5x, core.PlanMax20x:
+	case core.PlanMax5x:
 		fill = ColorAccent.Alpha(0.20)
 		stroke = ui.Transparent
 		text = ui.Hex("#E8977C")
-	case core.PlanUltra:
+	case core.PlanMax20x, core.PlanUltra:
 		fill = ColorAccent
 		stroke = ui.Transparent
 		text = ui.Hex("#3A1A0E")

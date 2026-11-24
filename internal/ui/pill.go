@@ -121,7 +121,7 @@ func (m *FloatingPillModel) View(c *ui.Context) {
 
 	zh := st.Prefs.IsChinese()
 	now := time.Now()
-	money := core.NewMoneyFormat(st.Prefs.Currency)
+	money := core.NewMoneyFormatWithRates(st.Prefs.Currency, st.FXRates)
 
 	if provider == core.ProviderClaude && st.Prefs.ClawdAnimation {
 		c.After(800 * time.Millisecond)

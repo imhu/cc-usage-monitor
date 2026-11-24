@@ -642,7 +642,7 @@ func (m *PopoverModel) renderAGSpeedSection(c *ui.Context, st service.ViewState,
 func (m *PopoverModel) renderAGSpendSection(c *ui.Context, st service.ViewState, now time.Time, zh bool) {
 	local := st.AG.LocalReport
 	off := st.AG.OfficialReport
-	money := core.NewMoneyFormat(st.Prefs.Currency)
+	money := core.NewMoneyFormatWithRates(st.Prefs.Currency, st.FXRates)
 	span := st.Prefs.AGCostSpan
 	if span == "" {
 		span = core.SpanWeek

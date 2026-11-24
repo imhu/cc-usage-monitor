@@ -426,8 +426,11 @@ func (m *PopoverModel) renderProcesses(c *ui.Context, st service.ViewState, zh b
 		SectionHeader(c, "sec-proc", tr(zh, "进程", "Processes"), !m.procExpanded, func() {
 			m.procExpanded = !m.procExpanded
 		}, func() {
-			ui.Text(c, tr(zh, fmt.Sprintf("%d 个", len(st.Processes)), fmt.Sprintf("%d", len(st.Processes)))).
+			txt := ui.Text(c, tr(zh, fmt.Sprintf("%d 个", len(st.Processes)), fmt.Sprintf("%d", len(st.Processes)))).
 				FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
+			if !m.procExpanded && len(st.Processes) > 0 {
+				txt.Tooltip(processesSummaryTooltip(st.Processes, zh))
+			}
 		})
 		if m.procExpanded {
 			ui.Column(c).FillWidth().Gap(2).Children(func() {
@@ -514,24 +517,40 @@ func (m *PopoverModel) renderSections(c *ui.Context, st service.ViewState, now t
 func (m *PopoverModel) renderLimitsSection(c *ui.Context, st service.ViewState, now time.Time, zh bool) {
 	rows := core.BuildLimitRows(st.OfficialUsage, now, zh)
 	collapsed := st.Prefs.CollapsedLimits
+	stale := limitsStaleReason(st, zh)
 
 	ui.Column(c).FillWidth().Padding(12, 0).Gap(11).Children(func() {
 		SectionHeader(c, "sec-limits", tr(zh, "用量限额", "Limits"), collapsed, func() {
 			m.Store.UpdatePrefs(func(p *core.Preferences) { p.CollapsedLimits = !p.CollapsedLimits })
 		}, func() {
-			if collapsed && len(rows) > 0 {
-				ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
-					for _, row := range rows {
-						ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
-							ui.Text(c, row.ShortTitle).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
-							ui.Text(c, fmt.Sprintf("%d%%", row.Percent)).FontSize(10.5).FontWeight(500).
-								TextColor(LevelColor(row.Fraction)).FontFeatures("tnum").SingleLine()
-						})
-					}
-				})
+			if collapsed {
+				if len(rows) > 0 {
+					sumRow := ui.Row(c).Gap(10).AlignItems(ui.Center)
+					sumRow.Children(func() {
+						for _, row := range rows {
+							pctCol := LevelColor(row.Fraction)
+							if stale != "" {
+								pctCol = ColorSecondary
+							}
+							ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+								ui.Text(c, row.ShortTitle).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
+								ui.Text(c, fmt.Sprintf("%d%%", row.Percent)).FontSize(10.5).FontWeight(500).
+									TextColor(pctCol).FontFeatures("tnum").SingleLine()
+							})
+						}
+						if stale != "" {
+							ui.Text(c, stale).FontSize(10.5).TextColor(ColorWarning).SingleLine()
+						}
+					})
+					sumRow.Tooltip(limitsSummaryTooltip(rows, st, stale, now, zh))
+					return
+				}
+				ui.Text(c, limitsStatusText(st, now, zh)).FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine().
+					Tooltip(limitsUnavailableReason(st, zh))
 				return
 			}
-			ui.Text(c, limitsStatusText(st, now, zh)).FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
+			ui.Text(c, limitsStatusText(st, now, zh)).FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine().
+				Tooltip(limitsStatusTooltip(st, stale, zh))
 		})
 
 		if collapsed {
@@ -555,7 +574,8 @@ func (m *PopoverModel) renderLimitsSection(c *ui.Context, st service.ViewState, 
 						mark = &f
 						exceeded = line.IsExceeded(row.Fraction)
 					}
-					ui.Row(c.Key("cl-"+row.ID)).FillWidth().Gap(12).AlignItems(ui.Center).Children(func() {
+					rEl := ui.Row(c.Key("cl-"+row.ID)).FillWidth().Gap(12).AlignItems(ui.Center)
+					rEl.Children(func() {
 						ui.Text(c, row.ShortTitle).Width(42).FontSize(12.5).TextColor(ColorText).SingleLine()
 						ui.Box(c).Grow(1).Children(func() {
 							ThinBar(c, "cbar-"+row.ID, row.Fraction, col, mark, exceeded, nil)
@@ -563,6 +583,9 @@ func (m *PopoverModel) renderLimitsSection(c *ui.Context, st service.ViewState, 
 						ui.Text(c, fmt.Sprintf("%d%%", row.Percent)).Width(34).TextAlign(ui.End).
 							FontSize(12.5).FontWeight(500).TextColor(col).FontFeatures("tnum").SingleLine()
 					})
+					if tip := limitCompactTooltip(row, line, st.Prefs, now, zh); tip != "" {
+						rEl.Tooltip(tip)
+					}
 				}
 			})
 		} else {
@@ -666,40 +689,201 @@ func formatLimitReset(row core.LimitRow, prefs core.Preferences, now time.Time, 
 	}
 }
 
+func limitsShortReason(st service.ViewState, zh bool) string {
+	switch st.OfficialState {
+	case service.OfficialConnected:
+		return tr(zh, "已连接", "Connected")
+	case service.OfficialConnecting:
+		return tr(zh, "正在连接…", "Connecting…")
+	case service.OfficialDisabled:
+		return tr(zh, "已关闭", "Off")
+	case service.OfficialNoCredentials:
+		return tr(zh, "未登录", "Not signed in")
+	case service.OfficialExpired:
+		return tr(zh, "登录已过期", "Login expired")
+	case service.OfficialSignedOut:
+		return tr(zh, "需要重新登录", "Sign in again")
+	case service.OfficialFailed:
+		if st.IsRateLimited {
+			return tr(zh, "被 Claude 限流", "Rate limited by Claude")
+		}
+		if st.OfficialFailMsg != "" {
+			return st.OfficialFailMsg
+		}
+		return tr(zh, "请求失败", "Request failed")
+	default:
+		return tr(zh, "尚未查询", "Not checked yet")
+	}
+}
+
+func limitsStaleReason(st service.ViewState, zh bool) string {
+	switch st.OfficialState {
+	case service.OfficialConnected, service.OfficialConnecting, service.OfficialDisabled:
+		return ""
+	default:
+		return limitsShortReason(st, zh)
+	}
+}
+
+func limitsUnavailableReason(st service.ViewState, zh bool) string {
+	switch st.OfficialState {
+	case service.OfficialConnected, service.OfficialConnecting:
+		if st.IsFetching {
+			return tr(zh, "正在获取官方用量…", "Fetching official usage…")
+		}
+		return tr(zh, "还没有官方数据。Claude Code 正在使用时会自动查询，也可以点「立即刷新」。", "No official numbers yet. They are checked while Claude Code is in use, or tap Refresh.")
+	case service.OfficialDisabled:
+		return tr(zh, "官方用量已关闭，可在「设置 › 用量」中开启。", "Official usage is off. Turn it on in Settings > Usage.")
+	case service.OfficialNoCredentials:
+		return tr(zh, "没有找到 Claude Code 的登录信息，登录后即可显示官方用量。", "No Claude Code login found. Sign in to show official usage.")
+	case service.OfficialExpired:
+		return tr(zh, "Claude Code 的登录已过期。开启「设置 › 用量 › 自动续期登录」，或重新登录。", "The Claude Code login has expired. Turn on automatic renewal in Settings > Usage, or sign in again.")
+	case service.OfficialSignedOut:
+		return tr(zh, "Claude Code 的登录已失效（登录到期或已退出），重新登录后自动恢复。", "The Claude Code login is no longer valid. Sign in again and this app recovers.")
+	case service.OfficialFailed:
+		msg := st.OfficialFailMsg
+		if st.IsRateLimited {
+			msg = tr(zh, "被 Claude 限流", "Rate limited by Claude")
+		}
+		return tr(zh, fmt.Sprintf("暂时无法获取官方用量（%s），稍后自动重试。", msg), fmt.Sprintf("Official usage is unavailable (%s). Retrying shortly.", msg))
+	default:
+		return ""
+	}
+}
+
+func formatSyncMoment(t time.Time, zh bool) string {
+	lt := t.Local()
+	if zh {
+		return lt.Format("1月2日 15:04")
+	}
+	return lt.Format("Jan 2, 15:04")
+}
+
 func limitsStatusText(st service.ViewState, now time.Time, zh bool) string {
 	if st.IsFetching {
 		return tr(zh, "正在同步…", "Syncing…")
 	}
 	if st.OfficialUsage == nil {
-		switch st.OfficialState {
-		case service.OfficialDisabled:
-			return tr(zh, "已关闭", "Off")
-		case service.OfficialNoCredentials:
-			return tr(zh, "未登录", "Not signed in")
-		case service.OfficialExpired:
-			return tr(zh, "登录已过期", "Login expired")
-		case service.OfficialSignedOut:
-			return tr(zh, "需要重新登录", "Sign in again")
-		case service.OfficialFailed:
-			if st.IsRateLimited && st.RetryWait > 0 {
-				mins := max(1, int(math.Ceil(st.RetryWait.Minutes())))
-				return tr(zh, fmt.Sprintf("限流，约 %d 分钟后重试", mins), fmt.Sprintf("Rate limited, ~%dm", mins))
-			}
-			return st.OfficialFailMsg
-		default:
+		if st.OfficialState == service.OfficialConnecting {
 			return tr(zh, "尚未查询", "Not checked yet")
 		}
+		reason := limitsShortReason(st, zh)
+		if st.IsRateLimited && st.RetryWait > 0 {
+			mins := max(1, int(math.Ceil(st.RetryWait.Minutes())))
+			return reason + tr(zh, fmt.Sprintf("，约 %d 分钟后重试", mins), fmt.Sprintf(", retry in about %d min", mins))
+		}
+		return reason
 	}
 	rel := core.FormatRelative(st.OfficialUsage.FetchedAt, now, zh)
 	synced := tr(zh, rel+"同步", "Synced "+rel)
 	if st.OfficialState == service.OfficialConnected {
 		return synced
 	}
-	if st.IsRateLimited && st.RetryWait > 0 {
+	reason := limitsShortReason(st, zh)
+	if st.RetryWait > 0 {
 		mins := max(1, int(math.Ceil(st.RetryWait.Minutes())))
-		return synced + tr(zh, fmt.Sprintf(" · 限流 %d 分", mins), fmt.Sprintf(" · 429 %dm", mins))
+		reason += tr(zh, fmt.Sprintf("，约 %d 分钟后重试", mins), fmt.Sprintf(", retry in about %d min", mins))
 	}
-	return synced
+	return synced + " · " + reason
+}
+
+func limitsStatusTooltip(st service.ViewState, stale string, zh bool) string {
+	var lines []string
+	lines = append(lines, tr(zh, "官方用量", "Official usage"))
+	if st.OfficialUsage != nil {
+		lines = append(lines, tr(zh, "上次同步: ", "Last sync: ")+formatSyncMoment(st.OfficialUsage.FetchedAt, zh))
+		if st.UsageFromClaudeCode {
+			lines = append(lines, tr(zh, "来源: Claude Code 查到的", "Source: Checked by Claude Code"))
+		}
+	}
+	if st.OfficialUsage != nil && stale != "" {
+		if st.IsRateLimited {
+			lines = append(lines, tr(zh,
+				"官方用量接口的额度由同一账号的 Claude Code 等客户端共用，现在暂时用完了，要过一阵才恢复。这期间 Claude Code 查到新数字时，这里会直接用上。",
+				"Claude's usage endpoint shares one allowance across the account's Claude Code clients, and it is used up for now. It takes a while to recover. If Claude Code checks usage meanwhile, its numbers show up here.",
+			))
+		} else if reason := limitsUnavailableReason(st, zh); reason != "" {
+			lines = append(lines, reason)
+		}
+	}
+	lines = append(lines, tr(zh,
+		"来自 Claude 官方用量接口，和 Claude Code 的 /usage 相同。Claude Code 正在使用时，消耗够让数字变化就同步；Claude Code 自己查到的新数字也会直接用上。随时可以点「立即刷新」",
+		"From the same endpoint as Claude Code /usage. While Claude Code is in use, it syncs once usage is enough to change the numbers, and picks up any newer numbers Claude Code has checked. Refresh works any time.",
+	))
+	return strings.Join(lines, "\n")
+}
+
+func limitsSummaryTooltip(rows []core.LimitRow, st service.ViewState, stale string, now time.Time, zh bool) string {
+	var lines []string
+	for _, row := range rows {
+		parts := []string{fmt.Sprintf("%d%%", row.Percent)}
+		if left, _ := formatLimitReset(row, st.Prefs, now, zh); left != "" {
+			parts = append(parts, left)
+		}
+		lines = append(lines, row.Title+": "+strings.Join(parts, " · "))
+	}
+	if stale != "" && st.OfficialUsage != nil {
+		moment := formatSyncMoment(st.OfficialUsage.FetchedAt, zh)
+		lines = append(lines, tr(zh,
+			fmt.Sprintf("现在取不到新数字（%s），显示的是 %s 同步的结果", stale, moment),
+			fmt.Sprintf("No fresh numbers right now (%s). Last sync: %s.", stale, moment),
+		))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func limitCompactTooltip(row core.LimitRow, line *core.PaceLine, prefs core.Preferences, now time.Time, zh bool) string {
+	var lines []string
+	lines = append(lines, fmt.Sprintf("%s · %d%%", row.Title, row.Percent))
+	if row.ResetKind != core.ResetNone {
+		left, clk := formatLimitReset(row, prefs, now, zh)
+		if left != "" {
+			if clk != "" {
+				lines = append(lines, left+" ("+clk+")")
+			} else {
+				lines = append(lines, left)
+			}
+		}
+	}
+	if line != nil {
+		markStr := core.FormatSafePercent(line.Fraction)
+		if line.IsExceeded(row.Fraction) {
+			over := core.FormatSafePercent(row.Fraction - line.Fraction)
+			lines = append(lines, tr(zh, "安全线 "+markStr+" · 超出 "+over, "Safe line "+markStr+" · "+over+" over"))
+		} else if row.Fraction > line.Fraction {
+			lines = append(lines, tr(zh, "安全线 "+markStr+" · 窗口刚开始", "Safe line "+markStr+" · Just started"))
+		} else {
+			left := core.FormatSafePercent(line.Fraction - row.Fraction)
+			lines = append(lines, tr(zh, "安全线 "+markStr+" · 还可用 "+left, "Safe line "+markStr+" · "+left+" left"))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func processesSummaryTooltip(procs []platform.ClaudeTask, zh bool) string {
+	var totalBytes uint64
+	for _, t := range procs {
+		totalBytes += t.Bytes
+	}
+	var lines []string
+	lines = append(lines, tr(zh,
+		fmt.Sprintf("运行中的 Claude 进程（共 %d 个 · %s）", len(procs), platform.FormatBytes(totalBytes)),
+		fmt.Sprintf("Running Claude processes (%d · %s)", len(procs), platform.FormatBytes(totalBytes)),
+	))
+	limit := min(len(procs), 6)
+	for i := 0; i < limit; i++ {
+		t := procs[i]
+		name := t.Name
+		if t.Detail != "" {
+			name += " · " + t.Detail
+		}
+		lines = append(lines, fmt.Sprintf("%s (%s)", name, platform.FormatBytes(t.Bytes)))
+	}
+	if len(procs) > limit {
+		lines = append(lines, tr(zh, fmt.Sprintf("另有 %d 个进程…", len(procs)-limit), fmt.Sprintf("and %d more…", len(procs)-limit)))
+	}
+	lines = append(lines, tr(zh, "点击展开后可悬停强制退出", "Click to expand and force quit"))
+	return strings.Join(lines, "\n")
 }
 
 func (m *PopoverModel) renderLimitsUnavailable(c *ui.Context, st service.ViewState, zh bool) {
@@ -1098,11 +1282,369 @@ func speedReplyDetail(r core.TimedRequest, zh bool) string {
 	)
 }
 
+type spendMath struct {
+	snap  *core.UsageSnapshot
+	money core.MoneyFormat
+	now   time.Time
+	zh    bool
+}
+
+func (sm spendMath) projection(p *core.PeriodUsage) *core.Projection {
+	if p == nil || sm.snap == nil {
+		return nil
+	}
+	return p.Projection(sm.now, sm.snap.WeeklyAllowance)
+}
+
+func (sm spendMath) projectedText(p *core.PeriodUsage) string {
+	proj := sm.projection(p)
+	if proj == nil || !(p.DayCount > 1 || p.Cost > 0) {
+		return ""
+	}
+	return sm.money.Whole(proj.Cost)
+}
+
+func (sm spendMath) shownRounded(usd float64, digits int) float64 {
+	scale := math.Pow10(digits)
+	return math.Round(sm.money.Convert(usd)*scale) / scale
+}
+
+func (sm spendMath) estimateDigits(usd float64) int {
+	if sm.money.Unit.FractionDigits() == 0 || math.Abs(sm.money.Convert(usd)) >= 100 {
+		return 0
+	}
+	return 2
+}
+
+// remaining mirrors Sections.swift SpendMath.remaining:
+// subtracts spent from the rounded displayed estimate so mental math matches the UI.
+func (sm spendMath) remaining(p *core.PeriodUsage) (float64, bool) {
+	proj := sm.projection(p)
+	if proj == nil {
+		return 0, false
+	}
+	if proj.Cost-p.Cost < 0.005 {
+		return 0, true
+	}
+	shown := sm.money.Convert(proj.Cost)
+	var rounded float64
+	if sm.money.Unit.FractionDigits() == 0 || math.Abs(shown) >= 100 {
+		rounded = math.Round(shown)
+	} else {
+		rounded = math.Round(shown*100) / 100
+	}
+	return max(0.0, rounded/sm.money.Rate-p.Cost), true
+}
+
+// exactRemaining mirrors Sections.swift SpendMath.exactRemaining for tooltips.
+func (sm spendMath) exactRemaining(p *core.PeriodUsage) (string, bool) {
+	proj := sm.projection(p)
+	if proj == nil || proj.Cost-p.Cost < 0.005 {
+		return "", false
+	}
+	estDigits := sm.estimateDigits(proj.Cost)
+	spentDigits := sm.money.FractionDigitsFor(p.Cost)
+	left := max(0.0, sm.shownRounded(proj.Cost, estDigits)-sm.shownRounded(p.Cost, spentDigits))
+	return sm.money.FormatDigits(left/sm.money.Rate, max(estDigits, spentDigits)), true
+}
+
+func (sm spendMath) remainingNote(p *core.PeriodUsage) string {
+	left, ok := sm.remaining(p)
+	if !ok {
+		daily := sm.money.Whole(p.DailyAverage(sm.now))
+		return tr(sm.zh, "日均 "+daily, daily+"/day")
+	}
+	if left < 0.005 {
+		return tr(sm.zh, "额度已用满", "limit used up")
+	}
+	amount := sm.money.Whole(left)
+	return tr(sm.zh, "还剩 "+amount, amount+" left")
+}
+
+func (sm spendMath) remainingRow(p *core.PeriodUsage) (string, string) {
+	left, ok := sm.remaining(p)
+	if !ok {
+		return tr(sm.zh, "日均", "Per day"), sm.money.Whole(p.DailyAverage(sm.now))
+	}
+	if left < 0.005 {
+		return tr(sm.zh, "还剩", "Left"), tr(sm.zh, "额度已用满", "Limit used up")
+	}
+	return tr(sm.zh, "还剩", "Left"), sm.money.Whole(left)
+}
+
+func (sm spendMath) restartSplit(proj *core.Projection, a *core.WeeklyAllowance) (before, after string, ok bool) {
+	if proj == nil || a == nil || a.Forgiven <= 0 || proj.Cost > a.FullWeek()+0.005 {
+		return "", "", false
+	}
+	estDigits := sm.estimateDigits(proj.Cost)
+	beforeDigits := sm.money.FractionDigitsFor(a.Forgiven)
+	afterVal := max(0.0, sm.shownRounded(proj.Cost, estDigits)-sm.shownRounded(a.Forgiven, beforeDigits))
+	return sm.money.Format(a.Forgiven), sm.money.FormatDigits(afterVal/sm.money.Rate, max(estDigits, beforeDigits)), true
+}
+
+func formatDayShort(t time.Time, zh bool) string {
+	lt := t.Local()
+	if zh {
+		return fmt.Sprintf("%d月%d日", int(lt.Month()), lt.Day())
+	}
+	return lt.Format("Jan 2")
+}
+
+func formatRestartMoment(t time.Time, zh bool) string {
+	lt := t.Local()
+	return formatDayShort(lt, zh) + " " + lt.Format("15:04")
+}
+
+func runsOutNote(date, now time.Time, zh bool) string {
+	if !date.After(now) {
+		return tr(zh, "额度已用完", "limit reached")
+	}
+	ld := date.Local()
+	ln := now.Local()
+	todayStart := time.Date(ln.Year(), ln.Month(), ln.Day(), 0, 0, 0, 0, ln.Location())
+	tomorrowStart := todayStart.AddDate(0, 0, 1)
+	dayAfter := todayStart.AddDate(0, 0, 2)
+	weekEnd := todayStart.AddDate(0, 0, 7)
+
+	if !ld.Before(todayStart) && ld.Before(tomorrowStart) {
+		hhmm := ld.Format("15:04")
+		return tr(zh, hhmm+" 用完", "runs out "+hhmm)
+	}
+	if !ld.Before(tomorrowStart) && ld.Before(dayAfter) {
+		return tr(zh, "明天用完", "runs out tomorrow")
+	}
+	if ld.Before(weekEnd) {
+		wd := weekdayShort(ld.Weekday(), zh)
+		return tr(zh, wd+"用完", "runs out "+wd)
+	}
+	day := formatDayShort(ld, zh)
+	return tr(zh, day+"用完", "runs out "+day)
+}
+
+func weekdayShort(w time.Weekday, zh bool) string {
+	if zh {
+		names := [...]string{"周日", "周一", "周二", "周三", "周四", "周五", "周六"}
+		return names[w]
+	}
+	names := [...]string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
+	return names[w]
+}
+
+func (sm spendMath) dayHelp(p *core.PeriodUsage) string {
+	proj := sm.projection(p)
+	if p == nil || p.Cost <= 0 || proj == nil {
+		return ""
+	}
+	projected := sm.money.Whole(proj.Cost)
+	if proj.RunsOut == nil {
+		return tr(sm.zh,
+			"照今天到现在的速度，今天预计一共 "+projected,
+			"At today's pace so far, about "+projected+" today",
+		)
+	}
+	stop := tr(sm.zh, "额度用完就停到下次重置", "spending stops until the next reset")
+	if !proj.RunsOut.After(sm.now) {
+		return tr(sm.zh,
+			fmt.Sprintf("每周额度已经用完；%s，今天预计一共 %s", stop, projected),
+			fmt.Sprintf("The weekly limit is used up and %s: about %s today", stop, projected),
+		)
+	}
+	moment := formatSyncMoment(*proj.RunsOut, sm.zh)
+	return tr(sm.zh,
+		fmt.Sprintf("照今天到现在的速度，每周额度会在 %s 前后用完；%s，今天预计一共 %s", moment, stop, projected),
+		fmt.Sprintf("At today's pace so far, the weekly limit runs out around %s and %s: about %s today", moment, stop, projected),
+	)
+}
+
+func (sm spendMath) meaning(p *core.PeriodUsage, span core.CostSpan) string {
+	if span == core.SpanDay {
+		return sm.dayHelp(p)
+	}
+	proj := sm.projection(p)
+	if proj == nil || sm.snap == nil || sm.snap.WeeklyAllowance == nil {
+		return tr(sm.zh,
+			"同步每周限额后显示预计：每周额度用满时本机一共花多少",
+			"The estimate appears once the weekly limit syncs: what this machine spends with the weekly limit fully used",
+		)
+	}
+	a := sm.snap.WeeklyAllowance
+	projected := sm.money.Whole(proj.Cost)
+	full := sm.money.Whole(a.Full())
+	if span == core.SpanWeek {
+		if before, after, ok := sm.restartSplit(proj, a); ok {
+			return tr(sm.zh,
+				fmt.Sprintf("预计 %s：重置前已花的 %s，加上重置后额度用满（100%%）时本机花的 %s，不管用得快慢", projected, before, after),
+				fmt.Sprintf("%s: %s spent before the reset, plus %s spent here with the limit fully used after it, however fast you go", projected, before, after),
+			)
+		}
+		return tr(sm.zh,
+			fmt.Sprintf("预计 %s：本周额度用满（100%%）时本机一共花多少，不管用得快慢", projected),
+			fmt.Sprintf("%s is what this machine spends with this week's limit fully used, however fast you go", projected),
+		)
+	}
+	return tr(sm.zh,
+		fmt.Sprintf("预计 %s：已经花的 %s，加上之后每周都用满（每周约 %s，跨出这个周期的那一周按时间折算）", projected, sm.money.Format(p.Cost), full),
+		fmt.Sprintf("%s: %s spent, plus every week after this used in full (about %s a week, prorated where a week runs past the period)", projected, sm.money.Format(p.Cost), full),
+	)
+}
+
+func (sm spendMath) allowanceBasis(a *core.WeeklyAllowance) string {
+	percent := int(math.Floor(a.Utilization))
+	full := sm.money.Whole(a.Full())
+	spent := sm.money.Format(a.SyncedCost)
+	if a.RestartedAt != nil && a.Forgiven > 0 {
+		when := formatRestartMoment(*a.RestartedAt, sm.zh)
+		forgiven := sm.money.Format(a.Forgiven)
+		reset := tr(sm.zh,
+			fmt.Sprintf("官方在 %s 前后中途重置了本周额度，之前本机花的 %s 不占额度。", when, forgiven),
+			fmt.Sprintf("Claude reset this week's limit around %s, so the %s spent here before that doesn't count. ", when, forgiven),
+		)
+		if a.Borrowed {
+			at := ""
+			if a.SyncedAt != nil {
+				at = formatDayShort(*a.SyncedAt, sm.zh)
+			}
+			return reset + tr(sm.zh,
+				fmt.Sprintf("重置后的百分比还不到 10%%，误差太大，先用 %s 同步时的比例：那时已用 %d%%，本机花了 %s，额度用满约 %s", at, percent, spent, full),
+				fmt.Sprintf("Since then it's under 10%%, too coarse to use, so it borrows the sync on %s: it was at %d%% with %s spent here, so a full week is about %s", at, percent, spent, full),
+			)
+		}
+		return reset + tr(sm.zh,
+			fmt.Sprintf("重置后已用 %d%%，本机花了 %s，照这个比例重置后本机花到约 %s 时额度用满", percent, spent, full),
+			fmt.Sprintf("Since then it's at %d%% with %s spent here, so the limit is full at about %s after the reset", percent, spent, full),
+		)
+	}
+	if a.Borrowed {
+		at := ""
+		if a.SyncedAt != nil {
+			at = formatDayShort(*a.SyncedAt, sm.zh)
+		}
+		return tr(sm.zh,
+			fmt.Sprintf("本周的百分比还不到 10%%，误差太大，先用 %s 同步时的比例：那一周已用 %d%%，本机花了 %s，额度用满约 %s", at, percent, spent, full),
+			fmt.Sprintf("This week is still under 10%%, too coarse to use, so it borrows the sync on %s: that week was at %d%% with %s spent here, so a full week is about %s", at, percent, spent, full),
+		)
+	}
+	basis := tr(sm.zh,
+		fmt.Sprintf("上次同步时本周已用 %d%%，本机花了 %s，照这个比例本机花到约 %s 时额度用满", percent, spent, full),
+		fmt.Sprintf("At the last sync this week was at %d%% with %s spent here, so the limit is full at about %s", percent, spent, full),
+	)
+	if a.Utilization < core.MinWeeklyUtilizationForBasis {
+		basis += tr(sm.zh,
+			"。官方百分比只有整数，现在还小，误差较大，用得越多越准",
+			". The official percentage is a whole number, so this is rough while it is small and sharpens as you use more",
+		)
+	}
+	return basis
+}
+
+func (sm spendMath) summaryTooltip(p *core.PeriodUsage, span core.CostSpan) string {
+	if p == nil {
+		return tr(sm.zh,
+			"本周按官方每周额度的重置时间统计，同步一次后显示",
+			"It follows the official weekly reset and appears after one sync.",
+		)
+	}
+	var lines []string
+	lines = append(lines, spanFullTitle(span, sm.zh))
+	if span != core.SpanDay {
+		lines = append(lines, tr(sm.zh,
+			fmt.Sprintf("进度: 第 %d / %d 天", p.DayIndex, p.DayCount),
+			fmt.Sprintf("Progress: Day %d of %d", p.DayIndex, p.DayCount),
+		))
+	}
+	if projTxt := sm.projectedText(p); projTxt != "" {
+		lines = append(lines, tr(sm.zh, "预计: ", "Estimate: ")+projTxt)
+	}
+	if span == core.SpanDay {
+		if proj := sm.projection(p); proj != nil && proj.RunsOut != nil {
+			lines = append(lines, tr(sm.zh, "每周额度: ", "Weekly limit: ")+runsOutNote(*proj.RunsOut, sm.now, sm.zh))
+		}
+	} else {
+		rk, rv := sm.remainingRow(p)
+		lines = append(lines, rk+": "+rv)
+		todayCost := 0.0
+		if td := sm.snap.Today(); td != nil {
+			todayCost = td.Cost
+		}
+		lines = append(lines, tr(sm.zh, "今日: ", "Today: ")+sm.money.Whole(todayCost))
+	}
+	lines = append(lines, core.FormatPeriodRange(p.Start, p.End, sm.zh))
+	return strings.Join(lines, "\n")
+}
+
+func (sm spendMath) totalTooltip(p *core.PeriodUsage, span core.CostSpan, compact bool) string {
+	var lines []string
+	if compact && p != nil {
+		lines = append(lines, tr(sm.zh, "总 Tokens: ", "Tokens: ")+core.FormatMagnitude(p.Tokens.Total(), sm.zh))
+		lines = append(lines, tr(sm.zh, "请求: "+core.FormatGrouped(int64(p.Requests))+" 次", "Requests: "+core.FormatGrouped(int64(p.Requests))))
+		if span != core.SpanDay {
+			todayCost := 0.0
+			if td := sm.snap.Today(); td != nil {
+				todayCost = td.Cost
+			}
+			lines = append(lines, tr(sm.zh, "今日: ", "Today: ")+sm.money.Whole(todayCost))
+		}
+		saved := tr(sm.zh, "省 "+sm.money.Compact(p.Categories.Savings), "saved "+sm.money.Compact(p.Categories.Savings))
+		lines = append(lines, tr(sm.zh, "缓存命中率: ", "Cache hit rate: ")+core.FormatPercent(p.Tokens.CacheHitRate(), 1)+" · "+saved)
+		for _, g := range buildModelLines(p, sm.money, sm.zh) {
+			lines = append(lines, fmt.Sprintf("%s: %s · %s", g.name, g.share, g.amount))
+		}
+	}
+	if m := sm.meaning(p, span); m != "" {
+		lines = append(lines, m)
+	}
+	lines = append(lines, tr(sm.zh, "点击金额切换货币", "Click the amount to change currency"))
+	return strings.Join(lines, "\n")
+}
+
+func (sm spendMath) paceTooltip(p *core.PeriodUsage, span core.CostSpan) string {
+	if p == nil {
+		return ""
+	}
+	if span == core.SpanDay {
+		proj := sm.projection(p)
+		if proj == nil || proj.RunsOut == nil {
+			return ""
+		}
+		return sm.dayHelp(p)
+	}
+	projTxt := sm.projectedText(p)
+	if projTxt == "" || sm.snap == nil || sm.snap.WeeklyAllowance == nil {
+		return tr(sm.zh,
+			"日均按实际过去的时间算，不足一天按一天算。同步每周限额后这里换成还剩多少",
+			"The daily average uses the time actually passed, at least one day. Once the weekly limit syncs, this shows what is left.",
+		)
+	}
+	leftTxt, ok := sm.exactRemaining(p)
+	if !ok {
+		leftTxt = tr(sm.zh, "额度已用满", "Limit used up")
+	}
+	lines := []string{
+		tr(sm.zh, "预计: ", "Estimate: ") + projTxt,
+		tr(sm.zh, "已花: ", "Spent: ") + sm.money.Format(p.Cost),
+		tr(sm.zh, "还剩: ", "Left: ") + leftTxt,
+		sm.allowanceBasis(sm.snap.WeeklyAllowance),
+	}
+	return strings.Join(lines, "\n")
+}
+
+func spanFullTitle(s core.CostSpan, zh bool) string {
+	switch s {
+	case core.SpanMonth:
+		return tr(zh, "本月周期", "Billing")
+	case core.SpanWeek:
+		return tr(zh, "本周期", "This week")
+	default:
+		return tr(zh, "每日", "Today")
+	}
+}
+
 func (m *PopoverModel) renderSpendSection(c *ui.Context, st service.ViewState, now time.Time, zh bool) {
 	snap := st.Snapshot
-	money := core.NewMoneyFormat(st.Prefs.Currency)
+	money := core.NewMoneyFormatWithRates(st.Prefs.Currency, st.FXRates)
 	span := st.Prefs.CostSpan
 	collapsed := st.Prefs.CollapsedSpend
+	math := spendMath{snap: snap, money: money, now: now, zh: zh}
 
 	var period *core.PeriodUsage
 	switch span {
@@ -1127,7 +1669,7 @@ func (m *PopoverModel) renderSpendSection(c *ui.Context, st service.ViewState, n
 				ui.Row(c).Gap(4).Children(func() {
 					ui.Text(c, lbl).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
 					ui.Text(c, val).FontSize(10.5).FontWeight(500).TextColor(ColorSecondary).FontFeatures("tnum").SingleLine()
-				})
+				}).Tooltip(math.summaryTooltip(period, span))
 				return
 			}
 			if period != nil {
@@ -1167,7 +1709,7 @@ func (m *PopoverModel) renderSpendSection(c *ui.Context, st service.ViewState, n
 		}
 
 		// Header: big amount + projected + subtitle + 14-day MiniBars
-		m.renderSpendHeader(c, snap, period, span, money, now, zh)
+		m.renderSpendHeader(c, snap, period, span, math, st.Prefs.SpendDisplay == core.DisplayCompact)
 
 		if st.Prefs.SpendDisplay == core.DisplayCompact {
 			return
@@ -1178,7 +1720,10 @@ func (m *PopoverModel) renderSpendSection(c *ui.Context, st service.ViewState, n
 			ui.Row(c).Gap(5).AlignItems(ui.Baseline).Children(func() {
 				ui.Text(c, tr(zh, "总 Tokens", "Tokens")).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
 				ui.Text(c, core.FormatMagnitude(period.Tokens.Total(), zh)).FontSize(12.5).FontWeight(500).TextColor(ColorText).FontFeatures("tnum").SingleLine()
-			}).Tooltip(fmt.Sprintf("%s tokens", core.FormatGrouped(period.Tokens.Total())))
+			}).Tooltip(tr(zh,
+				fmt.Sprintf("共 %s tokens", core.FormatGrouped(period.Tokens.Total())),
+				fmt.Sprintf("%s tokens in total", core.FormatGrouped(period.Tokens.Total())),
+			))
 			ui.Spacer(c)
 			ui.Row(c).Gap(5).AlignItems(ui.Baseline).Children(func() {
 				ui.Text(c, tr(zh, "请求", "Requests")).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
@@ -1198,10 +1743,14 @@ func (m *PopoverModel) renderSpendSection(c *ui.Context, st service.ViewState, n
 
 		// 4-column token breakdown with colored dots (hover shows dollar cost)
 		ui.Row(c).FillWidth().AlignItems(ui.Start).Children(func() {
-			renderTokenCol(c, "tk-in", tr(zh, "新增输入", "Input"), ColorInputTok, period.Tokens.Input, period.Categories.Input, money, zh)
-			renderTokenCol(c, "tk-out", tr(zh, "输出", "Output"), ColorOutputTok, period.Tokens.Output, period.Categories.Output, money, zh)
-			renderTokenCol(c, "tk-cw", tr(zh, "缓存创建", "Cache write"), ColorCacheWrite, period.Tokens.CacheWrite(), period.Categories.CacheWrite, money, zh)
-			renderTokenCol(c, "tk-cr", tr(zh, "缓存命中", "Cache read"), ColorCacheRead, period.Tokens.CacheRead, period.Categories.CacheRead, money, zh)
+			renderTokenCol(c, "tk-in", tr(zh, "新增输入", "Input"), ColorInputTok, period.Tokens.Input, period.Categories.Input, money, zh,
+				tr(zh, "没有命中缓存的新输入，按原价计费", "New input not served from the cache, billed at the full price"))
+			renderTokenCol(c, "tk-out", tr(zh, "输出", "Output"), ColorOutputTok, period.Tokens.Output, period.Categories.Output, money, zh,
+				tr(zh, "回复的内容，思考的 token 也算在里面", "The replies, thinking included"))
+			renderTokenCol(c, "tk-cw", tr(zh, "缓存创建", "Cache write"), ColorCacheWrite, period.Tokens.CacheWrite(), period.Categories.CacheWrite, money, zh,
+				tr(zh, "写进缓存的输入，按输入价的 1.25 倍（5 分钟）或 2 倍（1 小时）计费", "Input written to the cache, billed at 1.25× (5 minutes) or 2× (1 hour) the input price"))
+			renderTokenCol(c, "tk-cr", tr(zh, "缓存命中", "Cache read"), ColorCacheRead, period.Tokens.CacheRead, period.Categories.CacheRead, money, zh,
+				tr(zh, "从缓存读出的输入，单价远低于原价输入", "Input read from the cache, billed far below the full input price"))
 		})
 
 		// Cache hit rate + ThinBar
@@ -1211,7 +1760,8 @@ func (m *PopoverModel) renderSpendSection(c *ui.Context, st service.ViewState, n
 				ui.Text(c, tr(zh, "缓存命中率", "Cache hit rate")).FontSize(12.5).TextColor(ColorText).SingleLine()
 				ui.Spacer(c)
 				ui.Text(c, tr(zh, "省 "+money.Compact(period.Categories.Savings), "Saved "+money.Compact(period.Categories.Savings))).
-					FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
+					FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine().
+					Tooltip(tr(zh, "如果没有 Prompt Caching，这些命中缓存的 token 需要按原价计费", "Without prompt caching, these tokens would be billed at the full input price."))
 				ui.Text(c, core.FormatPercent(hitRate, 1)).FontSize(12.5).FontWeight(500).TextColor(ColorText).FontFeatures("tnum").SingleLine()
 			})
 			ThinBar(c, "cache-hit-bar", hitRate, ui.RGBA(255, 255, 255, 0.42), nil, false, nil)
@@ -1224,7 +1774,11 @@ func (m *PopoverModel) renderSpendSection(c *ui.Context, st service.ViewState, n
 	})
 }
 
-func (m *PopoverModel) renderSpendHeader(c *ui.Context, snap *core.UsageSnapshot, p *core.PeriodUsage, span core.CostSpan, money core.MoneyFormat, now time.Time, zh bool) {
+func (m *PopoverModel) renderSpendHeader(c *ui.Context, snap *core.UsageSnapshot, p *core.PeriodUsage, span core.CostSpan, math spendMath, compact bool) {
+	money := math.money
+	now := math.now
+	zh := math.zh
+
 	recent := snap.Daily
 	if len(recent) > 14 {
 		recent = recent[len(recent)-14:]
@@ -1238,7 +1792,8 @@ func (m *PopoverModel) renderSpendHeader(c *ui.Context, snap *core.UsageSnapshot
 		}
 	}
 
-	proj := p.Projection(now, snap.WeeklyAllowance)
+	proj := math.projection(p)
+	projTxt := math.projectedText(p)
 
 	ui.Row(c).FillWidth().AlignItems(ui.End).Gap(8).Children(func() {
 		ui.Column(c).Grow(1).Gap(4).Children(func() {
@@ -1256,16 +1811,16 @@ func (m *PopoverModel) renderSpendHeader(c *ui.Context, snap *core.UsageSnapshot
 					pr.Currency = core.AllCurrencies[(idx+1)%len(core.AllCurrencies)]
 				})
 			}
-			amtRow.Tooltip(tr(zh, "点击金额切换货币", "Click amount to switch currency"))
+			amtRow.Tooltip(math.totalTooltip(p, span, compact))
 			amtRow.Children(func() {
 				ui.Text(c, money.Format(p.Cost)).FontSize(26).FontWeight(600).LetterSpacing(-0.4).TextColor(ColorText).FontFeatures("tnum").SingleLine()
-				if proj != nil && (p.DayCount > 1 || p.Cost > 0) {
-					ui.Text(c, tr(zh, "预计 "+money.Whole(proj.Cost), "→ "+money.Whole(proj.Cost))).
+				if projTxt != "" {
+					ui.Text(c, tr(zh, "预计 "+projTxt, "→ "+projTxt)).
 						FontSize(12).FontWeight(500).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
 				}
 			})
 
-			// Subtitle: hovered bar day OR "第 1 / 7 天 · 还剩 $2,765"
+			// Subtitle: hovered bar day OR "第 1 / 7 天 · 还剩 $2,765" OR "当天 · 18:30 用完"
 			if m.hoveredDay >= 0 && m.hoveredDay < len(recent) {
 				d := recent[m.hoveredDay]
 				ui.Text(c, tr(zh,
@@ -1276,21 +1831,17 @@ func (m *PopoverModel) renderSpendHeader(c *ui.Context, snap *core.UsageSnapshot
 				var sub string
 				if span == core.SpanDay {
 					sub = tr(zh, "当天", "Today")
+					if proj != nil && proj.RunsOut != nil {
+						sub += " · " + runsOutNote(*proj.RunsOut, now, zh)
+					}
 				} else {
 					dayPart := tr(zh, fmt.Sprintf("第 %d / %d 天", p.DayIndex, p.DayCount), fmt.Sprintf("Day %d of %d", p.DayIndex, p.DayCount))
-					if proj != nil {
-						left := max(0.0, proj.Cost-p.Cost)
-						if left < 0.005 {
-							sub = dayPart + " · " + tr(zh, "额度已用满", "limit used up")
-						} else {
-							sub = dayPart + " · " + tr(zh, "还剩 "+money.Whole(left), money.Whole(left)+" left")
-						}
-					} else {
-						daily := money.Whole(p.DailyAverage(now))
-						sub = dayPart + " · " + tr(zh, "日均 "+daily, daily+"/day")
-					}
+					sub = dayPart + " · " + math.remainingNote(p)
 				}
-				ui.Text(c, sub).FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
+				subTxt := ui.Text(c, sub).FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
+				if tip := math.paceTooltip(p, span); tip != "" {
+					subTxt.Tooltip(tip)
+				}
 			}
 		})
 
@@ -1298,10 +1849,11 @@ func (m *PopoverModel) renderSpendHeader(c *ui.Context, snap *core.UsageSnapshot
 	})
 }
 
-func renderTokenCol(c *ui.Context, key, label string, dotColor ui.Color, tokens int64, costUSD float64, money core.MoneyFormat, zh bool) {
+func renderTokenCol(c *ui.Context, key, label string, dotColor ui.Color, tokens int64, costUSD float64, money core.MoneyFormat, zh bool, note string) {
 	col := ui.Column(c.Key(key)).Grow(1).Gap(4)
 	hov := col.Hovered()
-	col.Tooltip(fmt.Sprintf("%s: %s tokens (%s)", label, core.FormatGrouped(tokens), money.Format(costUSD)))
+	tip := fmt.Sprintf("%s\nTokens: %s\n%s", label, core.FormatGrouped(tokens), note)
+	col.Tooltip(tip)
 	col.Children(func() {
 		ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
 			ui.Box(c).Size(5, 5).Radius(2.5).Background(dotColor)
@@ -1315,9 +1867,18 @@ func renderTokenCol(c *ui.Context, key, label string, dotColor ui.Color, tokens 
 	})
 }
 
-func (m *PopoverModel) renderModelList(c *ui.Context, p *core.PeriodUsage, money core.MoneyFormat, zh bool) {
-	type group struct {
+type modelLine struct {
+	name      string
+	share     string
+	amount    string
+	estimated bool
+	models    []core.ModelUsage
+}
+
+func buildModelLines(p *core.PeriodUsage, money core.MoneyFormat, zh bool) []modelLine {
+	type rawGroup struct {
 		name      string
+		models    []core.ModelUsage
 		cost      float64
 		estimated bool
 	}
@@ -1325,17 +1886,28 @@ func (m *PopoverModel) renderModelList(c *ui.Context, p *core.PeriodUsage, money
 	if keep > 3 {
 		keep = 2
 	}
-	var groups []group
+	var groups []rawGroup
 	for i := 0; i < keep; i++ {
-		groups = append(groups, group{name: p.Models[i].DisplayName, cost: p.Models[i].Cost, estimated: p.Models[i].IsEstimated})
+		groups = append(groups, rawGroup{
+			name:      p.Models[i].DisplayName,
+			models:    []core.ModelUsage{p.Models[i]},
+			cost:      p.Models[i].Cost,
+			estimated: p.Models[i].IsEstimated,
+		})
 	}
 	if len(p.Models) > keep {
 		otherCost := 0.0
+		merged := make([]core.ModelUsage, 0, len(p.Models)-keep)
 		for i := keep; i < len(p.Models); i++ {
 			otherCost += p.Models[i].Cost
+			merged = append(merged, p.Models[i])
 		}
 		if otherCost > 0.005 {
-			groups = append(groups, group{name: tr(zh, "其他", "Other"), cost: otherCost})
+			groups = append(groups, rawGroup{
+				name:   tr(zh, "其他", "Other"),
+				models: merged,
+				cost:   otherCost,
+			})
 		}
 	}
 	costs := make([]float64, len(groups))
@@ -1344,18 +1916,63 @@ func (m *PopoverModel) renderModelList(c *ui.Context, p *core.PeriodUsage, money
 	}
 	shares := core.FormatShares(costs)
 	amounts := money.Split(p.Cost, costs)
+	out := make([]modelLine, len(groups))
+	for i, g := range groups {
+		out[i] = modelLine{
+			name:      g.name,
+			share:     shares[i],
+			amount:    amounts[i],
+			estimated: g.estimated,
+			models:    g.models,
+		}
+	}
+	return out
+}
 
+func modelLineTooltip(line modelLine, zh bool) string {
+	if len(line.models) == 1 {
+		m := line.models[0]
+		lines := []string{
+			line.name,
+			tr(zh, "请求: "+core.FormatGrouped(int64(m.Requests))+" 次", "Requests: "+core.FormatGrouped(int64(m.Requests))),
+			"Tokens: " + core.FormatMagnitude(m.Tokens.Total(), zh),
+		}
+		if m.IsEstimated {
+			lines = append(lines, tr(zh,
+				"价目表里还没有这个模型的官方价格，金额是估算的",
+				"There is no official price for this model yet, so the amount is an estimate.",
+			))
+		}
+		return strings.Join(lines, "\n")
+	}
+	lines := []string{
+		tr(zh, fmt.Sprintf("其他 %d 个模型", len(line.models)), fmt.Sprintf("%d other models", len(line.models))),
+	}
+	for _, m := range line.models {
+		usage := tr(zh,
+			fmt.Sprintf("%s 次 · %s tokens", core.FormatGrouped(int64(m.Requests)), core.FormatMagnitude(m.Tokens.Total(), zh)),
+			fmt.Sprintf("%s requests · %s tokens", core.FormatGrouped(int64(m.Requests)), core.FormatMagnitude(m.Tokens.Total(), zh)),
+		)
+		lines = append(lines, m.DisplayName+": "+usage)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *PopoverModel) renderModelList(c *ui.Context, p *core.PeriodUsage, money core.MoneyFormat, zh bool) {
+	lines := buildModelLines(p, money, zh)
 	ui.Column(c).FillWidth().Gap(5).Margin(2, 0, 0, 0).Children(func() {
-		for i, g := range groups {
-			ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
+		for i, g := range lines {
+			row := ui.Row(c.Key(fmt.Sprintf("mdl-%d", i))).FillWidth().Gap(8).AlignItems(ui.Center)
+			row.Children(func() {
 				ui.Text(c, g.name).FontSize(11.5).TextColor(ColorSecondary).SingleLine()
 				if g.estimated {
 					ui.Text(c, tr(zh, "估价", "est.")).FontSize(10.5).TextColor(ColorQuaternary).SingleLine()
 				}
 				ui.Spacer(c)
-				ui.Text(c, shares[i]).Width(44).TextAlign(ui.End).FontSize(11.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
-				ui.Text(c, amounts[i]).MinWidth(64).TextAlign(ui.End).FontSize(11.5).TextColor(ColorText).FontFeatures("tnum").SingleLine()
+				ui.Text(c, g.share).Width(44).TextAlign(ui.End).FontSize(11.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
+				ui.Text(c, g.amount).MinWidth(64).TextAlign(ui.End).FontSize(11.5).TextColor(ColorText).FontFeatures("tnum").SingleLine()
 			})
+			row.Tooltip(modelLineTooltip(g, zh))
 		}
 	})
 }

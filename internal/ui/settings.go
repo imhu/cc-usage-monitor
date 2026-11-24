@@ -2,6 +2,7 @@ package appui
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -566,7 +567,58 @@ func (m *SettingsModel) renderMenuBarTab(c *ui.Context, st service.ViewState, zh
 
 	Hairline(c)
 
-	// Multi-select metric strip matching hero.png "显示数值"
+	// Multi-select metric strip matching hero.png "显示数值" — uses live values (v1.6.3)
+	c.After(time.Second)
+	now := time.Now()
+	money := core.NewMoneyFormatWithRates(st.Prefs.Currency, st.FXRates)
+
+	var eff *core.OfficialUsage
+	if st.OfficialUsage != nil {
+		e := st.OfficialUsage.EffectiveAt(now)
+		eff = &e
+	}
+
+	v5h, c5h := "42%", ColorLive
+	if eff != nil && eff.FiveHour != nil {
+		v5h = fmt.Sprintf("%d%%", eff.FiveHour.Percent())
+		c5h = LevelColor(eff.FiveHour.Fraction())
+	}
+	v7d, c7d := "68%", ColorLive
+	if eff != nil && eff.SevenDay != nil {
+		v7d = fmt.Sprintf("%d%%", eff.SevenDay.Percent())
+		c7d = LevelColor(eff.SevenDay.Fraction())
+	}
+	scopedLabel, vScoped, cScoped := "Sonnet", "12%", ColorSecondary
+	if eff != nil && len(eff.Scoped) > 0 {
+		sc := eff.Scoped[0]
+		scopedLabel = sc.ModelName
+		vScoped = fmt.Sprintf("%d%%", sc.Limit.Percent())
+		cScoped = LevelColor(sc.Limit.Fraction())
+	}
+	vToday := money.Compact(12)
+	vWeekCost := money.Compact(86)
+	vMonthCost := money.Compact(1234)
+	if st.Snapshot != nil {
+		if td := st.Snapshot.Today(); td != nil {
+			vToday = money.Compact(td.Cost)
+		} else {
+			vToday = money.Compact(0)
+		}
+		if st.Snapshot.Week != nil {
+			vWeekCost = money.Compact(st.Snapshot.Week.Cost)
+		}
+		vMonthCost = money.Compact(st.Snapshot.Billing.Cost)
+	}
+	// Output speed chip always reflects live 5m rate ("–" when no reply in last 5m).
+	vSpeed := "–"
+	nowSec := float64(now.Unix()) + float64(now.Nanosecond())/1e9
+	models := st.SpeedLog.Models(nowSec)
+	if active := st.ActiveSpeedModel(models); active != nil {
+		if recent := core.ComputeSpeedRate(active.Requests, nowSec-core.SpeedRecentWindow, nowSec); recent != nil {
+			vSpeed = fmt.Sprintf("%d", int(math.Round(recent.TokensPerSecond())))
+		}
+	}
+
 	ui.Column(c).FillWidth().Gap(8).Children(func() {
 		ui.Text(c, tr(zh, "显示数值", "Visible metrics")).FontSize(13).FontWeight(500).TextColor(ColorText)
 		ui.Text(c, tr(zh, "亮起的会显示在悬浮条和预览栏上，点一下切换，可以多选。", "Click items to toggle them in the floating bar.")).
@@ -581,13 +633,13 @@ func (m *SettingsModel) renderMenuBarTab(c *ui.Context, st service.ViewState, zh
 			set   func(*core.Preferences, bool)
 		}
 		items := []metricChip{
-			{"m5h", tr(zh, "5小时", "5h"), "8%", ColorLive, st.Prefs.PillShowFiveHour, func(p *core.Preferences, v bool) { p.PillShowFiveHour = v }},
-			{"m7d", tr(zh, "本周", "Week"), "10%", ColorLive, st.Prefs.PillShowWeek, func(p *core.Preferences, v bool) { p.PillShowWeek = v }},
-			{"msc", "Fable", "0%", ColorSecondary, st.Prefs.PillShowScoped, func(p *core.Preferences, v bool) { p.PillShowScoped = v }},
-			{"mtd", tr(zh, "今日", "Today"), "$280", ColorText, st.Prefs.PillShowTodayCost, func(p *core.Preferences, v bool) { p.PillShowTodayCost = v }},
-			{"mwk", tr(zh, "本周费", "Wk $"), "$309", ColorText, st.Prefs.PillShowWeekCost, func(p *core.Preferences, v bool) { p.PillShowWeekCost = v }},
-			{"mmo", tr(zh, "本月费", "Mo $"), "$10.7k", ColorText, st.Prefs.PillShowMonthCost, func(p *core.Preferences, v bool) { p.PillShowMonthCost = v }},
-			{"msp", tr(zh, "速度", "Speed"), "71", ColorText, st.Prefs.PillShowSpeed, func(p *core.Preferences, v bool) { p.PillShowSpeed = v }},
+			{"m5h", tr(zh, "5小时", "5h"), v5h, c5h, st.Prefs.PillShowFiveHour, func(p *core.Preferences, v bool) { p.PillShowFiveHour = v }},
+			{"m7d", tr(zh, "本周", "Week"), v7d, c7d, st.Prefs.PillShowWeek, func(p *core.Preferences, v bool) { p.PillShowWeek = v }},
+			{"msc", scopedLabel, vScoped, cScoped, st.Prefs.PillShowScoped, func(p *core.Preferences, v bool) { p.PillShowScoped = v }},
+			{"mtd", tr(zh, "今日", "Today"), vToday, ColorText, st.Prefs.PillShowTodayCost, func(p *core.Preferences, v bool) { p.PillShowTodayCost = v }},
+			{"mwk", tr(zh, "本周费", "Wk $"), vWeekCost, ColorText, st.Prefs.PillShowWeekCost, func(p *core.Preferences, v bool) { p.PillShowWeekCost = v }},
+			{"mmo", tr(zh, "本月费", "Mo $"), vMonthCost, ColorText, st.Prefs.PillShowMonthCost, func(p *core.Preferences, v bool) { p.PillShowMonthCost = v }},
+			{"msp", tr(zh, "速度", "Speed"), vSpeed, ColorText, st.Prefs.PillShowSpeed, func(p *core.Preferences, v bool) { p.PillShowSpeed = v }},
 		}
 		ui.Row(c).Padding(4).Gap(4).Radius(9).Background(ColorPillBg).Children(func() {
 			for _, it := range items {
@@ -671,11 +723,15 @@ func (m *SettingsModel) renderPreviewPillContent(c *ui.Context, st service.ViewS
 		})
 	}
 	now := time.Now()
-	money := core.NewMoneyFormat(st.Prefs.Currency)
+	money := core.NewMoneyFormatWithRates(st.Prefs.Currency, st.FXRates)
+	var eff *core.OfficialUsage
+	if st.OfficialUsage != nil {
+		e := st.OfficialUsage.EffectiveAt(now)
+		eff = &e
+	}
 	if st.Prefs.PillShowFiveHour {
 		v, vc := "–", ColorSecondary
-		if st.OfficialUsage != nil && st.OfficialUsage.FiveHour != nil {
-			eff := st.OfficialUsage.EffectiveAt(now)
+		if eff != nil && eff.FiveHour != nil {
 			v = fmt.Sprintf("%d%%", eff.FiveHour.Percent())
 			vc = LevelColor(eff.FiveHour.Fraction())
 		}
@@ -683,25 +739,59 @@ func (m *SettingsModel) renderPreviewPillContent(c *ui.Context, st service.ViewS
 	}
 	if st.Prefs.PillShowWeek {
 		v, vc := "–", ColorSecondary
-		if st.OfficialUsage != nil && st.OfficialUsage.SevenDay != nil {
-			eff := st.OfficialUsage.EffectiveAt(now)
+		if eff != nil && eff.SevenDay != nil {
 			v = fmt.Sprintf("%d%%", eff.SevenDay.Percent())
 			vc = LevelColor(eff.SevenDay.Fraction())
 		}
 		addMetric(tr(zh, "本周", "Week"), v, vc)
+	}
+	if st.Prefs.PillShowScoped {
+		lbl, v, vc := "Sonnet", "–", ColorSecondary
+		if eff != nil && len(eff.Scoped) > 0 {
+			sc := eff.Scoped[0]
+			lbl = sc.ModelName
+			v = fmt.Sprintf("%d%%", sc.Limit.Percent())
+			vc = LevelColor(sc.Limit.Fraction())
+		}
+		addMetric(lbl, v, vc)
 	}
 	if st.Prefs.PillShowTodayCost {
 		cost := 0.0
 		if st.Snapshot != nil && st.Snapshot.Today() != nil {
 			cost = st.Snapshot.Today().Cost
 		}
-		addMetric(tr(zh, "今日", "Today"), money.Whole(cost), ColorText)
+		addMetric(tr(zh, "今日", "Today"), money.Compact(cost), ColorText)
+	}
+	if st.Prefs.PillShowWeekCost {
+		v := "–"
+		if st.Snapshot != nil && st.Snapshot.Week != nil {
+			v = money.Compact(st.Snapshot.Week.Cost)
+		}
+		addMetric(tr(zh, "本周费", "Wk $"), v, ColorText)
+	}
+	if st.Prefs.PillShowMonthCost {
+		v := "–"
+		if st.Snapshot != nil {
+			v = money.Compact(st.Snapshot.Billing.Cost)
+		}
+		addMetric(tr(zh, "本月费", "Mo $"), v, ColorText)
+	}
+	if st.Prefs.PillShowSpeed {
+		v := "–"
+		nowSec := float64(now.Unix()) + float64(now.Nanosecond())/1e9
+		models := st.SpeedLog.Models(nowSec)
+		if active := st.ActiveSpeedModel(models); active != nil {
+			if recent := core.ComputeSpeedRate(active.Requests, nowSec-core.SpeedRecentWindow, nowSec); recent != nil {
+				v = fmt.Sprintf("%d", int(math.Round(recent.TokensPerSecond())))
+			}
+		}
+		addMetric(tr(zh, "速度", "Speed"), v, ColorText)
 	}
 }
 
 func (m *SettingsModel) renderAGPreviewPillContent(c *ui.Context, st service.ViewState) {
 	AntigravityLogo(c, 15, 0)
-	money := core.NewMoneyFormat(st.Prefs.Currency)
+	money := core.NewMoneyFormatWithRates(st.Prefs.Currency, st.FXRates)
 	cols := buildAGPillColumns(st, money)
 	if len(cols) == 1 {
 		ui.Text(c, cols[0].val).FontSize(12).FontWeight(600).TextColor(cols[0].col).FontFeatures("tnum").SingleLine()
@@ -716,7 +806,7 @@ func (m *SettingsModel) renderAGPreviewPillContent(c *ui.Context, st service.Vie
 }
 
 func (m *SettingsModel) renderAGMenuBarSettings(c *ui.Context, st service.ViewState, zh bool) {
-	money := core.NewMoneyFormat(st.Prefs.Currency)
+	money := core.NewMoneyFormatWithRates(st.Prefs.Currency, st.FXRates)
 	off := st.AG.OfficialReport
 	local := st.AG.LocalReport
 
@@ -904,7 +994,7 @@ func (m *SettingsModel) renderPanelTab(c *ui.Context, st service.ViewState, zh b
 		curOpts[i] = string(cu)
 	}
 	curSel := string(st.Prefs.Currency)
-	settingsRow(c, tr(zh, "显示货币", "Display currency"), tr(zh, "也可以在主面板直接点击金额循环切换", "Or click the spend amount directly in the panel."), func() {
+	settingsRow(c, tr(zh, "显示货币", "Display currency"), tr(zh, "实时汇率，也可以在主面板直接点击金额循环切换", "Live exchange rates; or click the spend amount directly in the panel."), func() {
 		if ui.Select(c.Key("sel-cur"), &curSel, curOpts).Width(100).Changed() {
 			m.Store.UpdatePrefs(func(p *core.Preferences) { p.Currency = core.CurrencyUnit(curSel) })
 		}
@@ -1067,7 +1157,7 @@ func (m *SettingsModel) renderDataTab(c *ui.Context, st service.ViewState, zh bo
 
 	{
 		all := st.AG.LocalReport.AllTime
-		money := core.NewMoneyFormat(st.Prefs.Currency)
+		money := core.NewMoneyFormatWithRates(st.Prefs.Currency, st.FXRates)
 		sinceText := ""
 		if st.AG.LocalReport.EarliestRecordDate != nil {
 			dt := st.AG.LocalReport.EarliestRecordDate.Local()

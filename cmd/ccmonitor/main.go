@@ -61,7 +61,7 @@ func (a *application) updateTray() {
 	st := a.store.ViewState()
 	zh := st.Prefs.IsChinese()
 	now := time.Now()
-	money := core.NewMoneyFormat(st.Prefs.Currency)
+	money := core.NewMoneyFormatWithRates(st.Prefs.Currency, st.FXRates)
 
 	if core.NormalizeProvider(st.Prefs.ActiveProvider) == core.ProviderAntigravity {
 		pct := 0
