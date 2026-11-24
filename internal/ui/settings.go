@@ -498,7 +498,7 @@ func (m *SettingsModel) renderMenuBarTab(c *ui.Context, st service.ViewState, zh
 	ui.Row(c).FillWidth().Height(42).Padding(0, 16).Radius(10).Background(ColorPillBg).Center().Gap(12).Children(func() {
 		ui.Box(c).Size(12, 3).Radius(1.5).Background(ColorQuaternary)
 		if m.menuBarPreviewProvider == core.ProviderAntigravity {
-			m.renderAGPreviewPillContent(c, st)
+			m.renderAGPreviewPillContent(c, st, zh)
 		} else {
 			m.renderPreviewPillContent(c, st, zh)
 		}
@@ -789,10 +789,10 @@ func (m *SettingsModel) renderPreviewPillContent(c *ui.Context, st service.ViewS
 	}
 }
 
-func (m *SettingsModel) renderAGPreviewPillContent(c *ui.Context, st service.ViewState) {
+func (m *SettingsModel) renderAGPreviewPillContent(c *ui.Context, st service.ViewState, zh bool) {
 	AntigravityLogo(c, 15, 0)
 	money := core.NewMoneyFormatWithRates(st.Prefs.Currency, st.FXRates)
-	cols := buildAGPillColumns(st, money)
+	cols := buildAGPillColumns(st, money, zh)
 	if len(cols) == 1 {
 		ui.Text(c, cols[0].val).FontSize(12).FontWeight(600).TextColor(cols[0].col).FontFeatures("tnum").SingleLine()
 		return
@@ -847,11 +847,11 @@ func (m *SettingsModel) renderAGMenuBarSettings(c *ui.Context, st service.ViewSt
 			set   func(*core.Preferences, bool)
 		}
 		items := []agChip{
-			{"ag-m5h", "5H", v5h, c5h, st.Prefs.AGPillShowFiveHour, func(p *core.Preferences, v bool) { p.AGPillShowFiveHour = v }},
-			{"ag-mwk", "WEEK", vWk, cWk, st.Prefs.AGPillShowWeek, func(p *core.Preferences, v bool) { p.AGPillShowWeek = v }},
-			{"ag-mca", "CACHE", vCache, ColorAGAccent, st.Prefs.AGPillShowCache, func(p *core.Preferences, v bool) { p.AGPillShowCache = v }},
-			{"ag-mtd", "TODAY", vToday, ColorText, st.Prefs.AGPillShowTodayCost, func(p *core.Preferences, v bool) { p.AGPillShowTodayCost = v }},
-			{"ag-mctx", "CTX", vCtx, ColorWarning, st.Prefs.AGPillShowContext, func(p *core.Preferences, v bool) { p.AGPillShowContext = v }},
+			{"ag-m5h", tr(zh, "5小时", "5H"), v5h, c5h, st.Prefs.AGPillShowFiveHour, func(p *core.Preferences, v bool) { p.AGPillShowFiveHour = v }},
+			{"ag-mwk", tr(zh, "本周", "WEEK"), vWk, cWk, st.Prefs.AGPillShowWeek, func(p *core.Preferences, v bool) { p.AGPillShowWeek = v }},
+			{"ag-mca", tr(zh, "缓存", "CACHE"), vCache, ColorAGAccent, st.Prefs.AGPillShowCache, func(p *core.Preferences, v bool) { p.AGPillShowCache = v }},
+			{"ag-mtd", tr(zh, "今日", "TODAY"), vToday, ColorText, st.Prefs.AGPillShowTodayCost, func(p *core.Preferences, v bool) { p.AGPillShowTodayCost = v }},
+			{"ag-mctx", tr(zh, "上下文", "CTX"), vCtx, ColorWarning, st.Prefs.AGPillShowContext, func(p *core.Preferences, v bool) { p.AGPillShowContext = v }},
 		}
 		ui.Row(c).Padding(4).Gap(4).Radius(9).Background(ColorPillBg).Children(func() {
 			for _, it := range items {

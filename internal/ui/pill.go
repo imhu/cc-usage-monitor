@@ -309,41 +309,45 @@ type agPillCol struct {
 	col ui.Color
 }
 
-func buildAGPillColumns(st service.ViewState, money core.MoneyFormat) []agPillCol {
+func buildAGPillColumns(st service.ViewState, money core.MoneyFormat, zh bool) []agPillCol {
 	off := st.AG.OfficialReport
 	local := st.AG.LocalReport
 	var cols []agPillCol
 
 	if st.Prefs.AGPillShowFiveHour {
+		lbl := tr(zh, "5小时", "5H")
 		if b := off.PrimaryFiveHour; b != nil {
-			cols = append(cols, agPillCol{"5H", fmt.Sprintf("%d%%", b.UsedPercentInt()), AGLevelColor(b.UsedFraction, b.IsOverPace())})
+			cols = append(cols, agPillCol{lbl, fmt.Sprintf("%d%%", b.UsedPercentInt()), AGLevelColor(b.UsedFraction, b.IsOverPace())})
 		} else {
-			cols = append(cols, agPillCol{"5H", "--", ColorSecondary})
+			cols = append(cols, agPillCol{lbl, "--", ColorSecondary})
 		}
 	}
 	if st.Prefs.AGPillShowWeek {
+		lbl := tr(zh, "本周", "WEEK")
 		if b := off.PrimaryWeekly; b != nil {
-			cols = append(cols, agPillCol{"WEEK", fmt.Sprintf("%d%%", b.UsedPercentInt()), AGLevelColor(b.UsedFraction, b.IsOverPace())})
+			cols = append(cols, agPillCol{lbl, fmt.Sprintf("%d%%", b.UsedPercentInt()), AGLevelColor(b.UsedFraction, b.IsOverPace())})
 		} else {
-			cols = append(cols, agPillCol{"WEEK", "--", ColorSecondary})
+			cols = append(cols, agPillCol{lbl, "--", ColorSecondary})
 		}
 	}
 	if st.Prefs.AGPillShowCache {
+		lbl := tr(zh, "缓存", "CACHE")
 		if local.Today.TotalInputTokens() > 0 {
-			cols = append(cols, agPillCol{"CACHE", core.FormatPercent(local.Today.CacheHitRate(), 0), ColorAGAccent})
+			cols = append(cols, agPillCol{lbl, core.FormatPercent(local.Today.CacheHitRate(), 0), ColorAGAccent})
 		} else {
-			cols = append(cols, agPillCol{"CACHE", "--", ColorSecondary})
+			cols = append(cols, agPillCol{lbl, "--", ColorSecondary})
 		}
 	}
 	if st.Prefs.AGPillShowTodayCost {
-		cols = append(cols, agPillCol{"TODAY", money.Compact(local.Today.EstimatedCostUSD), ColorText})
+		cols = append(cols, agPillCol{tr(zh, "今日", "TODAY"), money.Compact(local.Today.EstimatedCostUSD), ColorText})
 	}
 	if st.Prefs.AGPillShowContext {
+		lbl := tr(zh, "上下文", "CTX")
 		if off.ContextWindow != nil && off.ContextWindow.UsedPercentage != nil {
 			u := *off.ContextWindow.UsedPercentage
-			cols = append(cols, agPillCol{"CTX", fmt.Sprintf("%d%%", int(u)), AGLevelColor(u/100.0, false)})
+			cols = append(cols, agPillCol{lbl, fmt.Sprintf("%d%%", int(u)), AGLevelColor(u/100.0, false)})
 		} else {
-			cols = append(cols, agPillCol{"CTX", "--", ColorSecondary})
+			cols = append(cols, agPillCol{lbl, "--", ColorSecondary})
 		}
 	}
 	return cols
@@ -351,7 +355,7 @@ func buildAGPillColumns(st service.ViewState, money core.MoneyFormat) []agPillCo
 
 func (m *FloatingPillModel) renderAGPillContent(c *ui.Context, st service.ViewState, money core.MoneyFormat, zh bool) {
 	AntigravityLogo(c, 16, 0)
-	cols := buildAGPillColumns(st, money)
+	cols := buildAGPillColumns(st, money, zh)
 	if len(cols) == 1 {
 		ui.Text(c, cols[0].val).FontSize(12.5).FontWeight(600).TextColor(cols[0].col).FontFeatures("tnum").SingleLine()
 		return

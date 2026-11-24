@@ -258,14 +258,45 @@ func TestAntigravityPopoverSwitchAndRender(t *testing.T) {
 		t.Fatalf("expected collapsed Third-Party group with 本周期未使用, got: %q", tt.Texts())
 	}
 
-	// Antigravity Floating Pill renders cleanly
+	// Antigravity Floating Pill renders cleanly in both single-column and localized multi-column modes
 	pill := NewFloatingPillModel(store, PillActions{})
 	pw := PillTargetWidth(store.ViewState())
 	pt := ui.NewTesterWith(pill.View, pw, PillHeight, ui.TesterOptions{Dark: true})
 	if !pt.HasText("42%") {
 		t.Errorf("antigravity floating pill missing 42%%; got: %q", pt.Texts())
 	}
-	saveSnap("pill-ag.png", pt)
+
+	store.UpdatePrefs(func(p *core.Preferences) {
+		p.AGPillShowFiveHour = true
+		p.AGPillShowWeek = true
+		p.AGPillShowCache = true
+		p.AGPillShowTodayCost = true
+		p.AGPillShowContext = true
+	})
+	pwAll := PillTargetWidth(store.ViewState())
+	ptAll := ui.NewTesterWith(pill.View, pwAll, PillHeight, ui.TesterOptions{Dark: true})
+	for _, want := range []string{"5小时", "本周", "缓存", "今日", "上下文", "42%"} {
+		if !ptAll.HasText(want) {
+			t.Errorf("antigravity Chinese multi-column pill missing %q; got: %q", want, ptAll.Texts())
+		}
+	}
+	saveSnap("pill-ag.png", ptAll)
+
+	store.UpdatePrefs(func(p *core.Preferences) { p.Language = core.LangEN })
+	ptEn := ui.NewTesterWith(pill.View, pwAll, PillHeight, ui.TesterOptions{Dark: true})
+	for _, want := range []string{"5H", "WEEK", "CACHE", "TODAY", "CTX", "42%"} {
+		if !ptEn.HasText(want) {
+			t.Errorf("antigravity English multi-column pill missing %q; got: %q", want, ptEn.Texts())
+		}
+	}
+
+	store.UpdatePrefs(func(p *core.Preferences) {
+		p.Language = core.LangZH
+		p.AGPillShowWeek = false
+		p.AGPillShowCache = false
+		p.AGPillShowTodayCost = false
+		p.AGPillShowContext = false
+	})
 
 	// Short viewport (600px) keeps Antigravity footer visible inside bounds
 	short := ui.NewTesterWith(pop.View, 356, 600, ui.TesterOptions{Dark: true})
@@ -299,7 +330,7 @@ func TestAntigravityPopoverSwitchAndRender(t *testing.T) {
 	if err := st.Click("Antigravity"); err != nil {
 		t.Fatalf("click Antigravity preview toggle failed: %v", err)
 	}
-	for _, want := range []string{"Antigravity 显示项", "5H", "WEEK", "CACHE", "TODAY", "CTX"} {
+	for _, want := range []string{"Antigravity 显示项", "5小时", "本周", "缓存", "今日", "上下文"} {
 		if !st.HasText(want) {
 			t.Errorf("settings Antigravity menubar tab missing %q; got: %q", want, st.Texts())
 		}
