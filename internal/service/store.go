@@ -333,14 +333,17 @@ func (s *Store) Start() {
 	// 1. Load local index + initial incremental scan
 	go s.bootIndex()
 
-	// 2. Local cache check; only probe exit & official API when authorized credentials exist
+	// 2. Local cache check; probe exit when Antigravity is active or Claude is authorized
 	go func() {
 		s.RefreshProcesses()
 		s.TryReadClaudeCodeCache()
-		if !s.syncLocalAuthState() {
+		hasAuth := s.syncLocalAuthState()
+		if s.shouldProbeExit() {
+			s.CheckExit(false)
+		}
+		if !hasAuth {
 			return
 		}
-		s.CheckExit(false)
 		s.mu.RLock()
 		enabled := s.prefs.OfficialEnabled
 		s.mu.RUnlock()
@@ -663,7 +666,7 @@ func (s *Store) runScheduler() {
 			s.scanIndex(roots)
 			s.TryReadClaudeCodeCache()
 		case <-exitTick.C:
-			if s.hasAuthorizedCredentials() {
+			if s.shouldProbeExit() {
 				s.CheckExit(false)
 			}
 		case <-tick.C:
@@ -693,8 +696,12 @@ func (s *Store) OnPanelOpened() {
 	go func() {
 		s.mu.RLock()
 		activeProvider := core.NormalizeProvider(s.prefs.ActiveProvider)
+		needExit := s.exitPlace == nil || s.exitFailed
 		s.mu.RUnlock()
 		if activeProvider == core.ProviderAntigravity {
+			if needExit {
+				go s.CheckExit(false)
+			}
 			s.RefreshAntigravity(false)
 			return
 		}
@@ -725,6 +732,7 @@ func (s *Store) RefreshNow() {
 		activeProvider := core.NormalizeProvider(s.prefs.ActiveProvider)
 		s.mu.RUnlock()
 		if activeProvider == core.ProviderAntigravity {
+			go s.CheckExit(true)
 			s.RefreshAntigravity(true)
 			return
 		}
@@ -774,6 +782,16 @@ func (s *Store) effectiveProxyLocked() string {
 		return s.prefs.ProxyURL
 	}
 	return platform.SystemProxyURL()
+}
+
+func (s *Store) shouldProbeExit() bool {
+	s.mu.RLock()
+	active := core.NormalizeProvider(s.prefs.ActiveProvider)
+	s.mu.RUnlock()
+	if active == core.ProviderAntigravity {
+		return true
+	}
+	return s.hasAuthorizedCredentials()
 }
 
 func (s *Store) CheckExit(force bool) {
@@ -1596,7 +1614,7 @@ func (s *Store) UpdatePrefs(fn func(*core.Preferences)) {
 
 	if proxyChanged {
 		go func() {
-			if s.hasAuthorizedCredentials() {
+			if s.shouldProbeExit() {
 				s.CheckExit(true)
 			}
 		}()

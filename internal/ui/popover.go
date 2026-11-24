@@ -154,13 +154,13 @@ func (m *PopoverModel) View(c *ui.Context) {
 		// Scrollable middle body: expands to natural height via FitContent when
 		// the screen has room, and scrolls smoothly if content exceeds WorkArea.
 		ui.Scroll(c.Key("popover-body")).FillWidth().Grow(1).Scrollbars(false).Children(func() {
+			// 2. Exit / Network Place row (shared by Claude & Antigravity)
+			m.renderExitRow(c, st, zh)
+
 			if provider == core.ProviderAntigravity {
 				m.renderAGBody(c, st, now, zh)
 				return
 			}
-
-			// 2. Exit / Network Place row
-			m.renderExitRow(c, st, zh)
 
 			// 3. Running Claude processes (collapsible)
 			if st.Prefs.ShowProcesses && len(st.Processes) > 0 {
@@ -355,6 +355,9 @@ func (m *PopoverModel) renderExitRow(c *ui.Context, st service.ViewState, zh boo
 		return
 	}
 
+	pal := PaletteFor(st.Prefs.ActiveProvider)
+	isAG := core.NormalizeProvider(st.Prefs.ActiveProvider) == core.ProviderAntigravity
+
 	ui.Column(c).FillWidth().Margin(0, 0, 8, 0).Gap(2).Children(func() {
 		ui.Row(c).FillWidth().Height(26).Gap(8).AlignItems(ui.Center).Children(func() {
 			if st.ExitPlace == nil && !st.ExitFailed {
@@ -367,16 +370,24 @@ func (m *PopoverModel) renderExitRow(c *ui.Context, st service.ViewState, zh boo
 				CountryBadge(c, st.ExitPlace.CountryCode)
 				ui.Text(c, st.ExitPlace.CountryName(zh)).FontSize(12.5).FontWeight(500).TextColor(ColorText).SingleLine()
 				if st.ExitPlace.RestrictsUsage() {
-					Chip(c, tr(zh, "已暂停", "Paused"), ColorCritical).Tooltip(
-						tr(zh, "出口在中国大陆、香港或澳门，暂停向官方查询用量", "Exit is in CN/HK/MO; official usage checks are paused."),
-					)
+					if isAG {
+						Chip(c, tr(zh, "受限区", "Restricted"), ColorCritical).Tooltip(
+							tr(zh, "出口在中国大陆、香港或澳门", "Exit is in CN/HK/MO."),
+						)
+					} else {
+						Chip(c, tr(zh, "已暂停", "Paused"), ColorCritical).Tooltip(
+							tr(zh, "出口在中国大陆、香港或澳门，暂停向官方查询用量", "Exit is in CN/HK/MO; official usage checks are paused."),
+						)
+					}
 				} else if st.ExitPlace.IsUnitedStates() {
-					Chip(c, tr(zh, "美区", "US"), ColorAccent)
+					Chip(c, tr(zh, "美区", "US"), pal.Accent)
 				}
 			} else {
 				ui.Icon(c, IconGlobe).FontSize(14).TextColor(ColorTertiary)
 				ui.Text(c, tr(zh, "无法确认出口", "Exit unknown")).FontSize(12.5).FontWeight(500).TextColor(ColorText).SingleLine()
-				Chip(c, tr(zh, "已暂停", "Paused"), ColorCritical)
+				if !isAG {
+					Chip(c, tr(zh, "已暂停", "Paused"), ColorCritical)
+				}
 			}
 			ui.Spacer(c)
 			if st.ExitPlace != nil {

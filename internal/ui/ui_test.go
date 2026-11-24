@@ -232,7 +232,7 @@ func TestAntigravityPopoverSwitchAndRender(t *testing.T) {
 		t.Fatalf("expected OnProviderChanged=1, got %d", changedCount)
 	}
 	for _, want := range []string{
-		"Antigravity 用量", "ULTRA", "活跃进程", "用量限额",
+		"Antigravity 用量", "ULTRA", "美国", "美区", core.MaskIP("162.141.213.48"), "活跃进程", "用量限额",
 		"Gemini 5小时", "42%", "Gemini 每周", "31%",
 		"输出速度", "~68", "本期消耗", "$186.20", "83.4%",
 		"Gemini 4 Neon", "Claude Sonnet 4.5", "设置…", "立即刷新", "退出",

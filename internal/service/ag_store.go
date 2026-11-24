@@ -143,6 +143,14 @@ func (s *Store) SetActiveProvider(p core.ProviderKind) {
 	s.UpdatePrefs(func(pr *core.Preferences) {
 		pr.ActiveProvider = norm
 	})
+	if norm == core.ProviderAntigravity {
+		s.mu.RLock()
+		needExit := s.ctx != nil && (s.exitPlace == nil || s.exitFailed)
+		s.mu.RUnlock()
+		if needExit {
+			go s.CheckExit(false)
+		}
+	}
 }
 
 func (s *Store) RefreshAntigravity(forceSync bool) {

@@ -90,3 +90,33 @@ func TestStoreAntigravityRefreshAndSwitchProvider(t *testing.T) {
 		t.Fatalf("expected AG bridge uninstalled, got %+v", st.AG.BridgeStatus)
 	}
 }
+
+func TestShouldProbeExitByProvider(t *testing.T) {
+	tmp := t.TempDir()
+	emptyClaudeDir := filepath.Join(tmp, "claude-empty")
+	prefs := core.DefaultPreferences()
+	prefs.ClaudeConfigDir = emptyClaudeDir
+	prefs.ActiveProvider = core.ProviderClaude
+
+	s := &Store{
+		dataDir:   tmp,
+		prefsPath: filepath.Join(tmp, "prefs.json"),
+		indexPath: filepath.Join(tmp, "index.gob"),
+		statePath: filepath.Join(tmp, "state.json"),
+		prefs:     prefs,
+		index:     core.NewUsageIndex(),
+		pstate:    persistedState{Budget: core.NewRequestBudget(time.Now())},
+	}
+
+	if s.shouldProbeExit() {
+		t.Fatal("expected shouldProbeExit=false when Claude is active without credentials")
+	}
+
+	s.SetActiveProvider(core.ProviderAntigravity)
+	if !s.shouldProbeExit() {
+		t.Fatal("expected shouldProbeExit=true when Antigravity is active even without Claude credentials")
+	}
+	if s.exitPlace != nil {
+		t.Fatalf("expected offline SetActiveProvider not to probe exit when ctx is nil, got %+v", s.exitPlace)
+	}
+}

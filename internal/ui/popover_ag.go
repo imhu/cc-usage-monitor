@@ -60,8 +60,8 @@ func agPlanTooltip(st service.ViewState, zh bool) string {
 func (m *PopoverModel) renderAGBody(c *ui.Context, st service.ViewState, now time.Time, zh bool) {
 	if st.Prefs.AGProcessesDisplay != core.DisplayHidden {
 		m.renderAGProcesses(c, st, zh)
-		Hairline(c)
 	}
+	Hairline(c)
 
 	showLimits := st.Prefs.LimitsDisplay != core.DisplayHidden
 	showSpeed := st.Prefs.AGShowEstimatedSpeed && st.Prefs.SpeedDisplay != core.DisplayHidden
@@ -100,7 +100,7 @@ func (m *PopoverModel) renderAGBody(c *ui.Context, st service.ViewState, now tim
 func (m *PopoverModel) renderAGProcesses(c *ui.Context, st service.ViewState, zh bool) {
 	procs := st.AG.Processes
 	expanded := m.agProcExpanded || st.Prefs.AGProcessesDisplay == core.DisplayDetailed
-	ui.Column(c).FillWidth().Padding(8, 0).Gap(4).Children(func() {
+	ui.Column(c).FillWidth().Margin(0, 0, 8, 0).Gap(4).Children(func() {
 		SectionHeader(c, "ag-sec-proc", tr(zh, "活跃进程", "Processes"), !expanded, func() {
 			m.agProcExpanded = !m.agProcExpanded
 		}, func() {
