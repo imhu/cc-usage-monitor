@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -623,10 +624,32 @@ func parseAGCaptureArgs(args []string) (snapshotPath, chainCmd string, ok bool) 
 	return snapshotPath, chainCmd, ok
 }
 
+func parseAGSyncOnceArg(args []string) (snapshotPath string, ok bool) {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--ag-sync-once" && i+1 < len(args) {
+			return args[i+1], true
+		}
+	}
+	return "", false
+}
+
 func main() {
 	if snapPath, chainCmd, ok := parseAGCaptureArgs(os.Args[1:]); ok {
 		if err := service.RunAGCaptureSnapshot(snapPath, chainCmd); err != nil {
 			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+	if snapPath, ok := parseAGSyncOnceArg(os.Args[1:]); ok {
+		agyPath := platform.LocateAgyBinary("")
+		res := service.NewAGSilentSyncer().Sync(context.Background(), agyPath, snapPath, 20*time.Second)
+		if res.Kind != service.AGSyncSynced {
+			msg := res.ErrorMsg
+			if msg == "" {
+				msg = fmt.Sprintf("antigravity sync failed (kind=%d)", res.Kind)
+			}
+			fmt.Fprintln(os.Stderr, msg)
 			os.Exit(1)
 		}
 		os.Exit(0)

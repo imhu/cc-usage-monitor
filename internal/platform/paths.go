@@ -172,6 +172,8 @@ func LocateAgyBinary(customPath string) string {
 	}
 	if localApp != "" {
 		candidates = append(candidates,
+			filepath.Join(localApp, "agy", "bin", "agy.exe"),
+			filepath.Join(localApp, "agy", "bin", "agy.cmd"),
 			filepath.Join(localApp, "Programs", "Antigravity", "bin", "agy.exe"),
 			filepath.Join(localApp, "Programs", "Antigravity", "resources", "app", "bin", "agy.cmd"),
 		)

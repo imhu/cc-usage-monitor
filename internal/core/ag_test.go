@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -233,12 +234,30 @@ func TestAGBridgeInstallerDirectAndChained(t *testing.T) {
 	if _, err := os.Stat(inst.BackupPath()); err != nil {
 		t.Fatalf("expected backup file: %v", err)
 	}
+	rawInstalled, _ := os.ReadFile(settingsPath)
+	var installedCfg map[string]any
+	_ = json.Unmarshal(rawInstalled, &installedCfg)
+	installedSL, _ := installedCfg["statusLine"].(map[string]any)
+	installedCmd, _ := installedSL["command"].(string)
+	if installedCmd != inst.CaptureScriptPath() || strings.Contains(installedCmd, `"`) {
+		t.Fatalf("expected quote-free capture script path %q, got %q", inst.CaptureScriptPath(), installedCmd)
+	}
+	scriptBytes, err := os.ReadFile(inst.CaptureScriptPath())
+	if err != nil {
+		t.Fatalf("expected capture script %q: %v", inst.CaptureScriptPath(), err)
+	}
+	if !strings.Contains(string(scriptBytes), `C:\Program Files\ccmonitor\ccmonitor.exe`) {
+		t.Fatalf("expected capture script to contain executable path, got:\n%s", string(scriptBytes))
+	}
 
 	if err := inst.Uninstall(); err != nil {
 		t.Fatalf("direct uninstall failed: %v", err)
 	}
 	if inst.Status().IsInstalled() {
 		t.Fatal("expected uninstalled after Uninstall")
+	}
+	if _, err := os.Stat(inst.CaptureScriptPath()); !os.IsNotExist(err) {
+		t.Fatalf("expected capture script to be removed on uninstall, stat err=%v", err)
 	}
 	raw, _ := os.ReadFile(settingsPath)
 	var restored map[string]any

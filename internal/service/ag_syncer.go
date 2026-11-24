@@ -34,8 +34,9 @@ type AGSyncResult struct {
 }
 
 type AGSilentSyncer struct {
-	mu      sync.Mutex
-	running bool
+	CaptureExePath string
+	mu             sync.Mutex
+	running        bool
 }
 
 func NewAGSilentSyncer() *AGSilentSyncer {
@@ -47,7 +48,7 @@ func (s *AGSilentSyncer) Sync(ctx context.Context, agyPath, snapshotPath string,
 		return AGSyncResult{Kind: AGSyncCLINotFound}
 	}
 	if timeout <= 0 {
-		timeout = 12 * time.Second
+		timeout = 20 * time.Second
 	}
 
 	s.mu.Lock()
@@ -64,9 +65,13 @@ func (s *AGSilentSyncer) Sync(ctx context.Context, agyPath, snapshotPath string,
 		s.mu.Unlock()
 	}()
 
-	exePath, err := os.Executable()
-	if err != nil || exePath == "" {
-		return AGSyncResult{Kind: AGSyncFailed, ErrorMsg: "无法定位当前可执行文件路径"}
+	exePath := strings.TrimSpace(s.CaptureExePath)
+	if exePath == "" {
+		var err error
+		exePath, err = os.Executable()
+		if err != nil || exePath == "" {
+			return AGSyncResult{Kind: AGSyncFailed, ErrorMsg: "无法定位当前可执行文件路径"}
+		}
 	}
 
 	tempDir, err := os.MkdirTemp("", "ag-silent-sync-*")
@@ -76,30 +81,38 @@ func (s *AGSilentSyncer) Sync(ctx context.Context, agyPath, snapshotPath string,
 	defer os.RemoveAll(tempDir)
 
 	probePath := filepath.Join(tempDir, "probe.json")
-	captureCmd := (core.AGBridgeInstaller{CaptureExePath: exePath}).BuildCaptureCommand(probePath, "")
+	probeScriptPath := filepath.Join(tempDir, "probe.cmd")
+	installer := core.AGBridgeInstaller{CaptureExePath: exePath}
+	if err := installer.WriteCaptureScript(probeScriptPath, probePath, ""); err != nil {
+		return AGSyncResult{Kind: AGSyncFailed, ErrorMsg: fmt.Sprintf("写入临时捕获脚本失败：%v", err)}
+	}
 
 	settingsBytes, err := json.Marshal(map[string]any{
 		"statusLine": map[string]any{
 			"type":    "command",
-			"command": captureCmd,
+			"command": probeScriptPath,
 			"enabled": true,
 		},
 	})
 	if err != nil {
 		return AGSyncResult{Kind: AGSyncFailed, ErrorMsg: "序列化临时配置失败"}
 	}
+	settingsPath := filepath.Join(tempDir, "settings.json")
+	if err := os.WriteFile(settingsPath, settingsBytes, 0o644); err != nil {
+		return AGSyncResult{Kind: AGSyncFailed, ErrorMsg: fmt.Sprintf("写入临时配置失败：%v", err)}
+	}
 
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	proc, err := platform.StartConPTYCommand(runCtx, agyPath, []string{"--settings", string(settingsBytes)}, tempDir)
+	proc, err := platform.StartConPTYCommand(runCtx, agyPath, []string{"--settings", settingsPath}, tempDir)
 	if err != nil {
 		return AGSyncResult{Kind: AGSyncFailed, ErrorMsg: fmt.Sprintf("启动 agy 失败：%v", err)}
 	}
 	defer proc.Close()
 
 	deadline := time.Now().Add(timeout)
-	var firstQuotaAt time.Time
+	var firstQuotaAt, firstAuthAt time.Time
 	var latest *core.AGStatusLineSnapshot
 	sawAuthRequired := false
 
@@ -109,17 +122,23 @@ func (s *AGSilentSyncer) Sync(ctx context.Context, agyPath, snapshotPath string,
 		}
 		if parsed := core.LoadAGSnapshot(probePath); parsed != nil {
 			latest = parsed
-			if parsed.AgentState == "authenticating" {
-				sawAuthRequired = true
-				break
+			if parsed.AgentState == "authenticating" && len(parsed.Quota) == 0 {
+				if firstAuthAt.IsZero() {
+					firstAuthAt = time.Now()
+				} else if time.Since(firstAuthAt) >= 3*time.Second {
+					sawAuthRequired = true
+					break
+				}
+			} else {
+				firstAuthAt = time.Time{}
 			}
 			if len(parsed.Quota) > 0 {
-				if strings.TrimSpace(parsed.PlanTier) != "" {
+				if strings.TrimSpace(parsed.PlanTier) != "" && strings.TrimSpace(parsed.Email) != "" {
 					break
 				}
 				if firstQuotaAt.IsZero() {
 					firstQuotaAt = time.Now()
-				} else if time.Since(firstQuotaAt) >= 800*time.Millisecond {
+				} else if time.Since(firstQuotaAt) >= 2500*time.Millisecond {
 					break
 				}
 			}
@@ -139,7 +158,10 @@ func (s *AGSilentSyncer) Sync(ctx context.Context, agyPath, snapshotPath string,
 		return AGSyncResult{Kind: AGSyncAuthRequired}
 	}
 	if latest == nil || len(latest.Quota) == 0 {
-		return AGSyncResult{Kind: AGSyncFailed, ErrorMsg: "超时未获取到官方额度，请确认 agy CLI 已登录"}
+		if latest == nil {
+			return AGSyncResult{Kind: AGSyncFailed, ErrorMsg: "超时未收到 agy CLI 状态回报，请确认 agy CLI 可正常运行"}
+		}
+		return AGSyncResult{Kind: AGSyncFailed, ErrorMsg: fmt.Sprintf("已连接 agy CLI（状态：%s），但超时未获取到官方额度", latest.AgentState)}
 	}
 
 	prev := core.LoadAGSnapshot(snapshotPath)

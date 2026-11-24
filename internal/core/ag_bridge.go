@@ -57,6 +57,10 @@ func (i AGBridgeInstaller) MetadataPath() string {
 	return filepath.Join(i.CLIConfigDir, "usage-monitor-bridge.json")
 }
 
+func (i AGBridgeInstaller) CaptureScriptPath() string {
+	return filepath.Join(i.CLIConfigDir, "usage-monitor-capture.cmd")
+}
+
 // BuildCaptureCommand returns a Windows-safe statusLine command pointing to ccmonitor.exe --ag-capture-snapshot.
 func (i AGBridgeInstaller) BuildCaptureCommand(snapshotPath, chainedCmd string) string {
 	exe := strings.TrimSpace(i.CaptureExePath)
@@ -74,12 +78,41 @@ func (i AGBridgeInstaller) BuildCaptureCommand(snapshotPath, chainedCmd string) 
 	return cmd
 }
 
+func escapeBatchQuotedArg(s string) string {
+	s = strings.ReplaceAll(s, `%`, `%%`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return s
+}
+
+// BuildCaptureScript generates a quote-free UTF-8 .cmd wrapper for agy statusLine execution.
+func (i AGBridgeInstaller) BuildCaptureScript(snapshotPath, chainedCmd string) string {
+	exe := strings.TrimSpace(i.CaptureExePath)
+	if exe == "" {
+		if p, err := os.Executable(); err == nil && p != "" {
+			exe = p
+		} else {
+			exe = "ccmonitor.exe"
+		}
+	}
+	line := fmt.Sprintf(`"%s" --ag-capture-snapshot "%s"`, escapeBatchQuotedArg(exe), escapeBatchQuotedArg(snapshotPath))
+	if strings.TrimSpace(chainedCmd) != "" {
+		line += fmt.Sprintf(` --chain "%s"`, escapeBatchQuotedArg(chainedCmd))
+	}
+	return "@echo off\r\nchcp 65001 >nul 2>nul\r\n" + line + "\r\n"
+}
+
+func (i AGBridgeInstaller) WriteCaptureScript(scriptPath, snapshotPath, chainedCmd string) error {
+	return atomicWriteFileCore(scriptPath, []byte(i.BuildCaptureScript(snapshotPath, chainedCmd)), 0o644)
+}
+
 func quoteWinArgInner(s string) string {
 	return strings.ReplaceAll(s, `"`, `\"`)
 }
 
 func (i AGBridgeInstaller) isOurCommand(command string) bool {
-	return strings.Contains(command, "--ag-capture-snapshot") && strings.Contains(command, i.SnapshotPath())
+	lower := strings.ToLower(command)
+	return strings.Contains(lower, "usage-monitor-capture.cmd") ||
+		(strings.Contains(command, "--ag-capture-snapshot") && strings.Contains(command, i.SnapshotPath()))
 }
 
 func (i AGBridgeInstaller) Status() AGBridgeStatus {
@@ -155,9 +188,13 @@ func (i AGBridgeInstaller) Install() (AGBridgeStatus, error) {
 		chainedCmd = existingCmd
 	}
 
+	if err := i.WriteCaptureScript(i.CaptureScriptPath(), i.SnapshotPath(), chainedCmd); err != nil {
+		return AGBridgeStatus{}, fmt.Errorf("write capture script: %w", err)
+	}
+
 	newSL := map[string]any{
 		"type":    "command",
-		"command": i.BuildCaptureCommand(i.SnapshotPath(), chainedCmd),
+		"command": i.CaptureScriptPath(),
 		"enabled": true,
 	}
 	if existingSL != nil {
@@ -226,6 +263,7 @@ func (i AGBridgeInstaller) Uninstall() error {
 			}
 		}
 	}
+	_ = os.Remove(i.CaptureScriptPath())
 	_ = os.Remove(i.MetadataPath())
 	return nil
 }

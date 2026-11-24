@@ -185,9 +185,9 @@ func (s *Store) RefreshAntigravity(forceSync bool) {
 	s.agLocal = local
 	s.agProcs = procs
 	s.agRefreshing = false
-	if official.AgentState == "authenticating" {
+	if official.AgentState == "authenticating" && len(official.Buckets) == 0 {
 		s.agAuthRequired = true
-	} else if official.HasSnapshot() && len(official.Buckets) > 0 && official.AgentState != "" {
+	} else if official.HasSnapshot() && len(official.Buckets) > 0 {
 		s.agAuthRequired = false
 	}
 
@@ -257,7 +257,7 @@ func (s *Store) SyncAntigravityOfficial(force bool) {
 	s.notify()
 
 	cliPath := platform.LocateAgyBinary(customCLI)
-	res := syncer.Sync(ctx, cliPath, inst.SnapshotPath(), 12*time.Second)
+	res := syncer.Sync(ctx, cliPath, inst.SnapshotPath(), 20*time.Second)
 
 	s.mu.Lock()
 	s.agSyncing = false
@@ -282,7 +282,7 @@ func (s *Store) SyncAntigravityOfficial(force bool) {
 			}
 		}
 	case AGSyncFailed:
-		if force {
+		if force || !s.agOfficial.HasSnapshot() {
 			s.agFeedback = res.ErrorMsg
 		}
 	}

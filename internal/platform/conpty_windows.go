@@ -269,13 +269,22 @@ func (p *ConPTYProcess) Close() {
 }
 
 func buildConPTYEnvBlock() ([]uint16, error) {
-	env := os.Environ()
+	rawEnv := os.Environ()
+	env := make([]string, 0, len(rawEnv)+1)
 	hasTerm := false
-	for _, kv := range env {
-		if len(kv) >= 5 && strings.EqualFold(kv[:5], "TERM=") {
-			hasTerm = true
-			break
+	for _, kv := range rawEnv {
+		key := kv
+		if eq := strings.IndexByte(kv, '='); eq >= 0 {
+			key = kv[:eq]
 		}
+		upperKey := strings.ToUpper(key)
+		if strings.HasPrefix(upperKey, "ANTIGRAVITY_") || strings.HasPrefix(upperKey, "AGY_") {
+			continue
+		}
+		if upperKey == "TERM" {
+			hasTerm = true
+		}
+		env = append(env, kv)
 	}
 	if !hasTerm {
 		env = append(env, "TERM=xterm-256color")

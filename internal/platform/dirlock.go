@@ -196,11 +196,15 @@ func AtomicWriteFile(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	_ = os.Chmod(tmp, perm)
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
+	var renameErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		if renameErr = os.Rename(tmp, path); renameErr == nil {
+			return nil
+		}
+		time.Sleep(time.Duration(attempt+1) * 20 * time.Millisecond)
 	}
-	return nil
+	_ = os.Remove(tmp)
+	return renameErr
 }
 
 // WriteAndVerifyFile atomically writes data and reads it back to confirm persistence.

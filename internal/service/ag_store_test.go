@@ -2,7 +2,9 @@ package service
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,5 +120,50 @@ func TestShouldProbeExitByProvider(t *testing.T) {
 	}
 	if s.exitPlace != nil {
 		t.Fatalf("expected offline SetActiveProvider not to probe exit when ctx is nil, got %+v", s.exitPlace)
+	}
+}
+
+func TestMain(m *testing.M) {
+	if os.Getenv("GO_WANT_AG_CAPTURE_HELPER") == "1" {
+		for i := 0; i < len(os.Args)-1; i++ {
+			if os.Args[i] == "--ag-capture-snapshot" {
+				if err := RunAGCaptureSnapshot(os.Args[i+1], ""); err != nil {
+					os.Exit(1)
+				}
+				os.Exit(0)
+			}
+		}
+		os.Exit(2)
+	}
+	os.Exit(m.Run())
+}
+
+func TestAGCaptureScriptViaGoCmdExec(t *testing.T) {
+	tmp := t.TempDir()
+	spacedDir := filepath.Join(tmp, "ag-测试 空间")
+	if err := os.MkdirAll(spacedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapPath := filepath.Join(spacedDir, "probe.json")
+	scriptPath := filepath.Join(spacedDir, "probe.cmd")
+	inst := core.AGBridgeInstaller{CaptureExePath: exe}
+	if err := inst.WriteCaptureScript(scriptPath, snapPath, ""); err != nil {
+		t.Fatalf("WriteCaptureScript failed: %v", err)
+	}
+
+	cmd := exec.Command("cmd", "/c", scriptPath)
+	cmd.Env = append(os.Environ(), "GO_WANT_AG_CAPTURE_HELPER=1")
+	cmd.Stdin = strings.NewReader(`{"plan_tier":"Pro","quota":{"gemini-5h":{"remaining_fraction":0.75,"reset_in_seconds":3600}}}`)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("cmd /c script failed: %v\noutput: %s", err, string(out))
+	}
+	snap := core.LoadAGSnapshot(snapPath)
+	if snap == nil || snap.PlanTier != "Pro" || snap.CapturedTime() == nil || len(snap.Quota) != 1 {
+		t.Fatalf("unexpected captured snapshot: %+v", snap)
 	}
 }

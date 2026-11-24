@@ -175,17 +175,26 @@ func (m *PopoverModel) renderAGLimitsSection(c *ui.Context, st service.ViewState
 			return
 		}
 
-		needsLogin := st.AG.AuthRequired || off.AgentState == "authenticating" || (off.HasSnapshot() && strings.TrimSpace(off.Email) == "")
+		needsLogin := st.AG.AuthRequired || off.AgentState == "authenticating" || (off.HasSnapshot() && len(off.Buckets) > 0 && strings.TrimSpace(off.Email) == "")
 
 		if !off.HasSnapshot() || len(off.Buckets) == 0 {
-			title := tr(zh, "需要登录 agy CLI", "agy CLI sign-in required")
+			title := tr(zh, "等待同步官方额度", "Waiting for official limits")
+			detail := tr(zh, "点击「立即同步」从 agy CLI 获取最新额度；若尚未登录，请先点击「终端登录 agy」。",
+				"Click Sync now to fetch limits from agy CLI, or sign in first if needed.")
 			if st.AG.IsSyncing {
 				title = tr(zh, "正在后台同步官方额度…", "Syncing official limits in background…")
 			} else if st.AG.CLIBinaryPath == "" {
 				title = tr(zh, "未检测到 agy CLI", "agy CLI not detected")
+				detail = tr(zh, "请先安装 Antigravity CLI 或在设置中指定 agy 路径；本地日志统计可直接使用。",
+					"Install Antigravity CLI or set the agy path in Settings. Local log stats work without it.")
+			} else if needsLogin {
+				title = tr(zh, "需要登录 agy CLI", "agy CLI sign-in required")
+				detail = tr(zh, "在终端完成一次 agy 登录后即可关闭终端，之后自动后台同步官方额度；本地日志统计可直接使用。",
+					"Sign in once with agy in terminal, then close it — official limits sync automatically. Local log stats work without it.")
+			} else if strings.TrimSpace(st.AG.Feedback) != "" {
+				title = tr(zh, "暂未获取到官方额度", "Official limits unavailable")
+				detail = st.AG.Feedback
 			}
-			detail := tr(zh, "在终端完成一次 agy 登录后即可关闭终端，之后自动后台同步官方额度；本地日志统计可直接使用。",
-				"Sign in once with agy in terminal, then close it — official limits sync automatically. Local log stats work without it.")
 			EmptyNote(c, IconTerm, title, detail, func() {
 				ui.Row(c).Gap(6).Margin(4, 0, 0, 0).Children(func() {
 					FooterButton(c, "ag-btn-login", IconTerm, tr(zh, "终端登录 agy", "Sign in agy CLI"), false, func() {
