@@ -121,6 +121,7 @@ type Preferences struct {
 	// General tab
 	Language            LanguagePref `json:"language"`
 	ExpiryNotifications bool         `json:"expiryNotifications"`
+	SkippedVersion      string       `json:"skippedVersion,omitempty"`
 }
 
 func DefaultPreferences() Preferences {

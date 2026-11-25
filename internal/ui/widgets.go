@@ -526,6 +526,10 @@ func SegmentedTabs(c *ui.Context, key string, labels []string, selected int, ful
 }
 
 func FooterButton(c *ui.Context, key string, icon *ui.SVG, title string, spinning bool, onClick func()) ui.Element {
+	return FooterButtonWithBadge(c, key, icon, title, spinning, false, onClick)
+}
+
+func FooterButtonWithBadge(c *ui.Context, key string, icon *ui.SVG, title string, spinning bool, badge bool, onClick func()) ui.Element {
 	btn := ui.Row(c.Key(key)).Height(24).Padding(0, 8).Gap(5).Radius(6).AlignItems(ui.Center).Cursor(ui.CursorPointer)
 	hov := btn.Hovered()
 	if hov {
@@ -544,6 +548,9 @@ func FooterButton(c *ui.Context, key string, icon *ui.SVG, title string, spinnin
 			ic.Rotate(ic.Loop("spin", 750*time.Millisecond, ui.Linear) * 360)
 		}
 		ui.Text(c, title).FontSize(11.5).TextColor(col).SingleLine()
+		if badge {
+			ui.Box(c).Size(6, 6).Radius(3).Background(ColorAGAccent)
+		}
 	})
 	return btn
 }

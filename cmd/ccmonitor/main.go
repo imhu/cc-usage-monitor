@@ -183,12 +183,22 @@ func (a *application) openPanel() {
 }
 
 func (a *application) openSettings() {
+	a.openSettingsAt(a.settingsModel.ActiveTab, false)
+}
+
+func (a *application) openSettingsAt(tab appui.SettingsTab, expandUpdate bool) {
 	if a.panel != nil {
 		a.panel.Close()
+	}
+	if expandUpdate {
+		a.settingsModel.OpenUpdateSection()
+	} else {
+		a.settingsModel.ActiveTab = tab
 	}
 	if a.settings != nil {
 		a.settings.Show()
 		a.settings.Focus()
+		a.settings.Invalidate()
 		return
 	}
 	st := a.store.ViewState()
@@ -481,11 +491,19 @@ func (a *application) switchProvider(p core.ProviderKind) {
 
 func (a *application) ready() {
 	a.store = service.NewStore(a.invalidateAll)
+	a.store.SetRelaunchHandler(func() {
+		mygo.RunOnMain(func() {
+			mygo.App.Relaunch()
+		})
+	})
 
 	a.popoverModel = appui.NewPopoverModel(a.store, appui.PopoverActions{
 		OpenSettings: a.openSettings,
-		Quit:         mygo.App.Quit,
-		ChooseDir:    a.chooseDataDir,
+		OpenSettingsUpdate: func() {
+			a.openSettingsAt(appui.TabGeneral, true)
+		},
+		Quit:      mygo.App.Quit,
+		ChooseDir: a.chooseDataDir,
 		TogglePill: func() {
 			st := a.store.ViewState()
 			next := !st.Prefs.ShowFloatingPill
@@ -506,6 +524,9 @@ func (a *application) ready() {
 		OnProviderChanged:  a.syncProviderState,
 		GetOpenAtLogin:     mygo.App.OpenAtLogin,
 		SetOpenAtLogin:     mygo.App.SetOpenAtLogin,
+		OpenURL: func(u string) {
+			_ = mygo.Shell.OpenExternal(u)
+		},
 	})
 	a.pillModel = appui.NewFloatingPillModel(a.store, appui.PillActions{
 		OnOpenPanel:       a.togglePanel,
@@ -652,6 +673,7 @@ func parseAGSyncOnceArg(args []string) (snapshotPath string, ok bool) {
 }
 
 func main() {
+	platform.CleanupStaleUpdatedBinary()
 	if snapPath, chainCmd, ok := parseAGCaptureArgs(os.Args[1:]); ok {
 		if err := service.RunAGCaptureSnapshot(snapPath, chainCmd); err != nil {
 			fmt.Fprintln(os.Stderr, err)

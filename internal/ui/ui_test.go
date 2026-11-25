@@ -521,3 +521,48 @@ func TestAntigravityDailyViewOtherModelsAndSlidingTabs(t *testing.T) {
 		t.Fatalf("expected 3rd/4th models merged under 其他, got: %q", mt.Texts())
 	}
 }
+
+func TestUpdateBadgeAndSettingsGeneralCard(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+	store := service.NewStore(nil)
+	store.SetDemoState()
+	store.SetUpdateReleaseForTest(&core.ReleaseInfo{
+		TagName: "v9.9.9",
+		Body:    "### Updates\n- Added update card",
+		HTMLURL: "https://github.com/imhu/cc-usage-monitor/releases/tag/v9.9.9",
+	})
+
+	if !store.ViewState().Update.HasBadge() {
+		t.Fatal("expected HasBadge=true when update release is set")
+	}
+
+	openUpdateCount := 0
+	pop := NewPopoverModel(store, PopoverActions{
+		OpenSettingsUpdate: func() { openUpdateCount++ },
+	})
+	pt := ui.NewTesterWith(pop.View, 356, 760, ui.TesterOptions{Dark: true})
+	if err := pt.Click("设置…"); err != nil {
+		t.Fatalf("click 设置… failed: %v", err)
+	}
+	if openUpdateCount != 1 {
+		t.Fatalf("expected OpenSettingsUpdate=1 when badge active, got %d", openUpdateCount)
+	}
+
+	set := NewSettingsModel(store, SettingsActions{})
+	set.OpenUpdateSection()
+	st := ui.NewTesterWith(set.View, 540, 760, ui.TesterOptions{Dark: true})
+	for _, want := range []string{"软件更新", "v9.9.9", "Added update card", "立即更新并重启", "忽略此版本"} {
+		if !st.HasText(want) {
+			t.Fatalf("settings General update card missing %q; got: %q", want, st.Texts())
+		}
+	}
+
+	if err := st.Click("忽略此版本"); err != nil {
+		t.Fatalf("click 忽略此版本 failed: %v", err)
+	}
+	vs := store.ViewState()
+	if vs.Prefs.SkippedVersion != "v9.9.9" || vs.Update.HasBadge() {
+		t.Fatalf("expected SkippedVersion=v9.9.9 and HasBadge=false, got prefs=%q badge=%v",
+			vs.Prefs.SkippedVersion, vs.Update.HasBadge())
+	}
+}

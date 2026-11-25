@@ -37,6 +37,7 @@ type SettingsActions struct {
 	OnProviderChanged  func()
 	GetOpenAtLogin     func() bool
 	SetOpenAtLogin     func(bool) error
+	OpenURL            func(url string)
 }
 
 type SettingsModel struct {
@@ -44,6 +45,7 @@ type SettingsModel struct {
 	Actions SettingsActions
 
 	ActiveTab              SettingsTab
+	updateNotesExpanded    bool
 	menuBarPreviewProvider core.ProviderKind
 	menuBarPreviewSynced   bool
 	proxyDraft             string
@@ -69,6 +71,11 @@ func NewSettingsModel(store *service.Store, actions SettingsActions) *SettingsMo
 		Actions:   actions,
 		ActiveTab: TabUsage,
 	}
+}
+
+func (m *SettingsModel) OpenUpdateSection() {
+	m.ActiveTab = TabGeneral
+	m.updateNotesExpanded = true
 }
 
 func (m *SettingsModel) View(c *ui.Context) {
@@ -113,7 +120,7 @@ func (m *SettingsModel) View(c *ui.Context) {
 
 	ui.Column(c).Fill().Background(ColorSurfaceSettings).Children(func() {
 		// Top 5-tab icon bar matching hero.png / settings-panel.png / settings-usage.png
-		m.renderTabBar(c, zh)
+		m.renderTabBar(c, st, zh)
 		Hairline(c)
 
 		// Scrollable settings body
@@ -136,7 +143,7 @@ func (m *SettingsModel) View(c *ui.Context) {
 	})
 }
 
-func (m *SettingsModel) renderTabBar(c *ui.Context, zh bool) {
+func (m *SettingsModel) renderTabBar(c *ui.Context, st service.ViewState, zh bool) {
 	tabs := []struct {
 		id   SettingsTab
 		icon *ui.SVG
@@ -168,7 +175,12 @@ func (m *SettingsModel) renderTabBar(c *ui.Context, zh bool) {
 			}
 			btn.Children(func() {
 				ui.Icon(c, tb.icon).FontSize(17).TextColor(col)
-				ui.Text(c, tb.name).FontSize(11).FontWeight(500).TextColor(col).SingleLine()
+				ui.Row(c).Center().Gap(4).Children(func() {
+					ui.Text(c, tb.name).FontSize(11).FontWeight(500).TextColor(col).SingleLine()
+					if tb.id == TabGeneral && st.Update.HasBadge() {
+						ui.Box(c).Size(6, 6).Radius(3).Background(ColorAGAccent)
+					}
+				})
 			})
 		}
 	})
@@ -1331,6 +1343,10 @@ func (m *SettingsModel) renderGeneralTab(c *ui.Context, st service.ViewState, zh
 
 	Hairline(c)
 
+	m.renderUpdateSection(c, st, zh)
+
+	Hairline(c)
+
 	ui.Column(c).FillWidth().Padding(8, 0).Gap(4).Children(func() {
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 			ClaudeLogo(c, 16, ColorAccent)
@@ -1341,4 +1357,187 @@ func (m *SettingsModel) renderGeneralTab(c *ui.Context, st service.ViewState, zh
 			"Windows native dual-provider monitor (Claude & Antigravity) powered by egoist/mygo Direct3D 11 UI.")).
 			FontSize(11).TextColor(ColorTertiary)
 	})
+}
+
+func (m *SettingsModel) renderUpdateSection(c *ui.Context, st service.ViewState, zh bool) {
+	upd := st.Update
+	curVer := strings.TrimSpace(upd.CurrentVersion)
+	if curVer == "" {
+		curVer = "dev"
+	}
+
+	settingsGroupTitle(c, tr(zh, "软件更新", "Software update"))
+
+	statusDesc := tr(zh, "当前版本："+curVer, "Current version: "+curVer)
+	if upd.CheckedAt != nil && upd.Status == service.UpdateIdle && !upd.HasAvailable() {
+		statusDesc += " · " + tr(zh, "上次检查 "+core.FormatRelative(*upd.CheckedAt, time.Now(), zh),
+			"Checked "+core.FormatRelative(*upd.CheckedAt, time.Now(), zh))
+	}
+	switch upd.Status {
+	case service.UpdateChecking:
+		statusDesc = tr(zh, "正在从 GitHub Releases 检查最新版本…", "Checking GitHub Releases for updates…")
+	case service.UpdateUpToDate:
+		statusDesc = tr(zh, fmt.Sprintf("当前版本 %s 已是最新版本", curVer), fmt.Sprintf("Version %s is up to date", curVer))
+	case service.UpdateDownloading:
+		statusDesc = tr(zh, fmt.Sprintf("正在下载更新包… %d%%", int(math.Round(upd.Progress*100))),
+			fmt.Sprintf("Downloading update… %d%%", int(math.Round(upd.Progress*100))))
+	case service.UpdateVerifying:
+		statusDesc = tr(zh, "正在校验 SHA256 文件摘要…", "Verifying SHA256 checksum…")
+	case service.UpdateInstalling:
+		statusDesc = tr(zh, "正在原地替换程序文件…", "Installing update in place…")
+	case service.UpdateReadyToRestart:
+		statusDesc = tr(zh, "更新已完成，正在重新启动…", "Update installed, relaunching…")
+	case service.UpdateError:
+		if upd.ErrorMsg != "" {
+			statusDesc = upd.ErrorMsg
+		}
+	default:
+		if upd.HasAvailable() && upd.Release != nil {
+			statusDesc = tr(zh, fmt.Sprintf("当前版本 %s · 发现新版本 %s", curVer, upd.Release.TagName),
+				fmt.Sprintf("Current %s · Update %s available", curVer, upd.Release.TagName))
+		}
+	}
+
+	busy := upd.Status == service.UpdateChecking || upd.Status == service.UpdateDownloading ||
+		upd.Status == service.UpdateVerifying || upd.Status == service.UpdateInstalling
+
+	ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(12).Children(func() {
+		ui.Column(c).Grow(1).Gap(3).Children(func() {
+			ui.Row(c).AlignItems(ui.Center).Gap(6).Children(func() {
+				ui.Text(c, tr(zh, "版本 ", "Version ")+curVer).FontSize(13).FontWeight(500).TextColor(ColorText).SingleLine()
+				if strings.EqualFold(curVer, "dev") {
+					Chip(c, tr(zh, "开发版", "Dev"), ColorTertiary)
+				}
+				if upd.HasAvailable() && upd.Release != nil {
+					Chip(c, upd.Release.TagName, ColorAGAccent)
+				}
+			})
+			descCol := ColorTertiary
+			if upd.Status == service.UpdateError {
+				descCol = ColorCritical
+			}
+			ui.Text(c, statusDesc).FontSize(11.5).TextColor(descCol)
+		})
+
+		chkBtn := ui.Row(c.Key("btn-upd-chk")).Height(28).Padding(0, 12).Radius(7).Center().Background(ColorPillSel)
+		if !busy {
+			chkBtn.Cursor(ui.CursorPointer)
+			if chkBtn.Clicked() {
+				go m.Store.CheckForUpdates(true)
+			}
+		}
+		chkBtn.Children(func() {
+			lbl := tr(zh, "检查更新", "Check for updates")
+			if upd.Status == service.UpdateChecking {
+				lbl = tr(zh, "检查中…", "Checking…")
+			}
+			ui.Text(c, lbl).FontSize(12).TextColor(ColorText).SingleLine()
+		})
+	})
+
+	if upd.HasAvailable() && upd.Release != nil {
+		rel := upd.Release
+		isInstalling := upd.Status == service.UpdateDownloading || upd.Status == service.UpdateVerifying ||
+			upd.Status == service.UpdateInstalling || upd.Status == service.UpdateReadyToRestart
+
+		ui.Column(c.Key("upd-card")).FillWidth().Padding(12).Radius(10).Gap(10).
+			Background(ColorHover).Border(1, ColorDivider).Children(func() {
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).Children(func() {
+				title := tr(zh, "发现新版本 ", "New version ") + rel.TagName
+				ui.Text(c, title).FontSize(13).FontWeight(600).TextColor(ColorText).SingleLine()
+				if rel.PublishedAt != nil {
+					ui.Text(c, rel.PublishedAt.Local().Format("2006-01-02")).FontSize(11).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
+				}
+				ui.Spacer(c)
+				if strings.TrimSpace(rel.Body) != "" {
+					tog := ui.Row(c.Key("upd-notes-tog")).Padding(2, 6).Radius(5).AlignItems(ui.Center).Gap(4).Cursor(ui.CursorPointer)
+					if tog.Hovered() {
+						tog.Background(ColorHover)
+					}
+					if tog.Clicked() {
+						m.updateNotesExpanded = !m.updateNotesExpanded
+					}
+					tog.Children(func() {
+						ui.Text(c, tr(zh, "更新日志", "Release notes")).FontSize(11).TextColor(ColorSecondary).SingleLine()
+						ic := IconChevRt
+						if m.updateNotesExpanded {
+							ic = IconChevDn
+						}
+						ui.Icon(c, ic).FontSize(9).TextColor(ColorTertiary)
+					})
+				}
+			})
+
+			if m.updateNotesExpanded && strings.TrimSpace(rel.Body) != "" {
+				lines := core.ParseReleaseNotesMarkdown(rel.Body)
+				ui.Column(c).FillWidth().Padding(8, 10).Radius(7).Gap(4).Background(ui.RGBA(0, 0, 0, 0.18)).Children(func() {
+					for i, ln := range lines {
+						switch ln.Kind {
+						case core.MDHeading:
+							ui.Text(c.Key(fmt.Sprintf("md-h-%d", i)), ln.Text).FontSize(11.5).FontWeight(600).TextColor(ColorText)
+						case core.MDBullet:
+							ui.Text(c.Key(fmt.Sprintf("md-b-%d", i)), "• "+ln.Text).FontSize(11).TextColor(ColorSecondary)
+						default:
+							ui.Text(c.Key(fmt.Sprintf("md-p-%d", i)), ln.Text).FontSize(11).TextColor(ColorSecondary)
+						}
+					}
+				})
+			}
+
+			if isInstalling {
+				ui.Column(c).FillWidth().Gap(4).Children(func() {
+					ThinBar(c, "upd-prog", upd.Progress, ColorAGAccent, nil, false, nil)
+					if upd.Total > 0 {
+						ui.Text(c, fmt.Sprintf("%s / %s", platform.FormatBytes(uint64(max(0, upd.Downloaded))), platform.FormatBytes(uint64(upd.Total)))).
+							FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
+					}
+				})
+			}
+
+			if upd.Status == service.UpdateError && upd.ErrorMsg != "" {
+				ui.Text(c, upd.ErrorMsg).FontSize(11).TextColor(ColorCritical)
+			}
+
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).Children(func() {
+				if !isInstalling {
+					instBtn := ui.Row(c.Key("btn-upd-inst")).Height(28).Padding(0, 12).Radius(7).Center().
+						Background(ColorAGAccent).Cursor(ui.CursorPointer)
+					if instBtn.Clicked() {
+						m.Store.InstallAvailableUpdate()
+					}
+					instBtn.Children(func() {
+						ui.Text(c, tr(zh, "立即更新并重启", "Update & restart")).FontSize(12).FontWeight(600).TextColor(ui.Hex("#FFFFFF")).SingleLine()
+					})
+				}
+
+				openBtn := ui.Row(c.Key("btn-upd-web")).Height(28).Padding(0, 12).Radius(7).Center().
+					Background(ColorPillSel).Cursor(ui.CursorPointer)
+				if openBtn.Clicked() && m.Actions.OpenURL != nil {
+					target := strings.TrimSpace(rel.HTMLURL)
+					if target == "" {
+						target = core.UpdateReleasesURL
+					}
+					m.Actions.OpenURL(target)
+				}
+				openBtn.Children(func() {
+					ui.Text(c, tr(zh, "前往下载", "Open Release")).FontSize(12).TextColor(ColorText).SingleLine()
+				})
+
+				ui.Spacer(c)
+
+				if !isInstalling && !strings.EqualFold(strings.TrimSpace(st.Prefs.SkippedVersion), strings.TrimSpace(rel.TagName)) {
+					skipBtn := ui.Row(c.Key("btn-upd-skip")).Height(28).Padding(0, 10).Radius(7).Center().Cursor(ui.CursorPointer)
+					if skipBtn.Hovered() {
+						skipBtn.Background(ColorHover)
+					}
+					if skipBtn.Clicked() {
+						m.Store.SkipUpdateVersion(rel.TagName)
+					}
+					skipBtn.Children(func() {
+						ui.Text(c, tr(zh, "忽略此版本", "Skip version")).FontSize(11.5).TextColor(ColorSecondary).SingleLine()
+					})
+				}
+			})
+		})
+	}
 }

@@ -15,11 +15,12 @@ import (
 )
 
 type PopoverActions struct {
-	OpenSettings      func()
-	Quit              func()
-	ChooseDir         func()
-	TogglePill        func()
-	OnProviderChanged func()
+	OpenSettings       func()
+	OpenSettingsUpdate func()
+	Quit               func()
+	ChooseDir          func()
+	TogglePill         func()
+	OnProviderChanged  func()
 }
 
 type PopoverModel struct {
@@ -2016,11 +2017,20 @@ func (m *PopoverModel) renderFooter(c *ui.Context, st service.ViewState, zh bool
 		spinning = st.AG.IsSyncing || st.AG.IsRefreshing
 	}
 	ui.Row(c).FillWidth().Padding(7, 0, 0, 0).Margin(0, -8, 0, -8).AlignItems(ui.Center).Children(func() {
-		FooterButton(c, "ft-settings", IconSliders, tr(zh, "设置…", "Settings…"), false, func() {
-			if m.Actions.OpenSettings != nil {
+		hasBadge := st.Update.HasBadge()
+		settingsTip := tr(zh, "快捷键 Ctrl+,", "Shortcut Ctrl+,")
+		if hasBadge && st.Update.Release != nil {
+			settingsTip = tr(zh,
+				fmt.Sprintf("发现新版本 %s · 点击查看更新", st.Update.Release.TagName),
+				fmt.Sprintf("Update %s available · Click to view", st.Update.Release.TagName))
+		}
+		FooterButtonWithBadge(c, "ft-settings", IconSliders, tr(zh, "设置…", "Settings…"), false, hasBadge, func() {
+			if hasBadge && m.Actions.OpenSettingsUpdate != nil {
+				m.Actions.OpenSettingsUpdate()
+			} else if m.Actions.OpenSettings != nil {
 				m.Actions.OpenSettings()
 			}
-		}).Tooltip(tr(zh, "快捷键 Ctrl+,", "Shortcut Ctrl+,"))
+		}).Tooltip(settingsTip)
 		ui.Spacer(c)
 		FooterButton(c, "ft-refresh", IconRefresh, tr(zh, "立即刷新", "Refresh"), spinning, func() {
 			m.Store.RefreshNow()

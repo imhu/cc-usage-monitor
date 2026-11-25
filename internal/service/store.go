@@ -92,6 +92,9 @@ type ViewState struct {
 
 	// Antigravity
 	AG AGViewState
+
+	// App updater
+	Update UpdateViewState
 }
 
 // ActiveSpeedModel returns the model currently displayed for output speed,
@@ -125,6 +128,9 @@ type persistedState struct {
 	ExpiryNotified   map[string]bool      `json:"expiryNotified,omitempty"`
 	FXPerUSD         map[string]float64   `json:"fxPerUSD,omitempty"`
 	FXFetchedAt      *time.Time           `json:"fxFetchedAt,omitempty"`
+	UpdateETag       string               `json:"updateETag,omitempty"`
+	UpdateCheckedAt  *time.Time           `json:"updateCheckedAt,omitempty"`
+	CachedRelease    *core.ReleaseInfo    `json:"cachedRelease,omitempty"`
 }
 
 type Store struct {
@@ -202,6 +208,18 @@ type Store struct {
 	agLastSeenTokens int64
 	agLastAlertKey   string
 	agWatchCancel    context.CancelFunc
+
+	// App updater state
+	updateStatus      UpdateStatusKind
+	updateRelease     *core.ReleaseInfo
+	updateProgress    float64
+	updateDownloaded  int64
+	updateTotal       int64
+	updateError       string
+	updateCancel      context.CancelFunc
+	updateAPIURL      string
+	targetExeOverride string
+	onRelaunch        func()
 }
 
 func NewStore(onChange func()) *Store {
@@ -236,6 +254,11 @@ func NewStore(onChange func()) *Store {
 	}
 	if s.pstate.Profile != nil {
 		s.profile = s.pstate.Profile
+	}
+	if s.pstate.CachedRelease != nil && core.IsNewerVersion(core.AppVersion, s.pstate.CachedRelease.TagName) {
+		cp := *s.pstate.CachedRelease
+		s.updateRelease = &cp
+		s.updateStatus = UpdateAvailable
 	}
 	if !prefs.OfficialEnabled {
 		s.officialState = OfficialDisabled
@@ -371,6 +394,9 @@ func (s *Store) Start() {
 
 	// 6. Refresh live FX rates (Frankfurter, hourly, independent of Anthropic)
 	go s.RefreshFXRatesIfStale()
+
+	// 7. Background GitHub Release update check (ETag-cached, every 6h)
+	go s.startUpdateScheduler()
 }
 
 func (s *Store) Stop() {
@@ -386,6 +412,10 @@ func (s *Store) Stop() {
 	if s.panelLiveCancel != nil {
 		s.panelLiveCancel()
 		s.panelLiveCancel = nil
+	}
+	if s.updateCancel != nil {
+		s.updateCancel()
+		s.updateCancel = nil
 	}
 	s.mu.Unlock()
 	if s.cancel != nil {
@@ -2050,6 +2080,7 @@ func (s *Store) ViewState() ViewState {
 		DataRoots:           platform.ClaudeProjectRoots(s.prefs.ClaudeConfigDir, s.prefs.CustomDataDir),
 		FXRates:             fxRates,
 		AG:                  s.agViewStateLocked(),
+		Update:              s.updateViewStateLocked(),
 	}
 }
 
