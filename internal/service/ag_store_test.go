@@ -232,3 +232,211 @@ func TestBuildAGProbeSettingsMergesUserFields(t *testing.T) {
 		t.Fatalf("expected clean fallback for missing file, err=%v out=%s", err, string(b2))
 	}
 }
+
+func TestMergeAGSnapshotsDoesNotCarryOverAcrossAccounts(t *testing.T) {
+	prevPct := 42.0
+	prevIn := int64(420000)
+	prevCost := 1.25
+	prev := &core.AGStatusLineSnapshot{
+		Email:             "alice@gmail.com",
+		PlanTier:          "Google AI Ultra",
+		ConversationID:    "conv-alice",
+		ConversationTitle: "Alice Chat",
+		Model:             &core.AGStatusLineModelInfo{ID: "m1", DisplayName: "Model 1"},
+		Version:           "1.5.14",
+		ContextWindow: &core.AGStatusLineContextWindow{
+			TotalInputTokens: &prevIn,
+			UsedPercentage:   &prevPct,
+		},
+		Cost: &core.AGStatusLineCostInfo{TotalUSD: &prevCost},
+	}
+
+	captured := &core.AGStatusLineSnapshot{
+		Email:      "Bob@gmail.com",
+		AgentState: "idle",
+		Quota: map[string]core.AGStatusLineQuotaBucket{
+			"gemini-5h": {RemainingFraction: func() *float64 { v := 0.9; return &v }()},
+		},
+	}
+
+	merged := mergeAGSnapshots(captured, prev, time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC))
+	if merged.Email != "Bob@gmail.com" {
+		t.Fatalf("expected Bob email, got %q", merged.Email)
+	}
+	if merged.PlanTier != "" || merged.ConversationID != "" || merged.ConversationTitle != "" ||
+		merged.Model != nil || merged.Version != "" || merged.ContextWindow != nil || merged.Cost != nil {
+		t.Fatalf("expected no stale fields carried over across accounts, got %+v", merged)
+	}
+}
+
+func TestStoreAntigravityAccountSwitchIsolatesLocalStatsAndWeeklyBasis(t *testing.T) {
+	tmp := t.TempDir()
+	brainDir := filepath.Join(tmp, "brain")
+	cliDir := filepath.Join(tmp, "ag-cli")
+	logsDir := filepath.Join(brainDir, "conv-shared", ".system_generated", "logs")
+	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(cliDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	aliceTs := now.Add(-10 * time.Minute)
+	recAlice := `{"created_at":"` + aliceTs.Format(time.RFC3339) + `","model":"gemini-4-neon-xhigh","input_tokens":100000,"cache_read_tokens":400000,"output_tokens":10000}` + "\n"
+	transcriptPath := filepath.Join(logsDir, "transcript.jsonl")
+	if err := os.WriteFile(transcriptPath, []byte(recAlice), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	snapPath := filepath.Join(cliDir, "usage-monitor-snapshot.json")
+	snapAlice := `{"plan_tier":"Ultra","email":"alice@gmail.com","quota":{"gemini-5h":{"remaining_fraction":0.7,"reset_in_seconds":3600},"gemini-weekly":{"remaining_fraction":0.5,"reset_in_seconds":345600}},"_captured_at":"` + aliceTs.Add(time.Minute).Format(time.RFC3339) + `"}`
+	if err := os.WriteFile(snapPath, []byte(snapAlice), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	prefs := core.DefaultPreferences()
+	prefs.AGOfficialEnabled = false
+	prefs.AGBrainDir = brainDir
+	prefs.AGCLIConfigDir = cliDir
+
+	s := &Store{
+		dataDir:   tmp,
+		prefsPath: filepath.Join(tmp, "prefs.json"),
+		indexPath: filepath.Join(tmp, "index.gob"),
+		statePath: filepath.Join(tmp, "state.json"),
+		prefs:     prefs,
+		index:     core.NewUsageIndex(),
+		pstate:    persistedState{Budget: core.NewRequestBudget(now)},
+	}
+
+	// 1. Refresh under Alice: sees Alice's record & saves Alice's full-week basis.
+	s.RefreshAntigravity(false)
+	st := s.ViewState()
+	if st.AG.LocalReport.Today.RequestCount != 1 || st.AG.SavedFullWeekCostUSD <= 0 {
+		t.Fatalf("expected Alice 1 request and SavedFullWeekCostUSD > 0, got req=%d cost=%v",
+			st.AG.LocalReport.Today.RequestCount, st.AG.SavedFullWeekCostUSD)
+	}
+	if st.AG.HasMultipleAccounts || st.AG.LocalAccountFiltered {
+		t.Fatalf("expected single account unfiltered initially, got multi=%v filt=%v",
+			st.AG.HasMultipleAccounts, st.AG.LocalAccountFiltered)
+	}
+	aliceSavedWeek := st.AG.SavedFullWeekCostUSD
+
+	// Adjust Alice's timeline start earlier than aliceTs so Alice retains her record after Bob switch is recorded.
+	s.mu.Lock()
+	s.agLastAlertKey = "gemini-5h:pace"
+	s.agLastSeenTokens = 510000
+	s.pstate.AGTimeline.Segments[0].Start = aliceTs.Add(-5 * time.Minute)
+	s.mu.Unlock()
+
+	// 2. Switch snapshot to Bob (0.02 weekly used -> below 10%, must NOT inherit Alice's basis).
+	bobSwitchTs := now.Add(-1 * time.Minute)
+	snapBob := `{"plan_tier":"Pro","email":"bob@gmail.com","quota":{"gemini-5h":{"remaining_fraction":1.0,"reset_in_seconds":3600},"gemini-weekly":{"remaining_fraction":0.98,"reset_in_seconds":345600}},"_captured_at":"` + bobSwitchTs.Format(time.RFC3339) + `"}`
+	if err := os.WriteFile(snapPath, []byte(snapBob), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.RefreshAntigravity(false)
+
+	st = s.ViewState()
+	if !st.AG.HasMultipleAccounts || !st.AG.LocalAccountFiltered {
+		t.Fatalf("expected HasMultipleAccounts=true & LocalAccountFiltered=true, got %+v", st.AG)
+	}
+	if st.AG.LocalReport.Today.RequestCount != 0 || st.AG.LocalReport.Week.EstimatedCostUSD != 0 {
+		t.Fatalf("expected Bob initial local usage isolated to 0, got req=%d cost=%v",
+			st.AG.LocalReport.Today.RequestCount, st.AG.LocalReport.Week.EstimatedCostUSD)
+	}
+	if st.AG.SavedFullWeekCostUSD != 0 || st.Prefs.AGSavedFullWeekCostUSD != 0 {
+		t.Fatalf("expected Bob SavedFullWeekCostUSD=0 (no leak from Alice), got view=%v prefs=%v",
+			st.AG.SavedFullWeekCostUSD, st.Prefs.AGSavedFullWeekCostUSD)
+	}
+	s.mu.RLock()
+	if s.agLastAlertKey != "" {
+		s.mu.RUnlock()
+		t.Fatalf("expected alert key cleared on account switch, got %q", s.agLastAlertKey)
+	}
+	s.mu.RUnlock()
+
+	// 3. Append a new turn inside the SAME shared conversation while Bob is active.
+	recBob := `{"created_at":"` + now.Add(-10*time.Second).Format(time.RFC3339) + `","model":"gemini-4-neon-xhigh","input_tokens":50000,"cache_read_tokens":0,"output_tokens":5000}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(recAlice+recBob), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.RefreshAntigravityLocal()
+	st = s.ViewState()
+	if st.AG.LocalReport.Today.RequestCount != 1 || st.AG.LocalReport.Today.OutputTokens != 5000 {
+		t.Fatalf("expected Bob to see only Bob's 1 turn (5000 out), got req=%d out=%d",
+			st.AG.LocalReport.Today.RequestCount, st.AG.LocalReport.Today.OutputTokens)
+	}
+
+	// 4. Toggling AGSpendAllAccounts shows both turns; switching back restores Bob isolation;
+	// switching snapshot back to Alice restores Alice's record and Alice's saved full-week basis.
+	s.UpdatePrefs(func(p *core.Preferences) { p.AGSpendAllAccounts = true })
+	s.RefreshAntigravityLocal()
+	st = s.ViewState()
+	if st.AG.LocalAccountFiltered || st.AG.LocalReport.Today.RequestCount != 2 {
+		t.Fatalf("expected AGSpendAllAccounts=true to show 2 requests unfiltered, got filt=%v req=%d",
+			st.AG.LocalAccountFiltered, st.AG.LocalReport.Today.RequestCount)
+	}
+	s.UpdatePrefs(func(p *core.Preferences) { p.AGSpendAllAccounts = false })
+	s.RefreshAntigravityLocal()
+
+	snapAliceBack := `{"plan_tier":"Ultra","email":"alice@gmail.com","quota":{"gemini-5h":{"remaining_fraction":0.7,"reset_in_seconds":3600},"gemini-weekly":{"remaining_fraction":0.95,"reset_in_seconds":345600}},"_captured_at":"` + now.Format(time.RFC3339) + `"}`
+	if err := os.WriteFile(snapPath, []byte(snapAliceBack), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.RefreshAntigravity(false)
+	st = s.ViewState()
+	if st.AG.LocalReport.Today.RequestCount != 1 || st.AG.LocalReport.Today.OutputTokens != 10000 {
+		t.Fatalf("expected Alice to see her 1 turn (10000 out), got req=%d out=%d",
+			st.AG.LocalReport.Today.RequestCount, st.AG.LocalReport.Today.OutputTokens)
+	}
+	if st.AG.SavedFullWeekCostUSD != aliceSavedWeek {
+		t.Fatalf("expected Alice SavedFullWeekCostUSD restored to %v, got %v", aliceSavedWeek, st.AG.SavedFullWeekCostUSD)
+	}
+}
+
+func TestAGCredentialScopeEventIgnoresSameContentAndTriggersOnChange(t *testing.T) {
+	tmp := t.TempDir()
+	scopeFile := filepath.Join(tmp, "credential-user-scope")
+	if err := os.WriteFile(scopeFile, []byte("scope-alice"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	prefs := core.DefaultPreferences()
+	prefs.AGOfficialEnabled = false // prevent spawning real agy sync during unit test
+	s := &Store{
+		dataDir:                 tmp,
+		prefsPath:               filepath.Join(tmp, "prefs.json"),
+		statePath:               filepath.Join(tmp, "state.json"),
+		prefs:                   prefs,
+		index:                   core.NewUsageIndex(),
+		pstate:                  persistedState{Budget: core.NewRequestBudget(time.Now())},
+		agCredScopePathOverride: scopeFile,
+		agLastCredScope:         readAGCredScope(scopeFile),
+		agCredScopeInit:         true,
+	}
+
+	// Rewriting identical content (e.g. agy CLI mtime touch) must NOT count as account switch.
+	if err := os.WriteFile(scopeFile, []byte("scope-alice\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if s.onAGCredentialScopeEvent() {
+		t.Fatal("expected identical scope content not to trigger account switch")
+	}
+
+	// Changing scope content triggers switch detection and timestamps agCredSwitchAt.
+	if err := os.WriteFile(scopeFile, []byte("scope-bob"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !s.onAGCredentialScopeEvent() {
+		t.Fatal("expected changed scope content to trigger account switch")
+	}
+	s.mu.RLock()
+	if s.agLastCredScope != "scope-bob" || s.agCredSwitchAt.IsZero() {
+		s.mu.RUnlock()
+		t.Fatalf("expected agLastCredScope='scope-bob' and non-zero agCredSwitchAt, got %q / %v",
+			s.agLastCredScope, s.agCredSwitchAt)
+	}
+	s.mu.RUnlock()
+}

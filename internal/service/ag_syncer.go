@@ -197,6 +197,14 @@ func saveMergedAGSnapshot(captured *core.AGStatusLineSnapshot, snapshotPath stri
 }
 
 func mergeAGSnapshots(captured, prev *core.AGStatusLineSnapshot, capturedAt time.Time) core.AGStatusLineSnapshot {
+	if prev != nil {
+		capEmail := core.NormalizeAGEmail(captured.Email)
+		prevEmail := core.NormalizeAGEmail(prev.Email)
+		if capEmail != "" && prevEmail != "" && capEmail != prevEmail {
+			// Never inherit context/plan/model/cost fields from a different account's snapshot.
+			prev = nil
+		}
+	}
 	merged := core.AGStatusLineSnapshot{
 		Quota:      captured.Quota,
 		AgentState: captured.AgentState,

@@ -78,6 +78,7 @@ type Preferences struct {
 	AGCollapsedSpend     bool        `json:"agCollapsedSpend"`
 	AGAlertEnabled       bool        `json:"agAlertEnabled"`
 	AGBillingReminders   bool        `json:"agBillingReminders"`
+	AGSpendAllAccounts   bool        `json:"agSpendAllAccounts,omitempty"`
 	AGSavedFullWeekCostUSD float64   `json:"agSavedFullWeekCostUsd,omitempty"`
 	AGSavedFullWeekTokens  int64     `json:"agSavedFullWeekTokens,omitempty"`
 

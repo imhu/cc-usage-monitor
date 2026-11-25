@@ -16,19 +16,23 @@ import (
 )
 
 type AGViewState struct {
-	LocalReport    core.AGLocalUsageReport
-	OfficialReport core.AGOfficialQuotaReport
-	BridgeStatus   core.AGBridgeStatus
-	CLIBinaryPath  string
-	Processes      []platform.ClaudeTask
-	IsRefreshing   bool
-	IsSyncing      bool
-	AuthRequired   bool
-	Feedback       string
-	BrainDir       string
-	HasBrainDir    bool
-	CLIConfigDir   string
-	SnapshotPath   string
+	LocalReport          core.AGLocalUsageReport
+	OfficialReport       core.AGOfficialQuotaReport
+	BridgeStatus         core.AGBridgeStatus
+	CLIBinaryPath        string
+	Processes            []platform.ClaudeTask
+	IsRefreshing         bool
+	IsSyncing            bool
+	AuthRequired         bool
+	Feedback             string
+	BrainDir             string
+	HasBrainDir          bool
+	CLIConfigDir         string
+	SnapshotPath         string
+	SavedFullWeekCostUSD float64
+	SavedFullWeekTokens  int64
+	HasMultipleAccounts  bool
+	LocalAccountFiltered bool
 }
 
 func (s *Store) ensureAGLocked() {
@@ -62,21 +66,69 @@ func (s *Store) agViewStateLocked() AGViewState {
 	procs := make([]platform.ClaudeTask, len(s.agProcs))
 	copy(procs, s.agProcs)
 
+	savedCost, savedToks := s.agSavedFullWeekLocked()
+
 	return AGViewState{
-		LocalReport:    s.agLocal,
-		OfficialReport: s.agOfficial,
-		BridgeStatus:   s.agBridge,
-		CLIBinaryPath:  s.agCLIPath,
-		Processes:      procs,
-		IsRefreshing:   s.agRefreshing,
-		IsSyncing:      s.agSyncing,
-		AuthRequired:   s.agAuthRequired,
-		Feedback:       s.agFeedback,
-		BrainDir:       brainDir,
-		HasBrainDir:    brainErr == nil,
-		CLIConfigDir:   cliDir,
-		SnapshotPath:   snapPath,
+		LocalReport:          s.agLocal,
+		OfficialReport:       s.agOfficial,
+		BridgeStatus:         s.agBridge,
+		CLIBinaryPath:        s.agCLIPath,
+		Processes:            procs,
+		IsRefreshing:         s.agRefreshing,
+		IsSyncing:            s.agSyncing,
+		AuthRequired:         s.agAuthRequired,
+		Feedback:             s.agFeedback,
+		BrainDir:             brainDir,
+		HasBrainDir:          brainErr == nil,
+		CLIConfigDir:         cliDir,
+		SnapshotPath:         snapPath,
+		SavedFullWeekCostUSD: savedCost,
+		SavedFullWeekTokens:  savedToks,
+		HasMultipleAccounts:  s.pstate.AGTimeline.HasMultipleAccounts(),
+		LocalAccountFiltered: s.agLocalFiltered,
 	}
+}
+
+func (s *Store) agActiveEmailLocked() string {
+	if email := core.NormalizeAGEmail(s.agOfficial.Email); email != "" {
+		return email
+	}
+	return core.NormalizeAGEmail(s.agActiveEmail)
+}
+
+func (s *Store) agSavedFullWeekLocked() (float64, int64) {
+	email := s.agActiveEmailLocked()
+	if email != "" {
+		if acct, ok := s.pstate.AGAccounts[email]; ok {
+			return acct.FullWeekCostUSD, acct.FullWeekTokens
+		}
+		return 0, 0
+	}
+	if len(s.pstate.AGAccounts) == 0 {
+		return s.prefs.AGSavedFullWeekCostUSD, s.prefs.AGSavedFullWeekTokens
+	}
+	return 0, 0
+}
+
+func (s *Store) agCredScopePathLocked() string {
+	if strings.TrimSpace(s.agCredScopePathOverride) != "" {
+		return s.agCredScopePathOverride
+	}
+	return platform.AGCredentialScopeFile()
+}
+
+func readAGCredScope(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	var buf [256]byte
+	n, _ := f.Read(buf[:])
+	return strings.TrimSpace(string(buf[:n]))
 }
 
 func (s *Store) startAG() {
@@ -125,6 +177,9 @@ func (s *Store) startAGWatchers() {
 	s.agWatchCancel = wcancel
 	brainDir := platform.AGBrainDir(s.prefs.AGBrainDir)
 	cliDir := platform.AGCLIConfigDir(s.prefs.AGCLIConfigDir)
+	credScopePath := s.agCredScopePathLocked()
+	s.agLastCredScope = readAGCredScope(credScopePath)
+	s.agCredScopeInit = true
 	s.mu.Unlock()
 
 	if _, err := os.Stat(cliDir); err == nil {
@@ -136,6 +191,156 @@ func (s *Store) startAGWatchers() {
 		go s.watchDir(wctx, brainDir, true, func() {
 			s.RefreshAntigravity(false)
 		})
+	}
+	if desktopDir := platform.AGDesktopConfigDir(); desktopDir != "" {
+		if _, err := os.Stat(desktopDir); err == nil {
+			go s.watchDir(wctx, desktopDir, false, func() {
+				s.onAGCredentialScopeEvent()
+			})
+		}
+	}
+}
+
+func (s *Store) onAGCredentialScopeEvent() bool {
+	s.mu.Lock()
+	cur := readAGCredScope(s.agCredScopePathLocked())
+	if !s.agCredScopeInit {
+		s.agLastCredScope = cur
+		s.agCredScopeInit = true
+		s.mu.Unlock()
+		return false
+	}
+	if cur == s.agLastCredScope {
+		s.mu.Unlock()
+		return false
+	}
+	s.agLastCredScope = cur
+	s.agCredSwitchAt = time.Now().UTC()
+	enabled := s.prefs.AGOfficialEnabled
+	syncing := s.agSyncing
+	ctx := s.ctx
+	s.mu.Unlock()
+
+	if !enabled {
+		return true
+	}
+	if !syncing {
+		go s.SyncAntigravityOfficial(true)
+	} else {
+		go func() {
+			if ctx != nil {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(2 * time.Second):
+				}
+			} else {
+				time.Sleep(2 * time.Second)
+			}
+			s.SyncAntigravityOfficial(true)
+		}()
+	}
+	return true
+}
+
+func (s *Store) applyAGAccountStateLocked(official core.AGOfficialQuotaReport, now time.Time) (activeEmail string, switched bool) {
+	email := core.NormalizeAGEmail(official.Email)
+	if email == "" {
+		return core.NormalizeAGEmail(s.agActiveEmail), false
+	}
+	observeAt := now.UTC()
+	if s.agActiveEmail != "" && s.agActiveEmail != email {
+		if !s.agCredSwitchAt.IsZero() && now.Sub(s.agCredSwitchAt) <= 2*time.Minute {
+			observeAt = s.agCredSwitchAt.UTC()
+		} else if official.SnapshotCapturedAt != nil && !official.SnapshotCapturedAt.After(now) {
+			observeAt = official.SnapshotCapturedAt.UTC()
+		}
+	} else if s.agActiveEmail == "" && len(s.pstate.AGTimeline.Segments) > 0 {
+		if official.SnapshotCapturedAt != nil && !official.SnapshotCapturedAt.After(now) {
+			observeAt = official.SnapshotCapturedAt.UTC()
+		}
+	}
+
+	changed, tlSwitched := s.pstate.AGTimeline.Observe(email, observeAt)
+	memSwitched := s.agActiveEmail != "" && s.agActiveEmail != email
+	if tlSwitched || memSwitched {
+		s.agLastAlertKey = ""
+		s.agLastSeenTokens = 0
+		s.agCredSwitchAt = time.Time{}
+		switched = true
+	}
+	s.agActiveEmail = email
+	if changed {
+		s.savePersistedStateLocked()
+	}
+	return email, switched
+}
+
+func (s *Store) computeAGReports(now time.Time, idx *core.AGTranscriptIndex, snapPath string, billingDay int) (
+	official core.AGOfficialQuotaReport,
+	local core.AGLocalUsageReport,
+	activeEmail string,
+	filtered bool,
+) {
+	snap := core.LoadAGSnapshot(snapPath)
+	official = core.EvaluateAGQuota(snap, now)
+	var weeklyReset *time.Time
+	if official.PrimaryWeekly != nil {
+		weeklyReset = official.PrimaryWeekly.ResetTime
+	}
+	recs, convCount := idx.Refresh()
+
+	s.mu.Lock()
+	activeEmail, _ = s.applyAGAccountStateLocked(official, now)
+	includeAll := s.prefs.AGSpendAllAccounts
+	filteredRecs, filteredConvCount, isFiltered := s.pstate.AGTimeline.FilterRecords(recs, activeEmail, includeAll)
+	if !isFiltered {
+		filteredConvCount = convCount
+	}
+	s.mu.Unlock()
+
+	local = core.AggregateAGUsage(filteredRecs, filteredConvCount, now, weeklyReset, billingDay)
+	return official, local, activeEmail, isFiltered
+}
+
+func (s *Store) syncAGFullWeekBasisLocked(official core.AGOfficialQuotaReport, local core.AGLocalUsageReport, activeEmail string) {
+	if !s.prefs.AGSpendAllAccounts && activeEmail != "" &&
+		official.PrimaryWeekly != nil &&
+		!official.PrimaryWeekly.IsResetElapsed &&
+		official.PrimaryWeekly.UsedFraction >= 0.10 &&
+		local.Week.EstimatedCostUSD > 0 {
+		fullCost := local.Week.EstimatedCostUSD / official.PrimaryWeekly.UsedFraction
+		fullToks := int64(float64(local.Week.TotalTokens()) / official.PrimaryWeekly.UsedFraction)
+		if s.pstate.AGAccounts == nil {
+			s.pstate.AGAccounts = map[string]core.AGAccountPersistedState{}
+		}
+		prev := s.pstate.AGAccounts[activeEmail]
+		if math.Abs(prev.FullWeekCostUSD-fullCost) > 0.01 || prev.FullWeekTokens != fullToks {
+			s.pstate.AGAccounts[activeEmail] = core.AGAccountPersistedState{
+				FullWeekCostUSD: fullCost,
+				FullWeekTokens:  fullToks,
+			}
+			s.savePersistedStateLocked()
+		}
+	}
+
+	var wantCost float64
+	var wantToks int64
+	if activeEmail != "" {
+		if acct, ok := s.pstate.AGAccounts[activeEmail]; ok {
+			wantCost = acct.FullWeekCostUSD
+			wantToks = acct.FullWeekTokens
+		}
+	} else if len(s.pstate.AGAccounts) == 0 {
+		wantCost = s.prefs.AGSavedFullWeekCostUSD
+		wantToks = s.prefs.AGSavedFullWeekTokens
+	}
+	if math.Abs(s.prefs.AGSavedFullWeekCostUSD-wantCost) > 0.01 || s.prefs.AGSavedFullWeekTokens != wantToks {
+		s.prefs.AGSavedFullWeekCostUSD = wantCost
+		s.prefs.AGSavedFullWeekTokens = wantToks
+		if s.prefsPath != "" {
+			_ = core.SavePreferences(s.prefsPath, s.prefs)
+		}
 	}
 }
 
@@ -169,14 +374,7 @@ func (s *Store) RefreshAntigravity(forceSync bool) {
 	now := time.Now()
 	bridgeStatus := inst.Status()
 	cliPath := platform.LocateAgyBinary(customCLI)
-	snap := core.LoadAGSnapshot(inst.SnapshotPath())
-	official := core.EvaluateAGQuota(snap, now)
-	var weeklyReset *time.Time
-	if official.PrimaryWeekly != nil {
-		weeklyReset = official.PrimaryWeekly.ResetTime
-	}
-	recs, convCount := idx.Refresh()
-	local := core.AggregateAGUsage(recs, convCount, now, weeklyReset, billingDay)
+	official, local, activeEmail, isFiltered := s.computeAGReports(now, idx, inst.SnapshotPath(), billingDay)
 	procs := platform.ListAntigravityProcesses()
 
 	s.mu.Lock()
@@ -184,18 +382,8 @@ func (s *Store) RefreshAntigravity(forceSync bool) {
 	s.agCLIPath = cliPath
 	s.agOfficial = official
 	s.agLocal = local
-	if official.PrimaryWeekly != nil &&
-		!official.PrimaryWeekly.IsResetElapsed &&
-		official.PrimaryWeekly.UsedFraction >= 0.10 &&
-		local.Week.EstimatedCostUSD > 0 {
-		fullCost := local.Week.EstimatedCostUSD / official.PrimaryWeekly.UsedFraction
-		fullToks := int64(float64(local.Week.TotalTokens()) / official.PrimaryWeekly.UsedFraction)
-		if math.Abs(s.prefs.AGSavedFullWeekCostUSD-fullCost) > 0.01 || s.prefs.AGSavedFullWeekTokens != fullToks {
-			s.prefs.AGSavedFullWeekCostUSD = fullCost
-			s.prefs.AGSavedFullWeekTokens = fullToks
-			_ = core.SavePreferences(s.prefsPath, s.prefs)
-		}
-	}
+	s.agLocalFiltered = isFiltered
+	s.syncAGFullWeekBasisLocked(official, local, activeEmail)
 	s.agProcs = procs
 	s.agRefreshing = false
 	if official.AgentState == "authenticating" && len(official.Buckets) == 0 {
@@ -400,19 +588,14 @@ func (s *Store) RefreshAntigravityLocal() {
 	s.mu.Unlock()
 
 	now := time.Now()
-	snap := core.LoadAGSnapshot(inst.SnapshotPath())
-	official := core.EvaluateAGQuota(snap, now)
-	var weeklyReset *time.Time
-	if official.PrimaryWeekly != nil {
-		weeklyReset = official.PrimaryWeekly.ResetTime
-	}
-	recs, convCount := idx.Refresh()
-	local := core.AggregateAGUsage(recs, convCount, now, weeklyReset, billingDay)
+	official, local, activeEmail, isFiltered := s.computeAGReports(now, idx, inst.SnapshotPath(), billingDay)
 	procs := platform.ListAntigravityProcesses()
 
 	s.mu.Lock()
 	s.agOfficial = official
 	s.agLocal = local
+	s.agLocalFiltered = isFiltered
+	s.syncAGFullWeekBasisLocked(official, local, activeEmail)
 	s.agProcs = procs
 	s.mu.Unlock()
 	s.notify()

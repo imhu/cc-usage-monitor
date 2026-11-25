@@ -151,6 +151,24 @@ func AGSnapshotFile(customCLIDir string) string {
 	return filepath.Join(AGCLIConfigDir(customCLIDir), "usage-monitor-snapshot.json")
 }
 
+// AGDesktopConfigDir returns %APPDATA%\Antigravity on Windows.
+func AGDesktopConfigDir() string {
+	roaming := strings.TrimSpace(os.Getenv("APPDATA"))
+	if roaming == "" {
+		return ""
+	}
+	return filepath.Join(roaming, "Antigravity")
+}
+
+// AGCredentialScopeFile returns %APPDATA%\Antigravity\credential-user-scope.
+func AGCredentialScopeFile() string {
+	dir := AGDesktopConfigDir()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, "credential-user-scope")
+}
+
 // LocateAgyBinary finds the agy CLI executable on Windows, preferring customPath if valid.
 func LocateAgyBinary(customPath string) string {
 	if p := expandPath(customPath); p != "" {

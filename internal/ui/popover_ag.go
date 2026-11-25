@@ -705,23 +705,28 @@ func (m *PopoverModel) renderAGSpendSection(c *ui.Context, st service.ViewState,
 				})
 				return
 			}
-			if span == core.SpanMonth && period == nil {
-				btn := ui.Row(c.Key("ag-set-bday")).Cursor(ui.CursorPointer)
-				if btn.Clicked() && m.Actions.OpenSettings != nil {
-					m.Actions.OpenSettings()
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				if strings.TrimSpace(off.Email) != "" || st.AG.HasMultipleAccounts {
+					renderAGSpendScopeChip(c, m.Store, off.Email, st.Prefs.AGSpendAllAccounts, st.AG.LocalAccountFiltered, zh)
 				}
-				btn.Children(func() {
-					ui.Text(c, tr(zh, "设置订阅日…", "Set billing day…")).FontSize(10.5).FontWeight(500).TextColor(ColorAGAccent).SingleLine()
-				})
-				return
-			}
-			if period != nil {
-				ui.Text(c, core.FormatPeriodRange(period.Start, period.End.Add(time.Second), zh)).
-					FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
-			} else {
-				ui.Text(c, core.FormatDayWithWeekday(local.UpdatedAt, zh)).
-					FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
-			}
+				if span == core.SpanMonth && period == nil {
+					btn := ui.Row(c.Key("ag-set-bday")).Cursor(ui.CursorPointer)
+					if btn.Clicked() && m.Actions.OpenSettings != nil {
+						m.Actions.OpenSettings()
+					}
+					btn.Children(func() {
+						ui.Text(c, tr(zh, "设置订阅日…", "Set billing day…")).FontSize(10.5).FontWeight(500).TextColor(ColorAGAccent).SingleLine()
+					})
+					return
+				}
+				if period != nil {
+					ui.Text(c, core.FormatPeriodRange(period.Start, period.End.Add(time.Second), zh)).
+						FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
+				} else {
+					ui.Text(c, core.FormatDayWithWeekday(local.UpdatedAt, zh)).
+						FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
+				}
+			})
 		})
 
 		if collapsed {
@@ -773,9 +778,9 @@ func (m *PopoverModel) renderAGSpendSection(c *ui.Context, st service.ViewState,
 					projCost = &v
 					projTokens = int64(fullWeekTok)
 				}
-			} else if st.Prefs.AGSavedFullWeekCostUSD > 0 {
-				fullWeekCost := st.Prefs.AGSavedFullWeekCostUSD
-				fullWeekTok := float64(st.Prefs.AGSavedFullWeekTokens)
+			} else if st.AG.SavedFullWeekCostUSD > 0 {
+				fullWeekCost := st.AG.SavedFullWeekCostUSD
+				fullWeekTok := float64(st.AG.SavedFullWeekTokens)
 				if span == core.SpanMonth {
 					v := fullWeekCost * weeksInMonth
 					projCost = &v
@@ -994,5 +999,40 @@ func (m *PopoverModel) renderAGModelList(c *ui.Context, models []core.AGModelUsa
 				}
 			})
 		}
+	})
+}
+
+func renderAGSpendScopeChip(c *ui.Context, store *service.Store, email string, showAll, isFiltered, zh bool) {
+	label := tr(zh, "当前账号", "Account")
+	bg := ColorPillBg
+	fg := ColorSecondary
+	if showAll {
+		label = tr(zh, "全部账号", "All")
+	} else if isFiltered {
+		bg = ColorAGAccent.Alpha(0.16)
+		fg = ColorAGAccent
+	}
+
+	tip := tr(zh,
+		"本地统计范围：当前账号（启用分账号时间线后按切号时间段隔离）。点击切换为本机全部账号。",
+		"Local spend scope: Current account (isolated by account switch timeline). Click to show all accounts.")
+	if showAll {
+		tip = tr(zh,
+			"本地统计范围：本机全部账号（包含历史与切号前日志）。点击切回当前账号隔离统计。",
+			"Local spend scope: All accounts on this machine. Click to isolate to the active account.")
+	}
+	if e := strings.TrimSpace(email); e != "" {
+		tip = tr(zh, "当前账号: ", "Account: ") + e + "\n" + tip
+	}
+
+	btn := ui.Row(c.Key("ag-spend-scope")).Height(16).Padding(0, 6).Radius(8).Center().
+		Background(bg).Cursor(ui.CursorPointer).Tooltip(tip)
+	if btn.Clicked() {
+		store.UpdatePrefs(func(p *core.Preferences) {
+			p.AGSpendAllAccounts = !p.AGSpendAllAccounts
+		})
+	}
+	btn.Children(func() {
+		ui.Text(c, label).FontSize(10).FontWeight(500).TextColor(fg).SingleLine()
 	})
 }

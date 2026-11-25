@@ -338,12 +338,16 @@ func (m *SettingsModel) renderUsageTab(c *ui.Context, st service.ViewState, zh b
 		"Silently syncs 5h & weekly limits via official agy --settings (zero sniffing)")
 	if st.AG.OfficialReport.HasSnapshot() && st.AG.OfficialReport.SnapshotCapturedAt != nil {
 		rel := core.FormatRelative(*st.AG.OfficialReport.SnapshotCapturedAt, time.Now(), zh)
+		acct := strings.TrimSpace(st.AG.OfficialReport.Email)
+		if acct != "" {
+			acct = " · " + acct
+		}
 		tier := st.AG.OfficialReport.PlanTier
 		if tier != "" {
 			tier = " · " + strings.ToUpper(tier)
 		}
-		agSub = tr(zh, fmt.Sprintf("已读取快照%s · 上次同步 %s", tier, rel),
-			fmt.Sprintf("Snapshot ready%s · Synced %s", tier, rel))
+		agSub = tr(zh, fmt.Sprintf("已读取快照%s%s · 上次同步 %s", acct, tier, rel),
+			fmt.Sprintf("Snapshot ready%s%s · Synced %s", acct, tier, rel))
 	}
 	settingsRow(c, tr(zh, "Antigravity 后台静默同步", "Antigravity background sync"), agSub, func() {
 		AccentSwitch(c, "sw-ag-off", st.Prefs.AGOfficialEnabled, ColorAGAccent, func(on bool) {

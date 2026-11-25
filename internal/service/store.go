@@ -128,9 +128,11 @@ type persistedState struct {
 	ExpiryNotified   map[string]bool      `json:"expiryNotified,omitempty"`
 	FXPerUSD         map[string]float64   `json:"fxPerUSD,omitempty"`
 	FXFetchedAt      *time.Time           `json:"fxFetchedAt,omitempty"`
-	UpdateETag       string               `json:"updateETag,omitempty"`
-	UpdateCheckedAt  *time.Time           `json:"updateCheckedAt,omitempty"`
-	CachedRelease    *core.ReleaseInfo    `json:"cachedRelease,omitempty"`
+	UpdateETag       string                                `json:"updateETag,omitempty"`
+	UpdateCheckedAt  *time.Time                            `json:"updateCheckedAt,omitempty"`
+	CachedRelease    *core.ReleaseInfo                     `json:"cachedRelease,omitempty"`
+	AGTimeline       core.AGAccountTimeline                `json:"agTimeline,omitempty"`
+	AGAccounts       map[string]core.AGAccountPersistedState `json:"agAccounts,omitempty"`
 }
 
 type Store struct {
@@ -192,22 +194,28 @@ type Store struct {
 	panelLiveCancel context.CancelFunc
 
 	// Antigravity state
-	agIndex          *core.AGTranscriptIndex
-	agIndexDir       string
-	agSyncer         *AGSilentSyncer
-	agLocal          core.AGLocalUsageReport
-	agOfficial       core.AGOfficialQuotaReport
-	agBridge         core.AGBridgeStatus
-	agCLIPath        string
-	agProcs          []platform.ClaudeTask
-	agRefreshing     bool
-	agSyncing        bool
-	agAuthRequired   bool
-	agFeedback       string
-	agLastAutoSync   time.Time
-	agLastSeenTokens int64
-	agLastAlertKey   string
-	agWatchCancel    context.CancelFunc
+	agIndex                 *core.AGTranscriptIndex
+	agIndexDir              string
+	agSyncer                *AGSilentSyncer
+	agLocal                 core.AGLocalUsageReport
+	agOfficial              core.AGOfficialQuotaReport
+	agBridge                core.AGBridgeStatus
+	agCLIPath               string
+	agProcs                 []platform.ClaudeTask
+	agRefreshing            bool
+	agSyncing               bool
+	agAuthRequired          bool
+	agFeedback              string
+	agLastAutoSync          time.Time
+	agLastSeenTokens        int64
+	agLastAlertKey          string
+	agWatchCancel           context.CancelFunc
+	agActiveEmail           string
+	agLocalFiltered         bool
+	agLastCredScope         string
+	agCredScopeInit         bool
+	agCredSwitchAt          time.Time
+	agCredScopePathOverride string
 
 	// App updater state
 	updateStatus      UpdateStatusKind
@@ -1863,6 +1871,7 @@ func (s *Store) UpdatePrefs(fn func(*core.Preferences)) {
 	oldAGCLIPath := s.prefs.AGAgyCLIPath
 	oldAGBilling := s.prefs.AGBillingAnchorDay
 	oldAGOfficial := s.prefs.AGOfficialEnabled
+	oldAGSpendAll := s.prefs.AGSpendAllAccounts
 
 	fn(&s.prefs)
 	s.prefs.ActiveProvider = core.NormalizeProvider(s.prefs.ActiveProvider)
@@ -1878,7 +1887,7 @@ func (s *Store) UpdatePrefs(fn func(*core.Preferences)) {
 	agBrainChanged := !strings.EqualFold(newAGBrain, oldAGBrain)
 	agCLIConfigChanged := !strings.EqualFold(newAGCLIDir, oldAGCLIDir)
 	agWatchChanged = agBrainChanged || agCLIConfigChanged
-	agRefreshNeeded = agWatchChanged || s.prefs.AGAgyCLIPath != oldAGCLIPath || s.prefs.AGBillingAnchorDay != oldAGBilling || (s.prefs.ActiveProvider != oldProvider && s.prefs.ActiveProvider == core.ProviderAntigravity)
+	agRefreshNeeded = agWatchChanged || s.prefs.AGAgyCLIPath != oldAGCLIPath || s.prefs.AGBillingAnchorDay != oldAGBilling || s.prefs.AGSpendAllAccounts != oldAGSpendAll || (s.prefs.ActiveProvider != oldProvider && s.prefs.ActiveProvider == core.ProviderAntigravity)
 	agToggledOn = s.prefs.AGOfficialEnabled && !oldAGOfficial
 	if agBrainChanged && s.agIndex != nil {
 		s.agIndex.SetBrainDir(newAGBrain)
