@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="20" role="img" aria-label="Windows: 10 / 11">
+  <title>Windows: 10 / 11</title>
+  <g shape-rendering="crispEdges">
+    <rect width="76" height="20" fill="#555"/>
+    <rect x="76" width="52" height="20" fill="#2B2B2B"/>
+  </g>
+  <g fill="#fff">
+    <path d="M8 5.2l5-.7v4.8H8V5.2zm5.8-.8l6.2-.9v5.8h-6.2V4.4zM8 10.1h5v4.8l-5-.7v-4.1zm5.8 0H20v5.8l-6.2-.9v-4.9z"/>
+  </g>
+  <g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" text-rendering="geometricPrecision" font-size="11">
+    <text x="48" y="14">Windows</text>
+    <text x="102" y="14">10 / 11</text>
+  </g>
+</svg>
