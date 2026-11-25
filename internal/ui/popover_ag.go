@@ -116,14 +116,32 @@ func (m *PopoverModel) renderAGProcesses(c *ui.Context, st service.ViewState, zh
 			ui.Column(c).FillWidth().Gap(2).Children(func() {
 				for _, task := range procs {
 					t := task
-					ui.Row(c.Key(fmt.Sprintf("ag-proc-%d-%s", t.PID, t.Name))).FillWidth().Height(22).Padding(0, 2).Gap(7).AlignItems(ui.Center).Children(func() {
+					row := ui.Row(c.Key(fmt.Sprintf("ag-proc-%d-%s", t.PID, t.Name))).FillWidth().Height(24).Padding(0, 4).Gap(7).Radius(6).AlignItems(ui.Center)
+					hov := row.Hovered()
+					if hov {
+						row.Background(ColorHover)
+					}
+					row.Children(func() {
 						ui.Box(c).Size(5, 5).Radius(2.5).Background(ColorLive)
 						ui.Text(c, t.Name).FontSize(11.5).FontWeight(500).TextColor(ColorText).SingleLine()
-						if t.Detail != "" {
-							ui.Text(c, t.Detail).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
+						if t.Detached {
+							Chip(c, tr(zh, "无终端", "Detached"), ColorWarning)
 						}
-						ui.Spacer(c)
-						if t.Bytes > 0 {
+						if t.Detail != "" {
+							ui.Text(c, t.Detail).FontSize(10.5).TextColor(ColorTertiary).SingleLine().Grow(1)
+						} else {
+							ui.Spacer(c)
+						}
+						if hov {
+							fq := ui.Row(c.Key("ag-fq")).Height(18).Padding(0, 8).Radius(9).Center().
+								Background(ColorCritical.Alpha(0.16)).Cursor(ui.CursorPointer)
+							if fq.Clicked() {
+								m.Store.ForceQuitAntigravityProcess(t)
+							}
+							fq.Children(func() {
+								ui.Text(c, tr(zh, "强制退出", "Force quit")).FontSize(10.5).FontWeight(600).TextColor(ColorCritical).SingleLine()
+							})
+						} else if t.Bytes > 0 {
 							ui.Text(c, platform.FormatBytes(t.Bytes)).FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
 						}
 					})
@@ -837,9 +855,8 @@ func (m *PopoverModel) renderAGSpendSection(c *ui.Context, st service.ViewState,
 						extra = " · " + tr(zh, "省 "+money.Format(summary.CacheSavingsUSD), "Saved "+money.Format(summary.CacheSavingsUSD))
 					}
 					ui.Text(c, dayLbl+extra).FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
-				} else if summary.CacheSavingsUSD > 0 {
-					ui.Text(c, tr(zh, "省 "+money.Format(summary.CacheSavingsUSD), "Saved "+money.Format(summary.CacheSavingsUSD))).
-						FontSize(10.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
+				} else {
+					ui.Text(c, tr(zh, "当天", "Today")).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
 				}
 			})
 
@@ -869,10 +886,21 @@ func (m *PopoverModel) renderAGSpendSection(c *ui.Context, st service.ViewState,
 					FontSize(12.5).FontWeight(500).TextColor(ColorText).FontFeatures("tnum").SingleLine()
 			})
 			ui.Spacer(c)
-			ui.Row(c).Gap(5).AlignItems(ui.Baseline).Children(func() {
+			todayRow := ui.Row(c).Gap(5).AlignItems(ui.Baseline).Children(func() {
 				ui.Text(c, tr(zh, "今日", "Today")).FontSize(10.5).TextColor(ColorTertiary).SingleLine()
 				ui.Text(c, money.Format(local.Today.EstimatedCostUSD)).FontSize(12.5).FontWeight(500).TextColor(ColorText).FontFeatures("tnum").SingleLine()
 			})
+			if local.WeekPeriod != nil {
+				loc := now.Location()
+				ws := local.WeekPeriod.Start.In(loc)
+				nl := now.In(loc)
+				if ws.Year() == nl.Year() && ws.Month() == nl.Month() && ws.Day() == nl.Day() {
+					hm := ws.Format("15:04")
+					todayRow.Tooltip(tr(zh,
+						fmt.Sprintf("「今日」从今天 00:00 起算；「本周期」从今天周额度重置时间（%s）起算，因此今日金额可能大于本周期。", hm),
+						fmt.Sprintf("Today starts at 00:00, while This week started at today's quota reset (%s), so Today may exceed This week.", hm)))
+				}
+			}
 		})
 
 		// 3-column token breakdown with colored dots (matching Antigravity transcript schema)
@@ -901,9 +929,9 @@ func (m *PopoverModel) renderAGSpendSection(c *ui.Context, st service.ViewState,
 			ThinBar(c, "ag-cache-hit-bar", hitRate, ui.RGBA(255, 255, 255, 0.45), nil, false, nil)
 		})
 
-		// Top 3 model breakdown
+		// Top 2 + Other model breakdown (sorted by cost, largest-remainder rounding)
 		if len(models) > 0 {
-			m.renderAGModelList(c, models, money, zh)
+			m.renderAGModelList(c, models, summary.EstimatedCostUSD, money, zh)
 		}
 	})
 }
@@ -920,39 +948,47 @@ func renderAGTokenCol(c *ui.Context, key, label string, dotColor ui.Color, token
 	})
 }
 
-func (m *PopoverModel) renderAGModelList(c *ui.Context, models []core.AGModelUsageSummary, money core.MoneyFormat, zh bool) {
-	var totalTok int64
-	for _, mod := range models {
-		totalTok += mod.TotalTokens()
+func (m *PopoverModel) renderAGModelList(c *ui.Context, models []core.AGModelUsageSummary, totalCostUSD float64, money core.MoneyFormat, zh bool) {
+	lines := core.BuildAGModelLines(models, totalCostUSD, money, zh)
+	if len(lines) == 0 {
+		return
 	}
-	if totalTok <= 0 {
-		totalTok = 1
-	}
-	keep := min(3, len(models))
 	ui.Column(c).FillWidth().Gap(5).Margin(2, 0, 0, 0).Children(func() {
-		for i := 0; i < keep; i++ {
-			mod := models[i]
-			share := float64(mod.TotalTokens()) / float64(totalTok)
-			row := ui.Row(c.Key("ag-mod-"+mod.Model)).FillWidth().Gap(8).AlignItems(ui.Center)
-			tipLines := []string{
-				mod.DisplayName,
-				fmt.Sprintf("%s: %s · %s: %s · %s: %s",
-					tr(zh, "输入", "In"), core.FormatMagnitude(mod.UncachedInputTokens, zh),
-					tr(zh, "输出", "Out"), core.FormatMagnitude(mod.OutputTokens, zh),
-					tr(zh, "缓存", "Cache"), core.FormatMagnitude(mod.CacheReadTokens, zh)),
-				fmt.Sprintf("%s: %s · %s: %d",
-					tr(zh, "命中率", "Cache"), core.FormatPercent(mod.CacheHitRate(), 1),
-					tr(zh, "请求", "Reqs"), mod.RequestCount),
+		for _, line := range lines {
+			row := ui.Row(c.Key("ag-mod-"+line.Key)).FillWidth().Gap(8).AlignItems(ui.Center)
+			if line.IsOther {
+				tipLines := []string{tr(zh, "其他模型明细", "Other models")}
+				for _, sub := range line.Models {
+					costTxt := tr(zh, "未定价", "Unpriced")
+					if sub.EstimatedCostUSD != nil {
+						costTxt = money.Format(*sub.EstimatedCostUSD)
+					}
+					tipLines = append(tipLines, fmt.Sprintf("%s · %s · %s tokens",
+						sub.DisplayName, costTxt, core.FormatMagnitude(sub.TotalTokens(), zh)))
+				}
+				row.Tooltip(strings.Join(tipLines, "\n"))
+			} else if len(line.Models) == 1 {
+				mod := line.Models[0]
+				tipLines := []string{
+					mod.DisplayName,
+					fmt.Sprintf("%s: %s · %s: %s · %s: %s",
+						tr(zh, "输入", "In"), core.FormatMagnitude(mod.UncachedInputTokens, zh),
+						tr(zh, "输出", "Out"), core.FormatMagnitude(mod.OutputTokens, zh),
+						tr(zh, "缓存", "Cache"), core.FormatMagnitude(mod.CacheReadTokens, zh)),
+					fmt.Sprintf("%s: %s · %s: %d",
+						tr(zh, "命中率", "Cache"), core.FormatPercent(mod.CacheHitRate(), 1),
+						tr(zh, "请求", "Reqs"), mod.RequestCount),
+				}
+				if mod.CacheSavingsUSD != nil && *mod.CacheSavingsUSD > 0 {
+					tipLines = append(tipLines, tr(zh, "缓存节省: ", "Cache saved: ")+money.Format(*mod.CacheSavingsUSD))
+				}
+				row.Tooltip(strings.Join(tipLines, "\n"))
 			}
-			if mod.CacheSavingsUSD != nil && *mod.CacheSavingsUSD > 0 {
-				tipLines = append(tipLines, tr(zh, "缓存节省: ", "Cache saved: ")+money.Format(*mod.CacheSavingsUSD))
-			}
-			row.Tooltip(strings.Join(tipLines, "\n"))
 			row.Children(func() {
-				ui.Text(c, mod.DisplayName).FontSize(11.5).TextColor(ColorSecondary).SingleLine().Grow(1)
-				ui.Text(c, core.FormatPercent(share, 1)).Width(44).TextAlign(ui.End).FontSize(11.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
-				if mod.EstimatedCostUSD != nil {
-					ui.Text(c, money.Format(*mod.EstimatedCostUSD)).MinWidth(60).TextAlign(ui.End).FontSize(11.5).TextColor(ColorText).FontFeatures("tnum").SingleLine()
+				ui.Text(c, line.Name).FontSize(11.5).TextColor(ColorSecondary).SingleLine().Grow(1)
+				ui.Text(c, line.Share).Width(44).TextAlign(ui.End).FontSize(11.5).TextColor(ColorTertiary).FontFeatures("tnum").SingleLine()
+				if line.Priced {
+					ui.Text(c, line.Amount).MinWidth(60).TextAlign(ui.End).FontSize(11.5).TextColor(ColorText).FontFeatures("tnum").SingleLine()
 				} else {
 					ui.Text(c, tr(zh, "未定价", "Unpriced")).MinWidth(60).TextAlign(ui.End).FontSize(10.5).TextColor(ColorWarning).SingleLine()
 				}

@@ -180,9 +180,10 @@ type Store struct {
 	fxInFlight    bool
 	notifyToastFn func(title, body string)
 
-	ctx         context.Context
-	cancel      context.CancelFunc
-	watchCancel context.CancelFunc
+	ctx             context.Context
+	cancel          context.CancelFunc
+	watchCancel     context.CancelFunc
+	panelLiveCancel context.CancelFunc
 
 	// Antigravity state
 	agIndex          *core.AGTranscriptIndex
@@ -381,6 +382,10 @@ func (s *Store) Stop() {
 	if s.agWatchCancel != nil {
 		s.agWatchCancel()
 		s.agWatchCancel = nil
+	}
+	if s.panelLiveCancel != nil {
+		s.panelLiveCancel()
+		s.panelLiveCancel = nil
 	}
 	s.mu.Unlock()
 	if s.cancel != nil {
@@ -707,6 +712,7 @@ func (s *Store) maybeAutoSync() {
 }
 
 func (s *Store) OnPanelOpened() {
+	s.startPanelLiveRefresh()
 	go s.RefreshFXRatesIfStale()
 	go func() {
 		s.mu.RLock()
@@ -737,6 +743,52 @@ func (s *Store) OnPanelOpened() {
 		spacingOK := lastReq == nil || now.Sub(*lastReq) >= core.AutoSyncMinSpacing
 		if checkOnOpen && spacingOK && s.hasAuthorizedCredentials() && (!hasUsage || core.ShouldCheckOnOpen(act, lastReq, now)) {
 			s.SyncOfficial(false, false)
+		}
+	}()
+}
+
+// OnPanelClosed stops the lightweight live refresh ticker started by OnPanelOpened.
+func (s *Store) OnPanelClosed() {
+	s.mu.Lock()
+	if s.panelLiveCancel != nil {
+		s.panelLiveCancel()
+		s.panelLiveCancel = nil
+	}
+	s.mu.Unlock()
+}
+
+func (s *Store) startPanelLiveRefresh() {
+	s.mu.Lock()
+	if s.ctx == nil {
+		s.mu.Unlock()
+		return
+	}
+	if s.panelLiveCancel != nil {
+		s.panelLiveCancel()
+	}
+	lctx, lcancel := context.WithCancel(s.ctx)
+	s.panelLiveCancel = lcancel
+	s.mu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(2500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-lctx.Done():
+				return
+			case <-ticker.C:
+				s.mu.RLock()
+				active := core.NormalizeProvider(s.prefs.ActiveProvider)
+				roots := platform.ClaudeProjectRoots(s.prefs.ClaudeConfigDir, s.prefs.CustomDataDir)
+				s.mu.RUnlock()
+				if active == core.ProviderAntigravity {
+					s.RefreshAntigravityLocal()
+				} else {
+					s.scanIndex(roots)
+					s.RefreshProcesses()
+				}
+			}
 		}
 	}()
 }

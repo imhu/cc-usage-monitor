@@ -580,3 +580,63 @@ func TestReadAGConversationStepTimingsAndExactOutputSpeed(t *testing.T) {
 		t.Fatalf("expected MedianTTFTMs=1500, got %v", speed.MedianTTFTMs)
 	}
 }
+
+func TestSummarizeAGByModelSortsByCostAndBuildLinesMergesOther(t *testing.T) {
+	now := time.Date(2026, 11, 25, 9, 0, 0, 0, time.UTC)
+	// Give unpriced or cheap-high-token model more tokens than an expensive model to prove cost-descending sort.
+	recs := []AGTranscriptRecord{
+		{Timestamp: now, Model: "gemini-2.5-flash", InputTokens: 500_000, OutputTokens: 100_000},     // cheap, lots of tokens
+		{Timestamp: now, Model: "claude-opus-4-6-thinking", InputTokens: 50_000, OutputTokens: 20_000}, // expensive
+		{Timestamp: now, Model: "gemini-4-neon-xhigh", InputTokens: 80_000, OutputTokens: 15_000},
+		{Timestamp: now, Model: "gpt-oss-120b", InputTokens: 40_000, OutputTokens: 5_000},
+	}
+
+	rep := AggregateAGUsage(recs, 1, now, nil, 15)
+	if len(rep.ByModelToday) != 4 {
+		t.Fatalf("expected 4 models, got %d", len(rep.ByModelToday))
+	}
+	if rep.ByModelToday[0].Model != "claude-opus-4-6-thinking" {
+		t.Fatalf("expected highest-cost model first, got %q", rep.ByModelToday[0].Model)
+	}
+
+	for _, unit := range []CurrencyUnit{CurrencyUSD, CurrencyCNY} {
+		money := NewMoneyFormat(unit)
+		lines := BuildAGModelLines(rep.ByModelToday, rep.Today.EstimatedCostUSD, money, true)
+		if len(lines) != 3 {
+			t.Fatalf("expected 3 display lines (top 2 + Other), got %d", len(lines))
+		}
+		if !lines[2].IsOther || lines[2].Name != "其他" || len(lines[2].Models) != 2 {
+			t.Fatalf("expected 3rd line to be 其他 merging 2 models, got %+v", lines[2])
+		}
+		pctSum := 0
+		for _, l := range lines {
+			var p int
+			if _, err := fmt.Sscanf(l.Share, "%d%%", &p); err != nil {
+				t.Fatalf("invalid share %q: %v", l.Share, err)
+			}
+			pctSum += p
+		}
+		if pctSum != 100 {
+			t.Fatalf("expected shares to sum strictly to 100%%, got %d%% (%+v)", pctSum, lines)
+		}
+
+		// Verify displayed amounts sum strictly to money.Format(total)
+		var amtSum float64
+		for _, l := range lines {
+			clean := strings.NewReplacer("$", "", "¥", "", ",", "").Replace(l.Amount)
+			var v float64
+			if _, err := fmt.Sscanf(clean, "%f", &v); err != nil {
+				t.Fatalf("invalid amount %q: %v", l.Amount, err)
+			}
+			amtSum += v
+		}
+		totalClean := strings.NewReplacer("$", "", "¥", "", ",", "").Replace(money.Format(rep.Today.EstimatedCostUSD))
+		var totalVal float64
+		if _, err := fmt.Sscanf(totalClean, "%f", &totalVal); err != nil {
+			t.Fatalf("invalid total %q: %v", money.Format(rep.Today.EstimatedCostUSD), err)
+		}
+		if math.Abs(amtSum-totalVal) > 0.015 {
+			t.Fatalf("unit=%s sum of model lines %.2f != total %.2f (%+v)", unit, amtSum, totalVal, lines)
+		}
+	}
+}

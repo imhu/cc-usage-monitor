@@ -377,21 +377,69 @@ func (s *Store) RebuildAGIndex() {
 	}()
 }
 
+func (s *Store) ForceQuitAntigravityProcess(task platform.ClaudeTask) {
+	go func() {
+		_ = platform.ForceQuitTask(task)
+		time.Sleep(300 * time.Millisecond)
+		procs := platform.ListAntigravityProcesses()
+		s.mu.Lock()
+		s.agProcs = procs
+		s.mu.Unlock()
+		s.notify()
+	}()
+}
+
+// RefreshAntigravityLocal performs a lightweight local-only refresh (transcript index + snapshot file + processes)
+// without triggering background CLI sync, used while the popover panel is open.
+func (s *Store) RefreshAntigravityLocal() {
+	s.mu.Lock()
+	s.ensureAGLocked()
+	idx := s.agIndex
+	inst := s.agBridgeInstallerLocked()
+	billingDay := s.prefs.AGBillingAnchorDay
+	s.mu.Unlock()
+
+	now := time.Now()
+	snap := core.LoadAGSnapshot(inst.SnapshotPath())
+	official := core.EvaluateAGQuota(snap, now)
+	var weeklyReset *time.Time
+	if official.PrimaryWeekly != nil {
+		weeklyReset = official.PrimaryWeekly.ResetTime
+	}
+	recs, convCount := idx.Refresh()
+	local := core.AggregateAGUsage(recs, convCount, now, weeklyReset, billingDay)
+	procs := platform.ListAntigravityProcesses()
+
+	s.mu.Lock()
+	s.agOfficial = official
+	s.agLocal = local
+	s.agProcs = procs
+	s.mu.Unlock()
+	s.notify()
+}
+
 func (s *Store) LaunchAgyLogin() {
 	s.mu.RLock()
 	customCLI := s.prefs.AGAgyCLIPath
+	inst := s.agBridgeInstallerLocked()
+	ctx := s.ctx
 	zh := s.prefs.IsChinese()
 	s.mu.RUnlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	cliPath := platform.LocateAgyBinary(customCLI)
-	LaunchAgyCLILogin(cliPath)
+	LaunchAgyCLILogin(ctx, cliPath, inst.SnapshotPath(), func() {
+		s.RefreshAntigravity(false)
+	})
 
 	s.mu.Lock()
 	if cliPath != "" {
 		if zh {
-			s.agFeedback = "已打开终端启动 agy。完成登录后即可关闭终端，程序会在后台自动刷新。"
+			s.agFeedback = "已打开终端启动 agy。完成登录后窗口将自动关闭并同步额度。"
 		} else {
-			s.agFeedback = "Opened terminal with agy. After signing in you can close it — limits sync automatically."
+			s.agFeedback = "Opened terminal with agy. Once signed in, it closes and syncs automatically."
 		}
 	} else {
 		if zh {

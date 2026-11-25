@@ -178,6 +178,7 @@ func (a *application) openPanel() {
 	a.panel.OnClosed(func() {
 		a.panel = nil
 		a.popoverModel.ResetHover()
+		a.store.OnPanelClosed()
 	})
 }
 

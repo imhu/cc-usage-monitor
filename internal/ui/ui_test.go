@@ -453,3 +453,71 @@ func TestSpendMathRoundingTooltipsAndLiveSettings(t *testing.T) {
 		t.Fatalf("settings Menubar tab should show live dash for speed with no 5m replies; got: %q", stUI.Texts())
 	}
 }
+
+func TestAntigravityDailyViewOtherModelsAndSlidingTabs(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+	store := service.NewStore(nil)
+	store.SetDemoState()
+
+	pop := NewPopoverModel(store, PopoverActions{})
+	tt := ui.NewTesterWith(pop.View, 356, 820, ui.TesterOptions{Dark: true})
+
+	// Test sliding spend tabs on Claude panel
+	if err := tt.Click("每日"); err != nil {
+		t.Fatalf("click Claude 每日 tab failed: %v", err)
+	}
+	tt.Advance(200 * time.Millisecond)
+	if !tt.HasText("当天") {
+		t.Fatalf("expected Claude daily view to show 当天, got: %q", tt.Texts())
+	}
+	if err := tt.Click("本周期"); err != nil {
+		t.Fatalf("click Claude 本周期 tab failed: %v", err)
+	}
+	tt.Advance(200 * time.Millisecond)
+
+	// Switch to Antigravity and test 每日 view (no duplicate 省 under big amount)
+	if err := tt.Click("Claude 用量"); err != nil {
+		t.Fatalf("open provider dropdown failed: %v", err)
+	}
+	if err := tt.Click("Antigravity"); err != nil {
+		t.Fatalf("switch to Antigravity failed: %v", err)
+	}
+	if err := tt.Click("每日"); err != nil {
+		t.Fatalf("click Antigravity 每日 tab failed: %v", err)
+	}
+	tt.Advance(200 * time.Millisecond)
+	if !tt.HasText("当天") {
+		t.Fatalf("expected Antigravity daily view to show 当天, got: %q", tt.Texts())
+	}
+	savedCount := 0
+	for _, txt := range tt.Texts() {
+		if strings.HasPrefix(txt, "省 ") {
+			savedCount++
+		}
+	}
+	if savedCount != 1 {
+		t.Fatalf("expected 省 $xxx once (in cache hit row only), got %d occurrences in: %q", savedCount, tt.Texts())
+	}
+
+	// Verify >3 models renders top 2 + 其他
+	c1, c2, c3, c4 := 12.50, 8.20, 3.10, 1.20
+	fourModels := []core.AGModelUsageSummary{
+		{Model: "claude-opus-4-6-thinking", DisplayName: "Opus 4.6", OutputTokens: 1000, EstimatedCostUSD: &c1},
+		{Model: "gemini-4-neon-xhigh", DisplayName: "Gemini 4 Neon", OutputTokens: 2000, EstimatedCostUSD: &c2},
+		{Model: "gemini-2.5-flash", DisplayName: "Gemini 2.5 Flash", OutputTokens: 3000, EstimatedCostUSD: &c3},
+		{Model: "gpt-oss-120b", DisplayName: "GPT OSS 120B", OutputTokens: 4000, EstimatedCostUSD: &c4},
+	}
+	mt := ui.NewTesterWith(func(c *ui.Context) {
+		ui.Column(c).FillWidth().Padding(8).Children(func() {
+			pop.renderAGModelList(c, fourModels, 25.00, core.NewMoneyFormat(core.CurrencyUSD), true)
+		})
+	}, 356, 200, ui.TesterOptions{Dark: true})
+	for _, want := range []string{"Opus 4.6", "Gemini 4 Neon", "其他", "$4.30"} {
+		if !mt.HasText(want) {
+			t.Fatalf("expected %q in merged model list, got: %q", want, mt.Texts())
+		}
+	}
+	if mt.HasText("Gemini 2.5 Flash") || mt.HasText("GPT OSS 120B") {
+		t.Fatalf("expected 3rd/4th models merged under 其他, got: %q", mt.Texts())
+	}
+}

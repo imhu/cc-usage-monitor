@@ -394,13 +394,146 @@ func summarizeAGByModel(records []AGTranscriptRecord) []AGModelUsageSummary {
 		})
 	}
 
-	sort.Slice(out, func(i, j int) bool {
-		ti, tj := out[i].TotalTokens(), out[j].TotalTokens()
+	sortAGModelSummaries(out)
+	return out
+}
+
+// AGModelDisplayLine is a formatted row for the Antigravity model breakdown list.
+type AGModelDisplayLine struct {
+	Key     string
+	Name    string
+	Share   string
+	Amount  string
+	Priced  bool
+	IsOther bool
+	Models  []AGModelUsageSummary
+}
+
+func sortAGModelSummaries(models []AGModelUsageSummary) {
+	sort.Slice(models, func(i, j int) bool {
+		pi, pj := models[i].EstimatedCostUSD != nil, models[j].EstimatedCostUSD != nil
+		if pi != pj {
+			return pi
+		}
+		if pi && pj && *models[i].EstimatedCostUSD != *models[j].EstimatedCostUSD {
+			return *models[i].EstimatedCostUSD > *models[j].EstimatedCostUSD
+		}
+		ti, tj := models[i].TotalTokens(), models[j].TotalTokens()
 		if ti != tj {
 			return ti > tj
 		}
-		return out[i].Model < out[j].Model
+		return models[i].Model < models[j].Model
 	})
+}
+
+// BuildAGModelLines sorts models by cost descending, merges models beyond the top 2
+// into an "Other" row when > 3 models exist, and allocates shares/amounts via
+// largest-remainder rounding so displayed rows sum strictly to 100% and totalCostUSD.
+func BuildAGModelLines(models []AGModelUsageSummary, totalCostUSD float64, money MoneyFormat, zh bool) []AGModelDisplayLine {
+	if len(models) == 0 {
+		return nil
+	}
+	sorted := make([]AGModelUsageSummary, len(models))
+	copy(sorted, models)
+	sortAGModelSummaries(sorted)
+
+	type rawGroup struct {
+		key     string
+		name    string
+		isOther bool
+		priced  bool
+		cost    float64
+		tokens  int64
+		models  []AGModelUsageSummary
+	}
+
+	keep := len(sorted)
+	if keep > 3 {
+		keep = 2
+	}
+
+	groups := make([]rawGroup, 0, 3)
+	for i := 0; i < keep; i++ {
+		m := sorted[i]
+		g := rawGroup{
+			key:    m.Model,
+			name:   m.DisplayName,
+			priced: m.EstimatedCostUSD != nil,
+			tokens: m.TotalTokens(),
+			models: []AGModelUsageSummary{m},
+		}
+		if m.EstimatedCostUSD != nil {
+			g.cost = *m.EstimatedCostUSD
+		}
+		groups = append(groups, g)
+	}
+
+	if len(sorted) > keep {
+		otherName := "Other"
+		if zh {
+			otherName = "其他"
+		}
+		g := rawGroup{
+			key:     "other",
+			name:    otherName,
+			isOther: true,
+			models:  make([]AGModelUsageSummary, 0, len(sorted)-keep),
+		}
+		for i := keep; i < len(sorted); i++ {
+			m := sorted[i]
+			g.models = append(g.models, m)
+			g.tokens += m.TotalTokens()
+			if m.EstimatedCostUSD != nil {
+				g.priced = true
+				g.cost += *m.EstimatedCostUSD
+			}
+		}
+		groups = append(groups, g)
+	}
+
+	totalPricedCost := 0.0
+	var pricedIdx []int
+	var pricedCosts []float64
+	for i, g := range groups {
+		if g.priced {
+			totalPricedCost += g.cost
+			pricedIdx = append(pricedIdx, i)
+			pricedCosts = append(pricedCosts, g.cost)
+		}
+	}
+
+	shareWeights := make([]float64, len(groups))
+	for i, g := range groups {
+		if totalPricedCost > 0 {
+			if g.priced {
+				shareWeights[i] = g.cost
+			}
+		} else {
+			shareWeights[i] = float64(g.tokens)
+		}
+	}
+	shares := FormatShares(shareWeights)
+
+	amounts := make([]string, len(groups))
+	if len(pricedIdx) > 0 {
+		splitAmounts := money.Split(totalCostUSD, pricedCosts)
+		for k, idx := range pricedIdx {
+			amounts[idx] = splitAmounts[k]
+		}
+	}
+
+	out := make([]AGModelDisplayLine, len(groups))
+	for i, g := range groups {
+		out[i] = AGModelDisplayLine{
+			Key:     g.key,
+			Name:    g.name,
+			Share:   shares[i],
+			Amount:  amounts[i],
+			Priced:  g.priced,
+			IsOther: g.isOther,
+			Models:  g.models,
+		}
+	}
 	return out
 }
 

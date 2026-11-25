@@ -87,13 +87,7 @@ func (s *AGSilentSyncer) Sync(ctx context.Context, agyPath, snapshotPath string,
 		return AGSyncResult{Kind: AGSyncFailed, ErrorMsg: fmt.Sprintf("写入临时捕获脚本失败：%v", err)}
 	}
 
-	settingsBytes, err := json.Marshal(map[string]any{
-		"statusLine": map[string]any{
-			"type":    "command",
-			"command": probeScriptPath,
-			"enabled": true,
-		},
-	})
+	settingsBytes, err := buildAGProbeSettings(filepath.Join(filepath.Dir(snapshotPath), "settings.json"), probeScriptPath)
 	if err != nil {
 		return AGSyncResult{Kind: AGSyncFailed, ErrorMsg: "序列化临时配置失败"}
 	}
@@ -164,18 +158,42 @@ func (s *AGSilentSyncer) Sync(ctx context.Context, agyPath, snapshotPath string,
 		return AGSyncResult{Kind: AGSyncFailed, ErrorMsg: fmt.Sprintf("已连接 agy CLI（状态：%s），但超时未获取到官方额度", latest.AgentState)}
 	}
 
-	prev := core.LoadAGSnapshot(snapshotPath)
-	merged := mergeAGSnapshots(latest, prev, time.Now().UTC())
+	merged, err := saveMergedAGSnapshot(latest, snapshotPath)
+	if err != nil {
+		return AGSyncResult{Kind: AGSyncFailed, ErrorMsg: err.Error()}
+	}
+	return AGSyncResult{Kind: AGSyncSynced, Snapshot: &merged}
+}
 
+func buildAGProbeSettings(userSettingsPath, probeScriptPath string) ([]byte, error) {
+	root := map[string]any{}
+	if strings.TrimSpace(userSettingsPath) != "" {
+		if raw, err := os.ReadFile(userSettingsPath); err == nil {
+			var parsed map[string]any
+			if err := json.Unmarshal(raw, &parsed); err == nil && parsed != nil {
+				root = parsed
+			}
+		}
+	}
+	root["statusLine"] = map[string]any{
+		"type":    "command",
+		"command": probeScriptPath,
+		"enabled": true,
+	}
+	return json.Marshal(root)
+}
+
+func saveMergedAGSnapshot(captured *core.AGStatusLineSnapshot, snapshotPath string) (core.AGStatusLineSnapshot, error) {
+	prev := core.LoadAGSnapshot(snapshotPath)
+	merged := mergeAGSnapshots(captured, prev, time.Now().UTC())
 	data, err := json.Marshal(merged)
 	if err != nil {
-		return AGSyncResult{Kind: AGSyncFailed, ErrorMsg: fmt.Sprintf("编码官方快照失败：%v", err)}
+		return core.AGStatusLineSnapshot{}, fmt.Errorf("编码官方快照失败：%v", err)
 	}
 	if err := platform.AtomicWriteFile(snapshotPath, data, 0o644); err != nil {
-		return AGSyncResult{Kind: AGSyncFailed, ErrorMsg: fmt.Sprintf("保存官方快照失败：%v", err)}
+		return core.AGStatusLineSnapshot{}, fmt.Errorf("保存官方快照失败：%v", err)
 	}
-
-	return AGSyncResult{Kind: AGSyncSynced, Snapshot: &merged}
+	return merged, nil
 }
 
 func mergeAGSnapshots(captured, prev *core.AGStatusLineSnapshot, capturedAt time.Time) core.AGStatusLineSnapshot {
@@ -266,7 +284,8 @@ func RunAGCaptureSnapshot(snapshotPath, chainCmd string) error {
 	if strings.TrimSpace(chainCmd) != "" {
 		cmd := exec.Command("cmd.exe")
 		cmd.SysProcAttr = &syscall.SysProcAttr{
-			CmdLine: "cmd.exe /C " + chainCmd,
+			HideWindow: true,
+			CmdLine:    "cmd.exe /C " + chainCmd,
 		}
 		cmd.Stdin = bytes.NewReader(raw)
 		cmd.Stdout = os.Stdout
@@ -295,19 +314,124 @@ func stampAGSnapshotTimestamp(raw []byte, now time.Time) []byte {
 	return b
 }
 
-// LaunchAgyCLILogin opens a Windows terminal running agy for interactive sign-in.
-func LaunchAgyCLILogin(agyPath string) {
+var (
+	agLoginMu     sync.Mutex
+	agLoginCancel context.CancelFunc
+)
+
+// LaunchAgyCLILogin opens a visible Windows terminal running agy for interactive sign-in,
+// captures the snapshot once authenticated, and closes the terminal automatically.
+func LaunchAgyCLILogin(ctx context.Context, agyPath, snapshotPath string, onSynced func()) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	agLoginMu.Lock()
+	if agLoginCancel != nil {
+		agLoginCancel()
+	}
+	loginCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	agLoginCancel = cancel
+	agLoginMu.Unlock()
+
 	go func() {
-		var inner string
-		if strings.TrimSpace(agyPath) != "" {
-			inner = fmt.Sprintf(`title Antigravity Usage Monitor - agy CLI Sign-in && echo Complete sign-in in agy below, then close this window. && call "%s"`, agyPath)
-		} else {
-			inner = `title Antigravity Usage Monitor - agy CLI && echo agy CLI not found in PATH. Please install Antigravity CLI first.`
+		defer cancel()
+		if strings.TrimSpace(agyPath) == "" {
+			inner := `title Antigravity Usage Monitor - agy CLI && echo agy CLI not found in PATH. Please install Antigravity CLI first.`
+			cmd := exec.Command("cmd.exe")
+			cmd.SysProcAttr = &syscall.SysProcAttr{
+				CmdLine: `cmd.exe /C start "agy CLI" cmd.exe /K "` + inner + `"`,
+			}
+			_ = cmd.Start()
+			return
 		}
-		cmd := exec.Command("cmd.exe")
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			CmdLine: `cmd.exe /C start "agy CLI" cmd.exe /K "` + inner + `"`,
+
+		exePath, err := os.Executable()
+		if err != nil || exePath == "" || strings.TrimSpace(snapshotPath) == "" {
+			inner := fmt.Sprintf(`title Antigravity Usage Monitor - agy CLI Sign-in && echo Complete sign-in in agy below, then close this window. && call "%s"`, agyPath)
+			cmd := exec.Command("cmd.exe")
+			cmd.SysProcAttr = &syscall.SysProcAttr{
+				CmdLine: `cmd.exe /C start "agy CLI" cmd.exe /K "` + inner + `"`,
+			}
+			_ = cmd.Start()
+			return
 		}
-		_ = cmd.Start()
+
+		tempDir, err := os.MkdirTemp("", "ag-login-*")
+		if err != nil {
+			return
+		}
+		defer os.RemoveAll(tempDir)
+
+		probePath := filepath.Join(tempDir, "probe.json")
+		probeScriptPath := filepath.Join(tempDir, "probe.cmd")
+		installer := core.AGBridgeInstaller{CaptureExePath: exePath}
+		if err := installer.WriteCaptureScript(probeScriptPath, probePath, ""); err != nil {
+			return
+		}
+		settingsBytes, err := buildAGProbeSettings(filepath.Join(filepath.Dir(snapshotPath), "settings.json"), probeScriptPath)
+		if err != nil {
+			return
+		}
+		settingsPath := filepath.Join(tempDir, "settings.json")
+		if err := os.WriteFile(settingsPath, settingsBytes, 0o644); err != nil {
+			return
+		}
+
+		esc := func(s string) string {
+			s = strings.ReplaceAll(s, `%`, `%%`)
+			return strings.ReplaceAll(s, `"`, `\"`)
+		}
+		loginScriptPath := filepath.Join(tempDir, "login.cmd")
+		loginScript := fmt.Sprintf(
+			"@echo off\r\nchcp 65001 >nul 2>nul\r\ntitle Antigravity Usage Monitor - agy CLI Sign-in\r\necho Complete sign-in in agy below. This window closes automatically once synced.\r\n\"%s\" --settings \"%s\"\r\n",
+			esc(agyPath), esc(settingsPath),
+		)
+		if err := os.WriteFile(loginScriptPath, []byte(loginScript), 0o644); err != nil {
+			return
+		}
+
+		proc, err := platform.StartVisibleConsoleCommand(loginCtx, loginScriptPath, nil, tempDir)
+		if err != nil {
+			return
+		}
+		defer proc.Close()
+
+		var firstQuotaAt time.Time
+		var readySnap *core.AGStatusLineSnapshot
+		for {
+			if parsed := core.LoadAGSnapshot(probePath); parsed != nil && len(parsed.Quota) > 0 {
+				readySnap = parsed
+				if strings.TrimSpace(parsed.Email) != "" && strings.TrimSpace(parsed.PlanTier) != "" {
+					break
+				}
+				if firstQuotaAt.IsZero() {
+					firstQuotaAt = time.Now()
+				} else if time.Since(firstQuotaAt) >= 2500*time.Millisecond {
+					break
+				}
+			}
+			select {
+			case <-loginCtx.Done():
+				return
+			case <-proc.Done():
+				if readySnap != nil {
+					if _, err := saveMergedAGSnapshot(readySnap, snapshotPath); err == nil && onSynced != nil {
+						onSynced()
+					}
+				}
+				return
+			case <-time.After(300 * time.Millisecond):
+			}
+		}
+
+		if readySnap != nil {
+			if _, err := saveMergedAGSnapshot(readySnap, snapshotPath); err == nil {
+				time.Sleep(400 * time.Millisecond)
+				proc.Close()
+				if onSynced != nil {
+					onSynced()
+				}
+			}
+		}
 	}()
 }

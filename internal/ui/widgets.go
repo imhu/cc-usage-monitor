@@ -451,12 +451,35 @@ func buildMonotonePath(raw []ui.Point) *ui.Path {
 	return path
 }
 
-// SegmentedTabs replicates SpanTabs & Settings segmented pickers 1:1.
+// SegmentedTabs replicates SpanTabs & Settings segmented pickers with a smooth sliding selection pill.
 func SegmentedTabs(c *ui.Context, key string, labels []string, selected int, fullWidth bool, onSelect func(int)) {
+	n := len(labels)
+	if n == 0 {
+		return
+	}
+	if selected < 0 {
+		selected = 0
+	} else if selected >= n {
+		selected = n - 1
+	}
+
 	wrap := ui.Row(c.Key(key)).Padding(2).Gap(2).Radius(9).Background(ColorPillBg)
 	if fullWidth {
 		wrap.FillWidth()
+		animIdx := wrap.Animate("sel-idx", float32(selected), 180*time.Millisecond)
+		wrap.Draw(func(p *ui.Painter, r ui.Rect) {
+			tabW := (r.W - 4 - 2*float32(n-1)) / float32(n)
+			if tabW > 0 && r.H > 4 {
+				x := r.X + 2 + animIdx*(tabW+2)
+				p.Fill(ui.Rect{X: x, Y: r.Y + 2, W: tabW, H: r.H - 4}, ColorPillSel, 7)
+			}
+		})
 	}
+
+	wrapBounds := wrap.Bounds()
+	var selBounds ui.Rect
+	var hasSelBounds bool
+
 	wrap.Children(func() {
 		for i, label := range labels {
 			isSel := i == selected
@@ -464,13 +487,20 @@ func SegmentedTabs(c *ui.Context, key string, labels []string, selected int, ful
 			if fullWidth {
 				tab.Grow(1)
 			}
-			if isSel {
-				tab.Background(ColorPillSel)
-			} else if tab.Hovered() {
+			if !isSel && tab.Hovered() {
 				tab.Background(ColorHover)
 			}
 			if tab.Clicked() && !isSel && onSelect != nil {
 				onSelect(i)
+			}
+			if isSel {
+				b := tab.Bounds()
+				if !fullWidth && wrapBounds.W > 0 && b.W > 0 {
+					selBounds = b
+					hasSelBounds = true
+				} else if !fullWidth {
+					tab.Background(ColorPillSel)
+				}
 			}
 			tab.Children(func() {
 				col := ColorSecondary
@@ -483,6 +513,16 @@ func SegmentedTabs(c *ui.Context, key string, labels []string, selected int, ful
 			})
 		}
 	})
+
+	if !fullWidth && hasSelBounds {
+		animX := wrap.Animate("sel-x", selBounds.X-wrapBounds.X, 180*time.Millisecond)
+		animW := wrap.Animate("sel-w", selBounds.W, 180*time.Millisecond)
+		wrap.Draw(func(p *ui.Painter, r ui.Rect) {
+			if animW > 0 && r.H > 4 {
+				p.Fill(ui.Rect{X: r.X + animX, Y: r.Y + 2, W: animW, H: r.H - 4}, ColorPillSel, 7)
+			}
+		})
+	}
 }
 
 func FooterButton(c *ui.Context, key string, icon *ui.SVG, title string, spinning bool, onClick func()) ui.Element {

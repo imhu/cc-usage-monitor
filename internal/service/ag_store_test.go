@@ -205,3 +205,30 @@ func TestMergeAGSnapshotsPreservesRealContextOverEmptyProbe(t *testing.T) {
 		t.Fatalf("expected PlanTier preserved, got %q", merged.PlanTier)
 	}
 }
+
+func TestBuildAGProbeSettingsMergesUserFields(t *testing.T) {
+	tmp := t.TempDir()
+	userSettings := filepath.Join(tmp, "settings.json")
+	orig := `{"model":"Gemini 4 Neon (High)","trustedWorkspaces":["D:\\work"],"statusLine":{"command":"old.cmd"}}`
+	if err := os.WriteFile(userSettings, []byte(orig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := buildAGProbeSettings(userSettings, `C:\tmp\probe.cmd`)
+	if err != nil {
+		t.Fatalf("buildAGProbeSettings failed: %v", err)
+	}
+	s := string(b)
+	if !strings.Contains(s, `"Gemini 4 Neon (High)"`) || !strings.Contains(s, `"trustedWorkspaces"`) {
+		t.Fatalf("expected user settings fields preserved, got: %s", s)
+	}
+	if !strings.Contains(s, `probe.cmd`) || strings.Contains(s, `old.cmd`) {
+		t.Fatalf("expected statusLine replaced with probe.cmd, got: %s", s)
+	}
+
+	// Missing or invalid user settings falls back cleanly
+	b2, err := buildAGProbeSettings(filepath.Join(tmp, "missing.json"), `C:\tmp\probe2.cmd`)
+	if err != nil || !strings.Contains(string(b2), `probe2.cmd`) {
+		t.Fatalf("expected clean fallback for missing file, err=%v out=%s", err, string(b2))
+	}
+}
