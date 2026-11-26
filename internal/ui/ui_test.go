@@ -2,6 +2,7 @@ package appui
 
 import (
 	"image/png"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -641,4 +642,135 @@ func TestAntigravityLogoSheenAndPillAnimation(t *testing.T) {
 	if store.ViewState().Prefs.AGLogoAnimation {
 		t.Fatal("expected AGLogoAnimation toggled to false")
 	}
+}
+
+func TestGenerateReadmeScreenshots(t *testing.T) {
+	outDir := strings.TrimSpace(os.Getenv("CCMONITOR_README_SHOTS"))
+	if outDir == "" {
+		t.Skip("set CCMONITOR_README_SHOTS to generate README screenshots")
+	}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+	store := service.NewStore(nil)
+	store.SetDemoState()
+
+	savePNG := func(name string, tester *ui.Tester) {
+		t.Helper()
+		img := tester.Image()
+		if img == nil {
+			t.Fatalf("nil image for %s", name)
+		}
+		f, err := os.Create(filepath.Join(outDir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if err := png.Encode(f, img); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	const frameW = int(PopoverWidth) + 32
+
+	renderPanelShot := func(filename string, provider core.ProviderKind, lang core.LanguagePref, anchorText, quitText string) {
+		t.Helper()
+		store.SetActiveProvider(provider)
+		store.UpdatePrefs(func(p *core.Preferences) {
+			p.Language = lang
+		})
+		store.SetDemoState()
+		pop := NewPopoverModel(store, PopoverActions{})
+		framedView := func(c *ui.Context) {
+			card := ui.Box(c.Key("readme-card")).
+				Width(PopoverWidth).
+				FillHeight().
+				Radius(PopoverRadius).
+				Clip().
+				Border(1, ui.RGBA(255, 255, 255, 0.12)).
+				Shadow(0, 8, 22, 0, ui.RGBA(0, 0, 0, 0.36))
+			card.Children(func() {
+				pop.View(c)
+			})
+			c.Root().Background(ui.Transparent).Padding(12, 16, 22, 16)
+		}
+
+		probe := ui.NewTesterWith(framedView, frameW, 880, ui.TesterOptions{Dark: true})
+		lastRow, ok := probe.Find(anchorText)
+		if !ok {
+			t.Fatalf("%s: anchor text %q not found in %q", filename, anchorText, probe.Texts())
+		}
+		tightH := int(math.Ceil(float64(lastRow.Y+lastRow.H))) + 84
+
+		tt := ui.NewTesterWith(framedView, frameW, tightH, ui.TesterOptions{Dark: true})
+		tt.SetScale(2)
+		tt.Advance(400 * time.Millisecond)
+
+		qr, ok := tt.Find(quitText)
+		if !ok {
+			t.Fatalf("%s: quit text %q not found", filename, quitText)
+		}
+		if qr.Y+qr.H > float32(tightH-22) {
+			t.Fatalf("%s: footer %q clipped (bottom=%.1f > limit=%d)", filename, quitText, qr.Y+qr.H, tightH-22)
+		}
+		savePNG(filename, tt)
+	}
+
+	renderPillShot := func(filename string, provider core.ProviderKind, lang core.LanguagePref, activeAG bool) {
+		t.Helper()
+		store.SetActiveProvider(provider)
+		store.UpdatePrefs(func(p *core.Preferences) {
+			p.Language = lang
+			if provider == core.ProviderAntigravity {
+				p.AGPillShowFiveHour = true
+				p.AGPillShowWeek = true
+				p.AGPillShowCache = true
+				p.AGPillShowTodayCost = true
+				p.AGPillShowContext = true
+			} else {
+				p.PillShowFiveHour = true
+				p.PillShowWeek = true
+				p.PillShowTodayCost = true
+			}
+		})
+		store.SetDemoState()
+		if activeAG {
+			store.SetAGExecutionForTest(core.AGExecutionState{
+				IsExecuting: true,
+				ActiveUntil: time.Now().Add(time.Minute),
+			})
+		} else {
+			store.SetAGExecutionForTest(core.AGExecutionState{})
+		}
+
+		measuredW := 0
+		pill := NewFloatingPillModel(store, PillActions{
+			OnContentWidth: func(w int) { measuredW = w },
+		})
+		initW := PillTargetWidth(store.ViewState())
+		pt := ui.NewTesterWith(pill.View, initW, PillHeight, ui.TesterOptions{Dark: true})
+		pt.Advance(20 * time.Millisecond)
+		if measuredW > 0 {
+			pt.SetSize(measuredW, PillHeight)
+		}
+		pt.SetScale(2)
+		if activeAG {
+			pt.Advance(600 * time.Millisecond)
+		} else {
+			pt.Advance(100 * time.Millisecond)
+		}
+		savePNG(filename, pt)
+	}
+
+	renderPanelShot("panel-claude-zh.png", core.ProviderClaude, core.LangZH, "Opus 5.5", "退出")
+	renderPanelShot("panel-antigravity-zh.png", core.ProviderAntigravity, core.LangZH, "Claude Sonnet 4.5", "退出")
+	renderPillShot("pill-claude-zh.png", core.ProviderClaude, core.LangZH, false)
+	renderPillShot("pill-antigravity-zh.png", core.ProviderAntigravity, core.LangZH, true)
+
+	renderPanelShot("panel-claude-en.png", core.ProviderClaude, core.LangEN, "Opus 5.5", "Quit")
+	renderPanelShot("panel-antigravity-en.png", core.ProviderAntigravity, core.LangEN, "Claude Sonnet 4.5", "Quit")
+	renderPillShot("pill-claude-en.png", core.ProviderClaude, core.LangEN, false)
+	renderPillShot("pill-antigravity-en.png", core.ProviderAntigravity, core.LangEN, true)
 }

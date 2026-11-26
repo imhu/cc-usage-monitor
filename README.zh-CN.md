@@ -16,11 +16,39 @@
   <img src="docs/badges/d3d11.svg" alt="Zero CGO Direct3D 11" height="20">
 </p>
 
-[**下载最新版**](https://github.com/imhu/cc-usage-monitor/releases/latest) · [**English**](README.md) · [核心特性](#核心特性) · [从源码构建与运行](#从源码构建与运行) · [致谢](#致谢)
+[**下载最新版**](https://github.com/imhu/cc-usage-monitor/releases/latest) · [**English**](README.md) · [界面预览](#界面预览) · [核心特性](#核心特性) · [从源码构建与运行](#从源码构建与运行) · [致谢](#致谢)
 
 </div>
 
 <br>
+
+## 界面预览
+
+<div align="center">
+<table>
+<tr>
+<td align="center" width="50%">
+<img src="docs/images/panel-claude-zh.png" width="356" alt="Claude 用量面板"><br>
+<sub><b>Claude 用量面板</b></sub>
+</td>
+<td align="center" width="50%">
+<img src="docs/images/panel-antigravity-zh.png" width="356" alt="Antigravity 用量面板"><br>
+<sub><b>Antigravity 用量面板</b></sub>
+</td>
+</tr>
+<tr>
+<td align="center">
+<img src="docs/images/pill-claude-zh.png" height="56" alt="Claude 桌面悬浮条"><br>
+<sub><b>桌面悬浮条 — Claude</b></sub>
+</td>
+<td align="center">
+<img src="docs/images/pill-antigravity-zh.png" height="56" alt="Antigravity 桌面悬浮条"><br>
+<sub><b>桌面悬浮条 — Antigravity（执行扫光态）</b></sub>
+</td>
+</tr>
+</table>
+<sub><i>以上截图基于内置 <code>--demo</code> 演示数据渲染，IP 已脱敏处理，不含任何真实账号或本地日志信息。</i></sub>
+</div>
 
 ## 核心特性
 

@@ -16,11 +16,39 @@ Powered by [`egoist/mygo`](https://github.com/egoist/mygo) — Pure Go, Zero CGO
   <img src="docs/badges/d3d11.svg" alt="Zero CGO Direct3D 11" height="20">
 </p>
 
-[**Download Latest**](https://github.com/imhu/cc-usage-monitor/releases/latest) · [**简体中文**](README.zh-CN.md) · [Highlights](#highlights) · [Build & Run](#build-and-run-from-source) · [Acknowledgments](#acknowledgments)
+[**Download Latest**](https://github.com/imhu/cc-usage-monitor/releases/latest) · [**简体中文**](README.zh-CN.md) · [Preview](#preview) · [Highlights](#highlights) · [Build & Run](#build-and-run-from-source) · [Acknowledgments](#acknowledgments)
 
 </div>
 
 <br>
+
+## Preview
+
+<div align="center">
+<table>
+<tr>
+<td align="center" width="50%">
+<img src="docs/images/panel-claude-en.png" width="356" alt="Claude Usage Panel"><br>
+<sub><b>Claude Usage Panel</b></sub>
+</td>
+<td align="center" width="50%">
+<img src="docs/images/panel-antigravity-en.png" width="356" alt="Antigravity Usage Panel"><br>
+<sub><b>Antigravity Usage Panel</b></sub>
+</td>
+</tr>
+<tr>
+<td align="center">
+<img src="docs/images/pill-claude-en.png" height="56" alt="Claude Floating Pill"><br>
+<sub><b>Floating Pill — Claude</b></sub>
+</td>
+<td align="center">
+<img src="docs/images/pill-antigravity-en.png" height="56" alt="Antigravity Floating Pill"><br>
+<sub><b>Floating Pill — Antigravity (active sheen)</b></sub>
+</td>
+</tr>
+</table>
+<sub><i>Rendered with built-in <code>--demo</code> sample data; exit IPs are masked and no personal account data is shown.</i></sub>
+</div>
 
 ## Highlights
 
