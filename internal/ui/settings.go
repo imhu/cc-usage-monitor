@@ -806,7 +806,7 @@ func (m *SettingsModel) renderPreviewPillContent(c *ui.Context, st service.ViewS
 }
 
 func (m *SettingsModel) renderAGPreviewPillContent(c *ui.Context, st service.ViewState, zh bool) {
-	AntigravityLogo(c, 15, 0)
+	AntigravityLogoAnimated(c, "ag-preview-logo", 15, st.Prefs.AGLogoAnimation && st.AG.Execution.IsActiveAt(time.Now()))
 	money := core.NewMoneyFormatWithRates(st.Prefs.Currency, st.FXRates)
 	cols := buildAGPillColumns(st, money, zh)
 	if len(cols) == 1 {
@@ -847,6 +847,15 @@ func (m *SettingsModel) renderAGMenuBarSettings(c *ui.Context, st service.ViewSt
 	if usedPct, _, _, ok := core.ResolveAGContextWindow(off, local); ok {
 		vCtx = fmt.Sprintf("%d%%", int(math.Round(usedPct)))
 	}
+
+	settingsRow(c, tr(zh, "执行时图标扫光", "Logo sheen while active"),
+		tr(zh, "Antigravity 执行时，悬浮条星标显示柔和斜向扫光动画。", "Subtle diagonal sheen sweeps across the star while Antigravity is running."), func() {
+			AccentSwitch(c, "sw-ag-anim", st.Prefs.AGLogoAnimation, ColorAGAccent, func(on bool) {
+				m.Store.UpdatePrefs(func(p *core.Preferences) { p.AGLogoAnimation = on })
+			})
+		})
+
+	Hairline(c)
 
 	ui.Column(c).FillWidth().Gap(8).Children(func() {
 		ui.Text(c, tr(zh, "Antigravity 显示项", "Antigravity visible metrics")).FontSize(13).FontWeight(500).TextColor(ColorText)

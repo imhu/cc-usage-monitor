@@ -76,9 +76,10 @@ type Preferences struct {
 	AGCollapsedLimits    bool        `json:"agCollapsedLimits"`
 	AGCollapsedSpeed     bool        `json:"agCollapsedSpeed"`
 	AGCollapsedSpend     bool        `json:"agCollapsedSpend"`
-	AGAlertEnabled       bool        `json:"agAlertEnabled"`
-	AGBillingReminders   bool        `json:"agBillingReminders"`
-	AGSpendAllAccounts   bool        `json:"agSpendAllAccounts,omitempty"`
+	AGAlertEnabled         bool        `json:"agAlertEnabled"`
+	AGBillingReminders     bool        `json:"agBillingReminders"`
+	AGLogoAnimation        bool        `json:"agLogoAnimation"`
+	AGSpendAllAccounts     bool        `json:"agSpendAllAccounts,omitempty"`
 	AGSavedFullWeekCostUSD float64   `json:"agSavedFullWeekCostUsd,omitempty"`
 	AGSavedFullWeekTokens  int64     `json:"agSavedFullWeekTokens,omitempty"`
 
@@ -142,6 +143,7 @@ func DefaultPreferences() Preferences {
 		AGCostSpan:           SpanWeek,
 		AGAlertEnabled:       true,
 		AGBillingReminders:   true,
+		AGLogoAnimation:      true,
 		IconStyle:            IconStyleClawd,
 		ClawdAnimation:      true,
 		ShowFloatingPill:    false,

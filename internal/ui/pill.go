@@ -138,10 +138,14 @@ func (m *FloatingPillModel) View(c *ui.Context) {
 	now := time.Now()
 	money := core.NewMoneyFormatWithRates(st.Prefs.Currency, st.FXRates)
 
+	agExecuting := provider == core.ProviderAntigravity && st.Prefs.AGLogoAnimation && st.AG.Execution.IsActiveAt(now)
+
 	if provider == core.ProviderClaude && st.Prefs.ClawdAnimation {
 		c.After(800 * time.Millisecond)
 	} else if provider == core.ProviderClaude && st.Prefs.PillShowSpeed {
 		c.After(5 * time.Second)
+	} else if agExecuting {
+		c.After(1 * time.Second)
 	} else {
 		c.After(15 * time.Second)
 	}
@@ -241,7 +245,7 @@ func (m *FloatingPillModel) View(c *ui.Context) {
 		content := ui.Row(c.Key("mini-pill-content")).Gap(9).AlignItems(ui.Center).Shrink(0)
 		content.Children(func() {
 			if provider == core.ProviderAntigravity {
-				AntigravityLogo(c, 16, 0)
+				AntigravityLogoAnimated(c, "ag-pill-logo", 16, agExecuting)
 				if len(cols) == 1 {
 					ui.Text(c, cols[0].val).FontSize(12.5).FontWeight(600).TextColor(cols[0].col).FontFeatures("tnum").SingleLine()
 				} else {

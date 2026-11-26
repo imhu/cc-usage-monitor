@@ -396,6 +396,52 @@ func (r AGOfficialQuotaReport) HasSnapshot() bool {
 	return r.SnapshotCapturedAt != nil
 }
 
+// AGExecutionState captures whether Antigravity is currently executing an AI turn.
+type AGExecutionState struct {
+	IsExecuting    bool
+	ActiveUntil    time.Time
+	LastEventAt    time.Time
+	ConversationID string
+}
+
+func (s AGExecutionState) IsActiveAt(now time.Time) bool {
+	if !s.IsExecuting {
+		return false
+	}
+	if s.ActiveUntil.IsZero() {
+		return true
+	}
+	return now.Before(s.ActiveUntil)
+}
+
+// EvaluateAGExecution combines local transcript step activity with official AgentState
+// to determine whether Antigravity is actively running at now.
+func EvaluateAGExecution(local AGExecutionState, official AGOfficialQuotaReport, now time.Time) AGExecutionState {
+	if local.IsActiveAt(now) {
+		return local
+	}
+	if official.HasSnapshot() && official.SnapshotCapturedAt != nil && isAGActiveAgentState(official.AgentState) {
+		until := official.SnapshotCapturedAt.Add(90 * time.Second)
+		if now.Before(until) {
+			return AGExecutionState{
+				IsExecuting: true,
+				ActiveUntil: until,
+				LastEventAt: *official.SnapshotCapturedAt,
+			}
+		}
+	}
+	return AGExecutionState{}
+}
+
+func isAGActiveAgentState(state string) bool {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "running", "thinking", "executing", "generating", "streaming", "working", "planning", "tool_use", "busy":
+		return true
+	default:
+		return false
+	}
+}
+
 // ResolveAGContextWindow returns the active Antigravity context usage, preferring
 // non-zero official statusLine context and falling back to the latest active
 // local transcript turn when the background probe only returned an empty 0% state.

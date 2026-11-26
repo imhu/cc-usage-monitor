@@ -36,30 +36,73 @@ func ParseAGISO8601(s string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+type rawAGToolCallRef struct {
+	Name string `json:"name"`
+}
+
 type rawAGTranscriptLine struct {
-	StepIndex       *int   `json:"step_index"`
-	CreatedAt       string `json:"created_at"`
-	Model           string `json:"model"`
-	InputTokens     *int64 `json:"input_tokens"`
-	CacheReadTokens *int64 `json:"cache_read_tokens"`
-	OutputTokens    *int64 `json:"output_tokens"`
+	StepIndex       *int               `json:"step_index"`
+	Source          string             `json:"source"`
+	Type            string             `json:"type"`
+	Status          string             `json:"status"`
+	CreatedAt       string             `json:"created_at"`
+	Model           string             `json:"model"`
+	InputTokens     *int64             `json:"input_tokens"`
+	CacheReadTokens *int64             `json:"cache_read_tokens"`
+	OutputTokens    *int64             `json:"output_tokens"`
+	ToolCalls       []rawAGToolCallRef `json:"tool_calls"`
+}
+
+type agTranscriptEvent struct {
+	Timestamp   time.Time
+	Type        string
+	Status      string
+	HasToolCall bool
+	WaitingUser bool
 }
 
 func ParseAGTranscriptLine(line []byte, conversationID, fallbackModel string) (AGTranscriptRecord, bool) {
+	rec, hasRec, _, _ := parseAGTranscriptLineFull(line, conversationID, fallbackModel)
+	return rec, hasRec
+}
+
+func parseAGTranscriptLineFull(line []byte, conversationID, fallbackModel string) (rec AGTranscriptRecord, hasRec bool, ev agTranscriptEvent, hasEv bool) {
 	line = bytes.TrimSpace(line)
 	if len(line) == 0 {
-		return AGTranscriptRecord{}, false
+		return AGTranscriptRecord{}, false, agTranscriptEvent{}, false
 	}
 	var raw rawAGTranscriptLine
 	if err := json.Unmarshal(line, &raw); err != nil {
-		return AGTranscriptRecord{}, false
+		return AGTranscriptRecord{}, false, agTranscriptEvent{}, false
 	}
-	if raw.InputTokens == nil && raw.OutputTokens == nil && raw.CacheReadTokens == nil {
-		return AGTranscriptRecord{}, false
-	}
+
 	ts, ok := ParseAGISO8601(raw.CreatedAt)
+	if raw.Type != "" || raw.Status != "" || ok {
+		waitingUser := false
+		if len(raw.ToolCalls) > 0 {
+			waitingUser = true
+			for _, tc := range raw.ToolCalls {
+				if !strings.EqualFold(strings.TrimSpace(tc.Name), "ask_question") {
+					waitingUser = false
+					break
+				}
+			}
+		}
+		ev = agTranscriptEvent{
+			Timestamp:   ts,
+			Type:        raw.Type,
+			Status:      raw.Status,
+			HasToolCall: len(raw.ToolCalls) > 0,
+			WaitingUser: waitingUser,
+		}
+		hasEv = true
+	}
+
+	if raw.InputTokens == nil && raw.OutputTokens == nil && raw.CacheReadTokens == nil {
+		return AGTranscriptRecord{}, false, ev, hasEv
+	}
 	if !ok {
-		return AGTranscriptRecord{}, false
+		return AGTranscriptRecord{}, false, ev, hasEv
 	}
 	resolved := resolveAGModelName(raw.Model, fallbackModel)
 
@@ -90,7 +133,7 @@ func ParseAGTranscriptLine(line []byte, conversationID, fallbackModel string) (A
 		ConversationID:  conversationID,
 		StepIndex:       stepIdx,
 		HasStepIndex:    hasStep,
-	}, true
+	}, true, ev, hasEv
 }
 
 func resolveAGModelName(explicit, fallback string) string {
@@ -106,7 +149,13 @@ func resolveAGModelName(explicit, fallback string) string {
 }
 
 func ParseAGTranscriptBytes(data []byte, conversationID string, lastKnownModel *string) []AGTranscriptRecord {
+	recs, _ := parseAGTranscriptBytesFull(data, conversationID, lastKnownModel)
+	return recs
+}
+
+func parseAGTranscriptBytesFull(data []byte, conversationID string, lastKnownModel *string) ([]AGTranscriptRecord, *agTranscriptEvent) {
 	var results []AGTranscriptRecord
+	var lastEvent *agTranscriptEvent
 	var known, firstKnown string
 	if lastKnownModel != nil {
 		known = *lastKnownModel
@@ -124,7 +173,12 @@ func ParseAGTranscriptBytes(data []byte, conversationID string, lastKnownModel *
 			slice = data[start : start+idx]
 			start += idx + 1
 		}
-		if rec, ok := ParseAGTranscriptLine(slice, conversationID, known); ok {
+		rec, hasRec, ev, hasEv := parseAGTranscriptLineFull(slice, conversationID, known)
+		if hasEv {
+			evCopy := ev
+			lastEvent = &evCopy
+		}
+		if hasRec {
 			if !strings.EqualFold(rec.Model, "unknown") {
 				if firstKnown == "" {
 					firstKnown = rec.Model
@@ -147,14 +201,16 @@ func ParseAGTranscriptBytes(data []byte, conversationID string, lastKnownModel *
 	if lastKnownModel != nil {
 		*lastKnownModel = known
 	}
-	return results
+	return results, lastEvent
 }
 
 type agFileCursor struct {
+	conversationID string
 	byteOffset     int64
 	modTime        time.Time
 	records        []AGTranscriptRecord
 	lastKnownModel string
+	lastEvent      *agTranscriptEvent
 }
 
 type agTimingCacheEntry struct {
@@ -240,27 +296,35 @@ func (idx *AGTranscriptIndex) Refresh() (records []AGTranscriptRecord, conversat
 		cur, ok := idx.cursors[transcriptPath]
 		if !ok {
 			var lastModel string
-			recs, newOff := readAGTranscriptSlice(transcriptPath, 0, name, &lastModel)
+			recs, newOff, lastEv := readAGTranscriptSlice(transcriptPath, 0, name, &lastModel)
 			cur = &agFileCursor{
+				conversationID: name,
 				byteOffset:     newOff,
 				modTime:        modTime,
 				records:        recs,
 				lastKnownModel: lastModel,
+				lastEvent:      lastEv,
 			}
 			idx.cursors[transcriptPath] = cur
 		} else if fileSize < cur.byteOffset {
 			var lastModel string
-			recs, newOff := readAGTranscriptSlice(transcriptPath, 0, name, &lastModel)
+			recs, newOff, lastEv := readAGTranscriptSlice(transcriptPath, 0, name, &lastModel)
+			cur.conversationID = name
 			cur.byteOffset = newOff
 			cur.modTime = modTime
 			cur.records = recs
 			cur.lastKnownModel = lastModel
+			cur.lastEvent = lastEv
 		} else if fileSize > cur.byteOffset || modTime.After(cur.modTime) {
 			lastModel := cur.lastKnownModel
-			recs, newOff := readAGTranscriptSlice(transcriptPath, cur.byteOffset, name, &lastModel)
+			recs, newOff, lastEv := readAGTranscriptSlice(transcriptPath, cur.byteOffset, name, &lastModel)
+			cur.conversationID = name
 			cur.byteOffset = newOff
 			cur.modTime = modTime
 			cur.lastKnownModel = lastModel
+			if lastEv != nil {
+				cur.lastEvent = lastEv
+			}
 			if len(recs) > 0 {
 				cur.records = append(cur.records, recs...)
 			}
@@ -352,39 +416,121 @@ func (idx *AGTranscriptIndex) stepTimingsForLocked(convDir, convID string) map[i
 	return timings
 }
 
-func readAGTranscriptSlice(path string, offset int64, conversationID string, lastKnownModel *string) ([]AGTranscriptRecord, int64) {
+// ExecutionState inspects the latest transcript step across all indexed conversations
+// to determine whether Antigravity is currently executing an AI turn.
+func (idx *AGTranscriptIndex) ExecutionState(now time.Time) AGExecutionState {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	var best AGExecutionState
+	for _, cur := range idx.cursors {
+		if cur.lastEvent == nil {
+			continue
+		}
+		cand := evaluateAGTranscriptEvent(cur.conversationID, *cur.lastEvent, cur.modTime, now)
+		if !cand.IsExecuting {
+			continue
+		}
+		if !best.IsExecuting || cand.ActiveUntil.After(best.ActiveUntil) ||
+			(cand.ActiveUntil.Equal(best.ActiveUntil) && cand.LastEventAt.After(best.LastEventAt)) {
+			best = cand
+		}
+	}
+	return best
+}
+
+func evaluateAGTranscriptEvent(convID string, ev agTranscriptEvent, fileMod, now time.Time) AGExecutionState {
+	eventAt := ev.Timestamp
+	if eventAt.IsZero() {
+		eventAt = fileMod
+	} else if fileMod.After(eventAt) && fileMod.Sub(eventAt) <= 10*time.Minute {
+		eventAt = fileMod
+	}
+	if eventAt.After(now) {
+		eventAt = now
+	}
+
+	typ := strings.ToUpper(strings.TrimSpace(ev.Type))
+	st := strings.ToUpper(strings.TrimSpace(ev.Status))
+
+	switch st {
+	case "CANCELLED", "CANCELED", "ERROR", "FAILED", "ABORTED", "STOPPED", "WAITING", "WAITING_FOR_USER", "BLOCKED", "PAUSED":
+		return AGExecutionState{}
+	}
+
+	var activeUntil time.Time
+	switch st {
+	case "RUNNING", "IN_PROGRESS", "STREAMING", "EXECUTING", "PENDING":
+		activeUntil = eventAt.Add(5 * time.Minute)
+	default:
+		switch typ {
+		case "USER_INPUT":
+			activeUntil = eventAt.Add(3 * time.Minute)
+		case "PLANNER_RESPONSE":
+			if ev.HasToolCall && !ev.WaitingUser {
+				activeUntil = eventAt.Add(3 * time.Minute)
+			} else {
+				return AGExecutionState{}
+			}
+		case "GENERIC":
+			activeUntil = eventAt.Add(3 * time.Minute)
+		case "SYSTEM_MESSAGE":
+			activeUntil = eventAt.Add(2 * time.Minute)
+		default:
+			return AGExecutionState{}
+		}
+	}
+
+	if !now.Before(activeUntil) {
+		return AGExecutionState{}
+	}
+	return AGExecutionState{
+		IsExecuting:    true,
+		ActiveUntil:    activeUntil,
+		LastEventAt:    eventAt,
+		ConversationID: convID,
+	}
+}
+
+func readAGTranscriptSlice(path string, offset int64, conversationID string, lastKnownModel *string) ([]AGTranscriptRecord, int64, *agTranscriptEvent) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, offset
+		return nil, offset, nil
 	}
 	defer f.Close()
 
 	if offset > 0 {
 		if _, err := f.Seek(offset, io.SeekStart); err != nil {
-			return nil, offset
+			return nil, offset, nil
 		}
 	}
 	data, err := io.ReadAll(f)
 	if err != nil || len(data) == 0 {
-		return nil, offset
+		return nil, offset, nil
 	}
 
 	lastNL := bytes.LastIndexByte(data, '\n')
 	if lastNL >= 0 {
 		completeLen := lastNL + 1
-		recs := ParseAGTranscriptBytes(data[:completeLen], conversationID, lastKnownModel)
-		return recs, offset + int64(completeLen)
+		recs, lastEv := parseAGTranscriptBytesFull(data[:completeLen], conversationID, lastKnownModel)
+		return recs, offset + int64(completeLen), lastEv
 	}
 
 	var fallback string
 	if lastKnownModel != nil {
 		fallback = *lastKnownModel
 	}
-	if rec, ok := ParseAGTranscriptLine(data, conversationID, fallback); ok {
+	rec, hasRec, ev, hasEv := parseAGTranscriptLineFull(data, conversationID, fallback)
+	var lastEv *agTranscriptEvent
+	if hasEv {
+		evCopy := ev
+		lastEv = &evCopy
+	}
+	if hasRec {
 		if lastKnownModel != nil && !strings.EqualFold(rec.Model, "unknown") {
 			*lastKnownModel = rec.Model
 		}
-		return []AGTranscriptRecord{rec}, offset + int64(len(data))
+		return []AGTranscriptRecord{rec}, offset + int64(len(data)), lastEv
 	}
-	return nil, offset
+	return nil, offset, nil
 }

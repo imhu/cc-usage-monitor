@@ -566,3 +566,79 @@ func TestUpdateBadgeAndSettingsGeneralCard(t *testing.T) {
 			vs.Prefs.SkippedVersion, vs.Update.HasBadge())
 	}
 }
+
+func TestAntigravityLogoSheenAndPillAnimation(t *testing.T) {
+	// 1. Validate agSheenGradient produces sorted stops in [0, 1], <= 7 stops, and zero alpha when intensity == 0.
+	for _, center := range []float32{-0.22, 0.0, 0.25, 0.5, 0.75, 1.0, 1.22} {
+		g := agSheenGradient(center, 0.28, 1.0)
+		if len(g.Stops) < 2 || len(g.Stops) > 7 {
+			t.Fatalf("center=%v expected 2..7 stops, got %d", center, len(g.Stops))
+		}
+		if g.Stops[0].At != 0 || g.Stops[len(g.Stops)-1].At != 1 {
+			t.Fatalf("center=%v stops must span [0, 1], got %+v", center, g.Stops)
+		}
+		for i := 1; i < len(g.Stops); i++ {
+			if g.Stops[i].At <= g.Stops[i-1].At {
+				t.Fatalf("center=%v stops not strictly increasing: %+v", center, g.Stops)
+			}
+		}
+	}
+	zeroG := agSheenGradient(0.5, 0.28, 0)
+	for _, s := range zeroG.Stops {
+		if s.Color.A != 0 {
+			t.Fatalf("expected zero alpha when intensity=0, got %+v", zeroG.Stops)
+		}
+	}
+
+	// 2. Render Antigravity floating pill across active -> idle transitions and toggle off.
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+	store := service.NewStore(nil)
+	store.SetDemoState()
+	store.SetActiveProvider(core.ProviderAntigravity)
+
+	pill := NewFloatingPillModel(store, PillActions{})
+	pw := PillTargetWidth(store.ViewState())
+	pt := ui.NewTesterWith(pill.View, pw, PillHeight, ui.TesterOptions{Dark: true})
+	if !pt.HasText("42%") {
+		t.Fatalf("antigravity pill missing 42%%; got %q", pt.Texts())
+	}
+
+	store.SetAGExecutionForTest(core.AGExecutionState{
+		IsExecuting: true,
+		ActiveUntil: time.Now().Add(time.Minute),
+	})
+	pt.Advance(150 * time.Millisecond)
+	if img := pt.Image(); img == nil {
+		t.Fatal("expected non-nil rendered pill image while active")
+	}
+
+	store.SetAGExecutionForTest(core.AGExecutionState{})
+	pt.Advance(350 * time.Millisecond)
+	if img := pt.Image(); img == nil {
+		t.Fatal("expected non-nil rendered pill image after returning idle")
+	}
+
+	// 3. Settings Menubar Antigravity tab renders the toggle and flips AGLogoAnimation.
+	set := NewSettingsModel(store, SettingsActions{})
+	st := ui.NewTesterWith(set.View, 540, 620, ui.TesterOptions{Dark: true})
+	if err := st.Click("菜单栏"); err != nil {
+		t.Fatalf("click Menubar tab failed: %v", err)
+	}
+	if err := st.Click("Antigravity"); err != nil {
+		t.Fatalf("click Antigravity preview toggle failed: %v", err)
+	}
+	if !st.HasText("执行时图标扫光") {
+		t.Fatalf("expected 执行时图标扫光 setting row, got: %q", st.Texts())
+	}
+	if !store.ViewState().Prefs.AGLogoAnimation {
+		t.Fatal("expected AGLogoAnimation default true")
+	}
+	r, ok := st.Find("执行时图标扫光")
+	if !ok {
+		t.Fatal("expected 执行时图标扫光 bounds")
+	}
+	st.ClickAt(540-24-22, r.Y+18)
+	if store.ViewState().Prefs.AGLogoAnimation {
+		t.Fatal("expected AGLogoAnimation toggled to false")
+	}
+}

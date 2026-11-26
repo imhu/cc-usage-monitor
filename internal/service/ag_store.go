@@ -18,6 +18,7 @@ import (
 type AGViewState struct {
 	LocalReport          core.AGLocalUsageReport
 	OfficialReport       core.AGOfficialQuotaReport
+	Execution            core.AGExecutionState
 	BridgeStatus         core.AGBridgeStatus
 	CLIBinaryPath        string
 	Processes            []platform.ClaudeTask
@@ -71,6 +72,7 @@ func (s *Store) agViewStateLocked() AGViewState {
 	return AGViewState{
 		LocalReport:          s.agLocal,
 		OfficialReport:       s.agOfficial,
+		Execution:            s.agExecution,
 		BridgeStatus:         s.agBridge,
 		CLIBinaryPath:        s.agCLIPath,
 		Processes:            procs,
@@ -279,6 +281,7 @@ func (s *Store) applyAGAccountStateLocked(official core.AGOfficialQuotaReport, n
 func (s *Store) computeAGReports(now time.Time, idx *core.AGTranscriptIndex, snapPath string, billingDay int) (
 	official core.AGOfficialQuotaReport,
 	local core.AGLocalUsageReport,
+	execState core.AGExecutionState,
 	activeEmail string,
 	filtered bool,
 ) {
@@ -289,6 +292,8 @@ func (s *Store) computeAGReports(now time.Time, idx *core.AGTranscriptIndex, sna
 		weeklyReset = official.PrimaryWeekly.ResetTime
 	}
 	recs, convCount := idx.Refresh()
+	localExec := idx.ExecutionState(now)
+	execState = core.EvaluateAGExecution(localExec, official, now)
 
 	s.mu.Lock()
 	activeEmail, _ = s.applyAGAccountStateLocked(official, now)
@@ -300,7 +305,7 @@ func (s *Store) computeAGReports(now time.Time, idx *core.AGTranscriptIndex, sna
 	s.mu.Unlock()
 
 	local = core.AggregateAGUsage(filteredRecs, filteredConvCount, now, weeklyReset, billingDay)
-	return official, local, activeEmail, isFiltered
+	return official, local, execState, activeEmail, isFiltered
 }
 
 func (s *Store) syncAGFullWeekBasisLocked(official core.AGOfficialQuotaReport, local core.AGLocalUsageReport, activeEmail string) {
@@ -374,7 +379,7 @@ func (s *Store) RefreshAntigravity(forceSync bool) {
 	now := time.Now()
 	bridgeStatus := inst.Status()
 	cliPath := platform.LocateAgyBinary(customCLI)
-	official, local, activeEmail, isFiltered := s.computeAGReports(now, idx, inst.SnapshotPath(), billingDay)
+	official, local, execState, activeEmail, isFiltered := s.computeAGReports(now, idx, inst.SnapshotPath(), billingDay)
 	procs := platform.ListAntigravityProcesses()
 
 	s.mu.Lock()
@@ -382,6 +387,7 @@ func (s *Store) RefreshAntigravity(forceSync bool) {
 	s.agCLIPath = cliPath
 	s.agOfficial = official
 	s.agLocal = local
+	s.agExecution = execState
 	s.agLocalFiltered = isFiltered
 	s.syncAGFullWeekBasisLocked(official, local, activeEmail)
 	s.agProcs = procs
@@ -588,15 +594,23 @@ func (s *Store) RefreshAntigravityLocal() {
 	s.mu.Unlock()
 
 	now := time.Now()
-	official, local, activeEmail, isFiltered := s.computeAGReports(now, idx, inst.SnapshotPath(), billingDay)
+	official, local, execState, activeEmail, isFiltered := s.computeAGReports(now, idx, inst.SnapshotPath(), billingDay)
 	procs := platform.ListAntigravityProcesses()
 
 	s.mu.Lock()
 	s.agOfficial = official
 	s.agLocal = local
+	s.agExecution = execState
 	s.agLocalFiltered = isFiltered
 	s.syncAGFullWeekBasisLocked(official, local, activeEmail)
 	s.agProcs = procs
+	s.mu.Unlock()
+	s.notify()
+}
+
+func (s *Store) SetAGExecutionForTest(exec core.AGExecutionState) {
+	s.mu.Lock()
+	s.agExecution = exec
 	s.mu.Unlock()
 	s.notify()
 }

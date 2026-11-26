@@ -199,6 +199,7 @@ type Store struct {
 	agSyncer                *AGSilentSyncer
 	agLocal                 core.AGLocalUsageReport
 	agOfficial              core.AGOfficialQuotaReport
+	agExecution             core.AGExecutionState
 	agBridge                core.AGBridgeStatus
 	agCLIPath               string
 	agProcs                 []platform.ClaudeTask

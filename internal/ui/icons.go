@@ -2,6 +2,8 @@ package appui
 
 import (
 	"fmt"
+	"math"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 
@@ -48,32 +50,141 @@ func ClaudeLogo(c *ui.Context, size float32, col ui.Color) ui.Element {
 	})
 }
 
+func buildAGStarPath(cx, cy, rad float32) ui.Path {
+	ctrl := rad * 0.14
+	var path ui.Path
+	path.MoveTo(cx, cy-rad)
+	path.QuadTo(cx+ctrl, cy-ctrl, cx+rad, cy)
+	path.QuadTo(cx+ctrl, cy+ctrl, cx, cy+rad)
+	path.QuadTo(cx-ctrl, cy+ctrl, cx-rad, cy)
+	path.QuadTo(cx-ctrl, cy-ctrl, cx, cy-rad)
+	path.Close()
+	return path
+}
+
+func agBaseStarGradient() ui.LinearGradient {
+	return ui.LinearGradient{
+		Angle: 135,
+		Stops: []ui.GradientStop{
+			{Color: ColorAGStarTop, At: 0},
+			{Color: ColorAGAccent, At: 0.55},
+			{Color: ColorAGStarBot, At: 1},
+		},
+	}
+}
+
 // AntigravityLogo draws the 30-degree tilted gradient 4-point star brand mark.
 func AntigravityLogo(c *ui.Context, size float32, spinDeg float32) ui.Element {
 	return ui.Box(c).Size(size, size).Draw(func(p *ui.Painter, r ui.Rect) {
 		cx := r.X + r.W/2
 		cy := r.Y + r.H/2
 		rad := min(r.W, r.H) / 2
-		ctrl := rad * 0.14
-
-		var path ui.Path
-		path.MoveTo(cx, cy-rad)
-		path.QuadTo(cx+ctrl, cy-ctrl, cx+rad, cy)
-		path.QuadTo(cx+ctrl, cy+ctrl, cx, cy+rad)
-		path.QuadTo(cx-ctrl, cy+ctrl, cx-rad, cy)
-		path.QuadTo(cx-ctrl, cy-ctrl, cx, cy-rad)
-		path.Close()
-
-		grad := ui.LinearGradient{
-			Angle: 135,
-			Stops: []ui.GradientStop{
-				{Color: ColorAGStarTop, At: 0},
-				{Color: ColorAGAccent, At: 0.55},
-				{Color: ColorAGStarBot, At: 1},
-			},
-		}
+		path := buildAGStarPath(cx, cy, rad)
+		grad := agBaseStarGradient()
 		p.Transform(ui.Rotation(30+spinDeg), cx, cy, func() {
 			p.FillPathGradient(&path, grad)
+		})
+	})
+}
+
+func agSheenGradient(center, halfWidth, intensity float32) ui.LinearGradient {
+	if intensity < 0 {
+		intensity = 0
+	} else if intensity > 1 {
+		intensity = 1
+	}
+	if halfWidth < 0.01 {
+		halfWidth = 0.01
+	}
+	const peakAlpha float32 = 0.78
+	type ctrlPt struct {
+		pos        float32
+		r, g, b    uint8
+		alphaValue float32
+	}
+	pts := [5]ctrlPt{
+		{pos: center - halfWidth, r: 225, g: 244, b: 255, alphaValue: 0},
+		{pos: center - 0.45*halfWidth, r: 225, g: 244, b: 255, alphaValue: 0.48 * peakAlpha * intensity},
+		{pos: center, r: 255, g: 255, b: 255, alphaValue: peakAlpha * intensity},
+		{pos: center + 0.45*halfWidth, r: 225, g: 244, b: 255, alphaValue: 0.48 * peakAlpha * intensity},
+		{pos: center + halfWidth, r: 225, g: 244, b: 255, alphaValue: 0},
+	}
+	evalAt := func(x float32) ui.Color {
+		if x <= pts[0].pos || x >= pts[4].pos {
+			return ui.RGBA(225, 244, 255, 0)
+		}
+		for i := 0; i < 4; i++ {
+			a, b := pts[i], pts[i+1]
+			if x <= b.pos {
+				span := b.pos - a.pos
+				frac := float32(0)
+				if span > 0 {
+					frac = (x - a.pos) / span
+				}
+				rr := uint8(math.Round(float64(a.r) + float64(int(b.r)-int(a.r))*float64(frac)))
+				gg := uint8(math.Round(float64(a.g) + float64(int(b.g)-int(a.g))*float64(frac)))
+				bb := uint8(math.Round(float64(a.b) + float64(int(b.b)-int(a.b))*float64(frac)))
+				aa := a.alphaValue + (b.alphaValue-a.alphaValue)*frac
+				return ui.RGBA(rr, gg, bb, aa)
+			}
+		}
+		return ui.RGBA(225, 244, 255, 0)
+	}
+
+	stops := make([]ui.GradientStop, 0, 7)
+	stops = append(stops, ui.GradientStop{Color: evalAt(0), At: 0})
+	for _, pt := range pts {
+		if pt.pos > 0.0001 && pt.pos < 0.9999 {
+			stops = append(stops, ui.GradientStop{
+				Color: ui.RGBA(pt.r, pt.g, pt.b, pt.alphaValue),
+				At:    pt.pos,
+			})
+		}
+	}
+	stops = append(stops, ui.GradientStop{Color: evalAt(1), At: 1})
+
+	return ui.LinearGradient{
+		Angle: 125,
+		Stops: stops,
+	}
+}
+
+// AntigravityLogoAnimated draws the static 30-degree tilted 4-point star with a
+// smooth back-and-forth diagonal sheen overlay while active is true.
+func AntigravityLogoAnimated(c *ui.Context, key string, size float32, active bool) ui.Element {
+	el := ui.Box(c.Key(key)).Size(size, size)
+	target := float32(0)
+	if active {
+		target = 1
+	}
+	intensity := el.Animate("ag-sheen", target, 280*time.Millisecond)
+
+	return el.Draw(func(p *ui.Painter, r ui.Rect) {
+		cx := r.X + r.W/2
+		cy := r.Y + r.H/2
+		rad := min(r.W, r.H) / 2
+		path := buildAGStarPath(cx, cy, rad)
+		baseGrad := agBaseStarGradient()
+
+		p.Transform(ui.Rotation(30), cx, cy, func() {
+			p.FillPathGradient(&path, baseGrad)
+			if intensity <= 0.005 {
+				return
+			}
+			if p.Preferences().ReduceMotion {
+				p.FillPathGradient(&path, agSheenGradient(0.35, 0.45, 0.35*intensity))
+				return
+			}
+			p.AnimationFrameRate(30)
+			const periodSec = 2.4
+			sec := float64(p.Now().UnixNano()) / 1e9
+			phase := math.Mod(sec, periodSec) / periodSec
+			if phase < 0 {
+				phase += 1
+			}
+			sweep := 0.5 - 0.5*math.Cos(2*math.Pi*phase)
+			center := float32(-0.22 + 1.44*sweep)
+			p.FillPathGradient(&path, agSheenGradient(center, 0.28, intensity))
 		})
 	})
 }

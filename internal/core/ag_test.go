@@ -640,3 +640,91 @@ func TestSummarizeAGByModelSortsByCostAndBuildLinesMergesOther(t *testing.T) {
 		}
 	}
 }
+
+func TestAGExecutionStateFromTranscriptAndOfficial(t *testing.T) {
+	root := t.TempDir()
+	logsDir := filepath.Join(root, "conv-exec", ".system_generated", "logs")
+	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(logsDir, "transcript.jsonl")
+	now := time.Now().UTC()
+
+	writeLines := func(content string) {
+		if err := os.WriteFile(filePath, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	idx := NewAGTranscriptIndex(root)
+
+	// 1. Brand-new conversation with only USER_INPUT -> active.
+	l1 := fmt.Sprintf(`{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"%s","content":"hi"}`+"\n", now.Add(-10*time.Second).Format(time.RFC3339))
+	writeLines(l1)
+	idx.Refresh()
+	if st := idx.ExecutionState(now); !st.IsActiveAt(now) || st.ConversationID != "conv-exec" {
+		t.Fatalf("expected active execution after USER_INPUT, got %+v", st)
+	}
+
+	// 2. PLANNER_RESPONSE with tool_calls (read_file) -> active.
+	l2 := fmt.Sprintf(`{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","model":"gemini-4-neon-high","input_tokens":1000,"output_tokens":50,"tool_calls":[{"name":"read_file"}]}`+"\n", now.Add(-5*time.Second).Format(time.RFC3339))
+	writeLines(l1 + l2)
+	idx.Refresh()
+	if st := idx.ExecutionState(now); !st.IsActiveAt(now) {
+		t.Fatalf("expected active execution when planner emitted tool call, got %+v", st)
+	}
+
+	// 3. PLANNER_RESPONSE with only ask_question -> inactive (waiting for user).
+	l3 := fmt.Sprintf(`{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","model":"gemini-4-neon-high","input_tokens":1100,"output_tokens":30,"tool_calls":[{"name":"ask_question"}]}`+"\n", now.Add(-3*time.Second).Format(time.RFC3339))
+	writeLines(l1 + l2 + l3)
+	idx.Refresh()
+	if st := idx.ExecutionState(now); st.IsActiveAt(now) {
+		t.Fatalf("expected inactive when waiting on ask_question, got %+v", st)
+	}
+
+	// 4. GENERIC tool result (RUNNING and DONE) -> active.
+	l4Running := fmt.Sprintf(`{"step_index":3,"source":"MODEL","type":"GENERIC","status":"RUNNING","created_at":"%s","content":"running"}`+"\n", now.Add(-2*time.Second).Format(time.RFC3339))
+	writeLines(l1 + l2 + l4Running)
+	idx.Refresh()
+	if st := idx.ExecutionState(now); !st.IsActiveAt(now) {
+		t.Fatalf("expected active execution for RUNNING generic step, got %+v", st)
+	}
+	l4Done := fmt.Sprintf(`{"step_index":3,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"%s","content":"ok"}`+"\n", now.Add(-2*time.Second).Format(time.RFC3339))
+	writeLines(l1 + l2 + l4Done)
+	idx.Refresh()
+	if st := idx.ExecutionState(now); !st.IsActiveAt(now) {
+		t.Fatalf("expected active execution after DONE generic tool result, got %+v", st)
+	}
+
+	// 5. Final PLANNER_RESPONSE without tool_calls -> immediately inactive.
+	l5 := fmt.Sprintf(`{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","model":"gemini-4-neon-high","input_tokens":1200,"output_tokens":180}`+"\n", now.Add(-1*time.Second).Format(time.RFC3339))
+	writeLines(l1 + l2 + l4Done + l5)
+	idx.Refresh()
+	if st := idx.ExecutionState(now); st.IsActiveAt(now) {
+		t.Fatalf("expected inactive immediately after final PLANNER_RESPONSE, got %+v", st)
+	}
+
+	// 6. Stale USER_INPUT older than 3 minutes -> inactive (even though file modTime is now).
+	stale := fmt.Sprintf(`{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"%s","content":"old"}`+"\n", now.Add(-20*time.Minute).Format(time.RFC3339))
+	writeLines(stale)
+	idx.Refresh()
+	if st := idx.ExecutionState(now); st.IsActiveAt(now) {
+		t.Fatalf("expected inactive for stale USER_INPUT (>3m), got %+v", st)
+	}
+
+	// 7. EvaluateAGExecution fallback to fresh AgentState "thinking" vs idle/stale.
+	freshAt := now.Add(-15 * time.Second)
+	thinkingRep := AGOfficialQuotaReport{SnapshotCapturedAt: &freshAt, AgentState: "thinking"}
+	if got := EvaluateAGExecution(AGExecutionState{}, thinkingRep, now); !got.IsActiveAt(now) {
+		t.Fatalf("expected active via fresh official AgentState=thinking, got %+v", got)
+	}
+	idleRep := AGOfficialQuotaReport{SnapshotCapturedAt: &freshAt, AgentState: "idle"}
+	if got := EvaluateAGExecution(AGExecutionState{}, idleRep, now); got.IsActiveAt(now) {
+		t.Fatalf("expected inactive for official AgentState=idle, got %+v", got)
+	}
+	staleAt := now.Add(-2 * time.Minute)
+	staleThinking := AGOfficialQuotaReport{SnapshotCapturedAt: &staleAt, AgentState: "thinking"}
+	if got := EvaluateAGExecution(AGExecutionState{}, staleThinking, now); got.IsActiveAt(now) {
+		t.Fatalf("expected inactive for stale official snapshot (>90s), got %+v", got)
+	}
+}
